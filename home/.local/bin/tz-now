@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""tz-now [--at EPOCH] TZ...    UTC offsets of time zones, as JSON, for the shell's world clock.
+tz-now --list                 every zone name this machine knows, one per line (settings page validation)
+
+Qt's JavaScript engine in Quickshell has no Intl and ignores the timeZone option of toLocaleString,
+so ClocksCore.qml asks here: once when the world clock is shown (and again after `next`), never on a
+timer. The answer is the offset now plus the moment it next changes (a daylight saving switch), so
+the shell can keep time itself in between.
+
+  [{"tz": "Europe/London", "ok": true, "offset": 0, "abbr": "GMT", "next": 1774832400}, ...]
+offset in seconds east of UTC; next = epoch seconds of the next offset change within 400 days, 0 if none;
+ok false (and no offset) for a name that is not a zone."""
+import json, sys, time
+from datetime import datetime, timedelta, timezone
+
+try:
+    from zoneinfo import ZoneInfo, available_timezones
+except ImportError:
+    print("tz-now: needs Python 3.9 or newer (zoneinfo)", file=sys.stderr); sys.exit(2)
+
+
+def offset(zone, epoch):
+    return int(datetime.fromtimestamp(epoch, timezone.utc).astimezone(zone).utcoffset().total_seconds())
+
+
+def next_change(zone, epoch):
+    """first second after `epoch` whose offset differs from the one at `epoch`; 0 if none in 400 days"""
+    base = offset(zone, epoch)
+    step = 12 * 3600
+    lo = epoch
+    for i in range(1, 400 * 2 + 1):
+        hi = epoch + i * step
+        if offset(zone, hi) != base:
+            while hi - lo > 1:                    # bisect to the second
+                mid = (lo + hi) // 2
+                if offset(zone, mid) == base:
+                    lo = mid
+                else:
+                    hi = mid
+            return hi
+        lo = hi
+    return 0
+
+
+def main(argv):
+    at = int(time.time())
+    names = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--list":
+            print("\n".join(sorted(available_timezones() | {"UTC"})))
+            return 0
+        if a == "--at" and i + 1 < len(argv):
+            try:
+                at = int(float(argv[i + 1]))
+            except ValueError:
+                print("tz-now: --at needs epoch seconds", file=sys.stderr); return 2
+            i += 2
+            continue
+        names.append(a)
+        i += 1
+    out = []
+    for n in names:
+        try:
+            if not n or n.startswith("/") or ".." in n:
+                raise ValueError(n)
+            z = ZoneInfo(n)
+            out.append({"tz": n, "ok": True, "offset": offset(z, at),
+                        "abbr": datetime.fromtimestamp(at, timezone.utc).astimezone(z).tzname() or "",
+                        "next": next_change(z, at)})
+        except Exception:
+            out.append({"tz": n, "ok": False})
+    print(json.dumps(out))
+    return 0
+
+
+sys.exit(main(sys.argv[1:]))

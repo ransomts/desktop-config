@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+"""Open Firefox tabs as JSON, for the launcher's `t ` mode (LaunchView.qml).
+
+  tabs-list [--profile DIR]
+
+Prints [{"title", "url", "host", "window", "index", "active", "pinned"}], one per tab,
+read from the sessionstore the way `firefox-tabs --list` does (it is imported from the
+file next to this one, or from $FIREFOX_TABS). `active` is true for the tab a window is
+showing. Read-only; the sessionstore is flushed about every 15 s, so a tab opened a
+moment ago may be missing. Titles and URLs go to stdout only, nothing is logged.
+"""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sys
+import time
+
+here = os.path.dirname(os.path.realpath(__file__))
+path = os.environ.get("FIREFOX_TABS") or os.path.join(here, "firefox-tabs")
+try:
+    loader = importlib.machinery.SourceFileLoader("firefox_tabs", path)
+    spec = importlib.util.spec_from_loader("firefox_tabs", loader)
+    ft = importlib.util.module_from_spec(spec)
+    loader.exec_module(ft)
+except Exception:
+    sys.exit("tabs-list: cannot load firefox-tabs")
+
+profile = None
+if len(sys.argv) == 3 and sys.argv[1] == "--profile":
+    profile = sys.argv[2]
+elif len(sys.argv) != 1:
+    sys.exit("usage: tabs-list [--profile DIR]")
+
+session, _ = ft.load_session(ft.find_profile(profile))
+windows = session.get("windows", [])
+out = []
+for t in ft.collect(session, time.time() * 1000):
+    sel = windows[t["window"] - 1].get("selected")
+    out.append({"title": t["title"], "url": t["url"], "host": t["host"], "window": t["window"],
+                "index": t["index"], "active": sel == t["index"], "pinned": t["pinned"]})
+print(json.dumps(out))

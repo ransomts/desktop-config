@@ -1,0 +1,18 @@
+#!/bin/sh
+# Alt+Tab: every open window on every desktop, most recently used first, with app
+# icons, in a list (qs-pick). Picking one focuses it; the Desk hook in hyprland.lua brings all
+# monitors to its desktop. The list comes from hypr-window-list (shared with
+# desk-overview).
+PLACEHOLDER="Switch window"
+# The launcher's window mode when Quickshell is running (`qs ipc call launcher open w`;
+# the same key again closes it); otherwise the list below.
+"$HOME/.nix-profile/bin/qs" ipc call launcher open 'w' >/dev/null 2>&1 && exit 0
+
+tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
+"$HOME/.local/bin/hypr-window-list" switcher > "$tmp"
+[ -s "$tmp" ] || exit 0
+
+i=$(cut -f1 "$tmp" | "$HOME/.local/bin/qs-pick" --index --prompt "󰖯  " --placeholder "$PLACEHOLDER") || exit 0
+[ "$i" -ge 0 ] 2>/dev/null || exit 0
+addr=$(sed -n "$((i + 1))p" "$tmp" | cut -f2)
+hyprctl dispatch "hl.dsp.focus({ window = \"address:$addr\" })" >/dev/null

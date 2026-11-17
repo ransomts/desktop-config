@@ -1,0 +1,31 @@
+#!/bin/sh
+# Pick the animated wallpaper's scene, or flip one of its effects, from a list (qs-pick).
+# The wallpaper itself is Quickshell's Wallpaper.qml; state is in ~/.local/state/wallpaper.json.
+qs="$HOME/.nix-profile/bin/qs"
+st=$("$qs" ipc call wallpaper status 2>/dev/null) || { notify-send "Wallpaper" "Quickshell is not running"; exit 1; }
+has() { case " $st " in *" $1 "*) return 0 ;; esac; return 1; }
+mark() { if has "$1=on"; then echo "on "; else echo "off"; fi; }
+cur=$(echo "$st" | sed -n 's/.*scene=\([a-z]*\).*/\1/p')
+choice=$( {
+    for s in silk aurora contours ink ridges sky terrain flow ripples field pulsar depths; do
+        [ "$s" = "$cur" ] && echo "scene   $s   (current)" || echo "scene   $s"
+    done
+    echo "effect  daylight  $(mark daylight)  colours shift with the time of day"
+    echo "effect  music     $(mark music)  pulse with what is playing"
+    echo "effect  weather   $(mark weather)  rain, fog and snow over the scene"
+    echo "effect  pointer   $(mark pointer)  lean toward the pointer"
+    echo "effect  agenda    $(mark agenda)  today's events along the bottom"
+    echo "effect  desks     $(mark desks)  a different view on each desktop"
+    echo "effect  rest      $(mark rest)  screens with windows on them hold still (saves GPU)"
+    echo "effect  sharp     $(mark sharp)  no blur behind bar and windows while moving (saves GPU)"
+    echo "effect  heat      $(mark heat)  hold still while the CPU is hot"
+    echo "try     rain"; echo "try     fog"; echo "try     snow"; echo "try     real weather"
+    echo "turn    on    (moving)"; echo "turn    off   (hold this frame)"; echo "turn    hide  (plain wallpaper image)"
+} | "$HOME/.local/bin/qs-pick" --placeholder "Wallpaper" ) || exit 0
+set -- $choice
+case "$1" in
+    scene)  "$qs" ipc call wallpaper scene "$2" >/dev/null ;;
+    effect) if has "$2=on"; then "$qs" ipc call wallpaper effect "$2" false; else "$qs" ipc call wallpaper effect "$2" true; fi ;;
+    try)    [ "$2" = real ] && "$qs" ipc call wallpaper weather auto || "$qs" ipc call wallpaper weather "$2" ;;
+    turn)   "$qs" ipc call wallpaper "$2" ;;
+esac

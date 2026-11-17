@@ -1,0 +1,7 @@
+/* Light mode: orange stays for fills (buttons, switches, selections); accent
+   text and links are Regalia purple, which reads better on light backgrounds. */
+@define-color accent_color #522d80;
+@define-color accent_bg_color #f56600;
+@define-color accent_fg_color #16161a;
+@define-color theme_selected_bg_color #f56600;
+@define-color theme_selected_fg_color #16161a;

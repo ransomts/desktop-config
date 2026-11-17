@@ -1,0 +1,171 @@
+#!/usr/bin/python3 -I
+"""keystats: count what the ZSA Moonlander sends, for tuning its layout.
+
+Reads the Moonlander's input devices (evdev) and keeps aggregate counts in
+~/.local/state/keystats/counts.json, saved every minute and on exit:
+
+  keys     KEY with the modifiers held, "Super+Shift+KEY_GRAVE": what you press
+  bigrams  "KEY_A KEY_B": consecutive non-modifier keys, for finger-sequence analysis
+  repeats  held-key autorepeat, per key
+  mods     each modifier pressed on its own and released (Super tap = launcher)
+  timing   per key pair typed within 1.5 s: a histogram of the gap (ms buckets in
+           "timing_buckets"), to find the slow, awkward pairs
+  apps     the "keys" counts again per focused app (Hyprland window class)
+
+No raw stream and no timestamps are written, only counts.  What layer a key
+came from is invisible here (the firmware resolves layers); Keymapp's heatmap
+has that.  Runs as keystats.service; access comes from the ZSA udev rule
+(uaccess on the Moonlander's event devices).
+"""
+import collections, json, os, select, signal, socket, subprocess, sys, time
+import evdev
+from evdev import ecodes
+
+STATE = os.path.expanduser("~/.local/state/keystats/counts.json")
+MATCH = "Moonlander"
+MODS = {ecodes.KEY_LEFTCTRL: "Ctrl", ecodes.KEY_RIGHTCTRL: "Ctrl",
+        ecodes.KEY_LEFTSHIFT: "Shift", ecodes.KEY_RIGHTSHIFT: "Shift",
+        ecodes.KEY_LEFTALT: "Alt", ecodes.KEY_RIGHTALT: "AltGr",
+        ecodes.KEY_LEFTMETA: "Super", ecodes.KEY_RIGHTMETA: "Super"}
+ORDER = ["Ctrl", "Alt", "AltGr", "Super", "Shift"]
+
+def load():
+    try:
+        with open(STATE) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        d = {}
+    c = {k: collections.Counter(d.get(k, {})) for k in ("keys", "bigrams", "repeats", "mods")}
+    timing = {pair: list(h) for pair, h in d.get("timing", {}).items()}
+    apps = collections.defaultdict(collections.Counter,
+                                   {a: collections.Counter(v) for a, v in d.get("apps", {}).items()})
+    return c, timing, apps, d.get("since")
+
+# Gap between the two keys of a pair, in ms: bucket i holds gaps below BUCKETS[i];
+# the last bucket is the rest up to MAX_GAP.  Longer gaps are pauses, not typing.
+BUCKETS = [40, 60, 80, 100, 125, 150, 175, 200, 250, 300, 400, 500, 750, 1000]
+MAX_GAP = 1.5
+counts, timing, apps, since = load()
+since = since or time.strftime("%Y-%m-%d %H:%M")
+
+def save():
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"since": since, "saved": time.strftime("%Y-%m-%d %H:%M"),
+                   **{k: dict(v) for k, v in counts.items()},
+                   "timing_buckets": BUCKETS + [int(MAX_GAP * 1000)], "timing": timing,
+                   "apps": {a: dict(v) for a, v in apps.items()}}, f, indent=0, sort_keys=True)
+    os.replace(tmp, STATE)
+
+def name(code):
+    n = ecodes.KEY.get(code) or ecodes.BTN.get(code) or str(code)
+    return n[0] if isinstance(n, list) else n
+
+def devices():
+    found = []
+    for path in evdev.list_devices():
+        try:
+            d = evdev.InputDevice(path)
+        except OSError:
+            continue
+        if MATCH in d.name and ecodes.EV_KEY in d.capabilities():
+            found.append(d)
+        else:
+            d.close()
+    return found
+
+# ---- the focused app, from Hyprland ----
+app = "?"
+def hypr_socket():
+    """Hyprland's event socket (non-blocking), or None outside Hyprland."""
+    global app
+    sig, run = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"), os.environ.get("XDG_RUNTIME_DIR")
+    if not (sig and run):
+        return None
+    try:
+        out = subprocess.run(["hyprctl", "-j", "activewindow"], capture_output=True, text=True, timeout=2).stdout
+        app = (json.loads(out) or {}).get("class") or "desktop"
+    except Exception:
+        pass
+    try:
+        s = socket.socket(socket.AF_UNIX); s.connect(f"{run}/hypr/{sig}/.socket2.sock"); s.setblocking(False)
+        return s
+    except OSError:
+        return None
+
+def stop(*_):
+    save(); sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+
+hs = hypr_socket()
+hbuf = b""
+last_down = None      # (key, time) of the last non-modifier press, for timing
+held = set()          # modifier names held now
+mod_alone = None      # a modifier pressed with nothing else since
+prev = None           # last non-modifier key, for bigrams
+last_save = time.monotonic()
+while True:
+    devs = devices()
+    if not devs:
+        time.sleep(5); continue
+    fds = {d.fd: d for d in devs}
+    try:
+        while True:
+            r, _, _ = select.select(list(fds) + ([hs] if hs else []), [], [], 60)
+            for fd in r:
+                if fd is hs:
+                    try:
+                        data = hs.recv(65536)
+                    except BlockingIOError:
+                        continue
+                    if not data:          # Hyprland restarted: reconnect later
+                        hs.close(); hs = None; continue
+                    hbuf += data
+                    *lines, hbuf = hbuf.split(b"\n")
+                    for line in lines:
+                        if line.startswith(b"activewindow>>"):
+                            app = line[14:].split(b",", 1)[0].decode(errors="replace") or "desktop"
+                    continue
+                for ev in fds[fd].read():
+                    if ev.type != ecodes.EV_KEY:
+                        continue
+                    if ev.code in MODS:
+                        m = MODS[ev.code]
+                        if ev.value == 1:
+                            held.add(m); mod_alone = m
+                        elif ev.value == 0:
+                            held.discard(m)
+                            if mod_alone == m:
+                                counts["mods"][m] += 1
+                            mod_alone = None
+                        continue
+                    k = name(ev.code)
+                    if ev.value == 1:
+                        mod_alone = None
+                        combo = "+".join([m for m in ORDER if m in held] + [k])
+                        counts["keys"][combo] += 1
+                        apps[app][combo] += 1
+                        if prev:
+                            counts["bigrams"][f"{prev} {k}"] += 1
+                        t = ev.timestamp()
+                        if last_down and t - last_down[1] < MAX_GAP:
+                            gap = (t - last_down[1]) * 1000
+                            pair = f"{last_down[0]} {k}"
+                            h = timing.setdefault(pair, [0] * (len(BUCKETS) + 1))
+                            h[next((i for i, b in enumerate(BUCKETS) if gap < b), len(BUCKETS))] += 1
+                        last_down = (k, t)
+                        prev = k
+                    elif ev.value == 2:
+                        counts["repeats"][k] += 1
+            if time.monotonic() - last_save >= 60:
+                save(); last_save = time.monotonic()
+                if hs is None:
+                    hs = hypr_socket()
+    except OSError:
+        # The keyboard went away (unplugged, reset, flashing): look again.
+        for d in devs:
+            try: d.close()
+            except OSError: pass
+        save(); held.clear(); prev = None
+        time.sleep(2)

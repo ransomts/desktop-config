@@ -1,0 +1,27 @@
+# Tomorrow Night's ANSI colours (so it still sits well next to Emacs' doom-tomorrow-night)
+# on the desktop's own background, with the Clemson-orange cursor and selection.
+palette = 0=#16161a
+palette = 1=#cc6666
+palette = 2=#b5bd68
+palette = 3=#f0c674
+palette = 4=#81a2be
+palette = 5=#b294bb
+palette = 6=#8abeb7
+palette = 7=#e6e1dc
+palette = 8=#595959
+palette = 9=#cc6666
+palette = 10=#b5bd68
+palette = 11=#f0c674
+palette = 12=#81a2be
+palette = 13=#b294bb
+palette = 14=#8abeb7
+palette = 15=#ffffff
+# 208: the desktop's Clemson orange, for the prompt, fzf and other tools that use palette indices
+palette = 208=#f56600
+background = #16161a
+foreground = #e6e1dc
+cursor-color = #f56600
+cursor-text = #16161a
+selection-background = #f56600
+selection-foreground = #16161a
+split-divider-color = #f56600

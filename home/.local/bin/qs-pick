@@ -1,0 +1,60 @@
+#!/bin/sh
+# Pick one line from stdin in a Quickshell list (Picker.qml); fuzzel if Quickshell
+# isn't running. A drop-in for the way the menu scripts used `fuzzel --dmenu`.
+#   qs-pick [--index] [--placeholder TEXT] [--prompt TEXT] [--on-highlight CMD] < lines
+#       --on-highlight CMD: run `CMD INDEX` whenever the highlight moves (live preview;
+#       Quickshell only, ignored by the fuzzel fallback)
+#       --rank: order results by how well they match (lines are "name   keywords")
+#       --start N: with --on-highlight, the line (0-based) highlighted when the list opens
+#   qs-pick --input | --password --placeholder TEXT        (type a line; no list)
+# Prints the chosen line (or its 0-based index with --index); exits 1 on cancel.
+# fuzzel's icon syntax (label\0icon\x1fNAME) is understood. Running it again
+# with the same placeholder while the list is open closes the list.
+index=0; input=0; secret=false; placeholder="Pick one"; prompt=""; live=""; start=0; rank=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --index) index=1 ;;
+        --input) input=1 ;;
+        --password) input=1; secret=true ;;
+        --placeholder) placeholder="$2"; shift ;;
+        --prompt) prompt="$2"; shift ;;
+        --on-highlight) live="$2"; shift ;;
+        --start) start="$2"; shift ;;
+        --rank) rank=1 ;;
+    esac
+    shift
+done
+qs="$HOME/.nix-profile/bin/qs"
+dir=$(mktemp -d); trap 'rm -rf "$dir"' EXIT
+
+if [ "$input" = 1 ]; then      # ask for a line of text instead of picking one
+    mkfifo "$dir/out"
+    if [ -x "$qs" ] && "$qs" ipc call picker ask "$dir/out" "$placeholder" "$secret" >/dev/null 2>&1; then
+        r=$(timeout 600 cat "$dir/out") || exit 1
+        case "$r" in ok:*) printf '%s\n' "${r#ok:}"; exit 0 ;; *) exit 1 ;; esac
+    fi
+    set -- --dmenu --lines 0 --width 46 --prompt-only "$placeholder: "
+    [ "$secret" = true ] && set -- "$@" --password
+    exec fuzzel "$@" < /dev/null
+fi
+
+cat > "$dir/raw"
+sed 's/\x00icon\x1f/\x1f/' "$dir/raw" > "$dir/items"     # Picker.qml's icon marker
+mkfifo "$dir/out"
+
+if [ -n "$live" ]; then opened() { "$qs" ipc call picker openlive "$dir/items" "$dir/out" "$placeholder" "$live" "$start" >/dev/null 2>&1; }
+elif [ "$rank" = 1 ]; then opened() { "$qs" ipc call picker openranked "$dir/items" "$dir/out" "$placeholder" >/dev/null 2>&1; }
+else opened() { "$qs" ipc call picker open "$dir/items" "$dir/out" "$placeholder" >/dev/null 2>&1; }; fi
+if [ -x "$qs" ] && opened; then
+    # Quickshell writes the chosen index (or -1) to the fifo
+    i=$(timeout 600 cat "$dir/out") || exit 1
+    [ "$i" -ge 0 ] 2>/dev/null || exit 1
+    if [ "$index" = 1 ]; then echo "$i"
+    else sed -n "$((i + 1))p" "$dir/raw" | sed 's/\x00icon\x1f.*//'; fi
+    exit 0
+fi
+
+# fallback: fuzzel, as before
+set -- --dmenu --no-sort --width 80 --lines 15 --prompt "${prompt:-> }" --placeholder "$placeholder"
+[ "$index" = 1 ] && set -- "$@" --index
+exec fuzzel "$@" < "$dir/raw"

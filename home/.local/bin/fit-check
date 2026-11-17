@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# fit-check: is anything in the Quickshell shell cut off? (Fit.qml)
+#   fit-check          sweep: open each popup on the focused screen in turn, check, close; print the report
+#   fit-check now      check only what is open right now
+#   fit-check windows  list the windows the check can see
+# The report is also left in ~/.local/state/fit-report.txt. Exit 0 clean, 1 something cut, 2 could not run.
+# The sweep takes ~30 s and briefly grabs the keyboard for each popup: don't type meanwhile.
+qs="$HOME/.nix-profile/bin/qs"
+report="$HOME/.local/state/fit-report.txt"
+[ -x "$qs" ] || { echo "fit-check: no qs at $qs" >&2; exit 2; }
+
+case "${1:-sweep}" in
+  now)     out=$("$qs" ipc call fit check) || exit 2; echo "$out" ;;
+  windows) exec "$qs" ipc call fit windows ;;
+  sweep)
+    "$qs" ipc call fit sweep || exit 2
+    for _ in $(seq 1 240); do
+      grep -q '^FITCHECK RESULT' "$report" 2>/dev/null && break
+      sleep 0.5
+    done
+    grep -q '^FITCHECK RESULT' "$report" 2>/dev/null || { echo "fit-check: no result after 2 min ($("$qs" ipc call fit status))" >&2; exit 2; }
+    out=$(cat "$report"); echo "$out" ;;
+  *) sed -n '2,7p' "$0"; exit 2 ;;
+esac
+grep -q '^FITCHECK RESULT clean' <<<"$out"

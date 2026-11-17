@@ -1,0 +1,24 @@
+#!/bin/sh
+# Install a Bibata cursor theme for this user (no sudo). Safe to re-run.
+#   bibata-cursor-install [theme]      # default Bibata-Modern-Classic
+# Other themes in the package: Bibata-Modern-Ice, Bibata-Modern-Amber,
+# Bibata-Original-Classic, Bibata-Original-Ice, Bibata-Original-Amber.
+# The theme is selected by XCURSOR_THEME in ~/.config/hypr/hyprland.lua and
+# gsettings org.gnome.desktop.interface cursor-theme; this only puts it on disk.
+set -e
+theme="${1:-Bibata-Modern-Classic}"
+dest="${DEST:-$HOME/.local/share/icons}"
+mkdir -p "$dest"
+if [ -d "$dest/$theme/cursors" ]; then
+    echo "$theme already in $dest"
+    exit 0
+fi
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+(cd "$tmp" && apt download bibata-cursor-theme && dpkg-deb -x bibata-cursor-theme_*.deb .)
+if [ ! -d "$tmp/usr/share/icons/$theme" ]; then
+    echo "no theme called $theme in bibata-cursor-theme" >&2
+    exit 1
+fi
+cp -a "$tmp/usr/share/icons/$theme" "$dest/"
+echo "$theme installed in $dest"

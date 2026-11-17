@@ -1,0 +1,79 @@
+#+title: desktop-config
+#+subtitle: Hyprland + Quickshell on a System76 laptop, in Clemson orange
+
+My Linux desktop: a Hyprland session whose whole shell (bar, launcher, notifications, lock screen, control panel, wallpaper, settings) is written in Quickshell, plus the scripts and user services that hold it together. It runs on Pop!_OS 24.04 on a System76 Lemur Pro, docked to four screens most days, with COSMIC still installed as the fallback session.
+
+This is a copy of my real config, published so people can read it and borrow from it. It is not an installer: paths, screens, the keyboard layout (Dvorak) and a few integrations are mine. Take the pieces you want.
+
+* Layout
+
+Everything under =home/= sits where it lives in =$HOME=.
+
+| Path | What it is |
+|------+------------|
+| =home/.config/hypr/= | Hyprland 0.57 config in Lua (=hyprland.lua=, =layouts.lua=), plus hypridle, hyprlock, hyprpaper, hyprsunset |
+| =home/.config/quickshell/= | The shell: about 170 QML files, shaders, a few JS helpers and assets |
+| =home/.local/bin/= | Scripts the bar, launcher and key bindings call |
+| =home/.local/share/hypr-strict-resize/= | A small Hyprland plugin (C++) for resizing tiled windows, with its tests |
+| =home/.config/palette/= | The colour-plan tool's data: master copies of every themed file and alternate plans |
+| =home/.config/fuzzel/=, =ghostty/=, =gtk-3.0/=, =gtk-4.0/=, =qt5ct/=, =qt6ct/= | Matching colours for the launcher fallback, terminal, GTK and Qt apps |
+| =home/.config/systemd/user/= | User services and timers for the desktop (theme by time of day, polkit prompt, dock layout, logging) |
+| =home/.config/uwsm/=, =environment.d/=, =.local/share/wayland-sessions/= | Session start-up through uwsm |
+
+* Versions
+
+- Hyprland 0.57 (Lua config; the old =.conf= format is ignored by this version)
+- Quickshell 0.3.2, installed through Nix and run with nixGL (=quickshell-start= handles that)
+- uwsm for the session ("Hyprland (uwsm-managed)" at the greeter)
+- Nerd Fonts for the bar glyphs, Papirus icons with orange folders (=papirus-orange-install=), Bibata cursor (=bibata-cursor-install=)
+
+* Key bindings
+
+One meaning per modifier, written at the top of the key section of =hyprland.lua=:
+
+| Keys | Meaning |
+|------+---------|
+| Super | open or go to something |
+| Super+Shift | the same key the other way round: send there, reverse, variant |
+| Super+Ctrl | adjust: window sizes (arrows, =\= to reset), theme T, mic M, webcam W, colour picker C, recording R |
+| Super+Alt | tab groups |
+| Super+Z, then a letter | lecture tools: D draw, L spotlight, K show keys, Z the menu |
+
+Some fixed points: Super+D launcher, Super+Tab overview, Alt+Tab window switcher, Super+C control panel, Super+N notifications, Super+I dashboard, Super+W wallpaper menu, Super+comma settings, Print screenshot editor, Super+[0-9] desktops, Super+P display switching. =keybind-help= shows the live list from the running config.
+
+* The shell (Quickshell)
+
+=shell.qml= is the entry point; =quickshell-start= launches it. The lock screen (=lockscreen.qml=) and the polkit password prompt (=authprompt.qml=) run as their own Quickshell instances, so a crash in the main shell cannot take them down.
+
+- Bar (=Bar.qml=, =Pill.qml=): one per screen. Every pill follows one rule: click opens its list or card, right-click is the quick action (mute, Do Not Disturb, play/pause, eject, reconnect), middle-click opens the full app, scroll only for levels.
+- Launcher (=Launcher.qml=, =LaunchView.qml=): apps by how often you use them, plus modes for a calculator, clipboard history, files, windows, emoji, quick calendar events ("event Lunch tomorrow 12-1") and notes.
+- Notifications (=Notif*.qml=, =Island.qml=): Quickshell is the notification daemon. Popups stack in the corner, repeats collapse into one card with a count, and short messages grow out of the top of the bar.
+- Calendar-aware Do Not Disturb (=Quiet*.qml=, =quiet.js=): goes quiet during meetings and lectures on its own.
+- Control panel and settings (=Panel.qml=, =Settings*.qml=): one settings window over everything that already exists (displays, input, power, notifications, screensaver, recording). Every row reads the live value and writes it back where it really lives.
+- Wallpaper (=Wallpaper.qml=, =Wall*.qml=, =shaders/=): animated shader scenes on the bottom layer, a real night sky for your latitude (star catalogue, moon phase, planets), seasonal touches and a thin band showing the day's calendar. It holds still on battery.
+- Lock screen and screensaver (=Lock*.qml=, =Saver*.qml=).
+- Screenshot editor (=Shot*.qml=): freezes every screen, select a region, annotate, copy or save. Also a screen-share picker for =xdg-desktop-portal-hyprland= (=SharePick.qml=).
+- Lecture tools (=Lecture*.qml=): draw on the screen, spotlight, show the keys being pressed, a countdown timer, a round webcam bubble for recordings.
+- The pet (=Pet*.qml=): a pixel-art tiger cub that lives in the empty stretches of the bar, reacts to notifications, runs a focus timer and keeps reminders. It also has a few secrets.
+- Tests: =fit-check= walks every popup and reports anything drawn where it gets cut off.
+
+* Colours
+
+Everything is themed from one palette: Clemson orange (=#F56600=) and regalia purple, with dark and light variants. =theme-by-time= switches between them on the night light's schedule in =hyprsunset.conf= (a manual toggle, Super+Ctrl+T, holds until the next switch), and =hypr-theme-apply= plus =gtk-theme-follows-cosmic= swap the files that need swapping for fuzzel, GTK and Qt; Quickshell and the terminal follow on their own.
+
+=palette= recolours the whole set in one go: =palette new NAME --seed '#hex'= (or =--image FILE=) makes a plan, =palette preview NAME= draws it beside the current one, and applying it rewrites every file listed in =home/.config/palette/files.json= from the masters while keeping each colour's lightness. =forest=, =ocean= and =rose= are example plans.
+
+* hypr-strict-resize
+
+A Hyprland plugin that makes resizing tiled windows follow the pointer and the arrow keys literally: Super+Ctrl+Right always makes the focused window wider, whatever side its neighbour is on, and dragging a border moves only that border. It also adds drag-to-place with a preview outline (=DropPreview.qml= draws it). Build with =build.sh= after every Hyprland update; =tests/README.org= explains how to test it in a nested Hyprland without disturbing the live session.
+
+* Using pieces of it
+
+- Copy a file or folder into the same place under your =$HOME=; nothing here needs to be installed as a whole.
+- Scripts assume =~/.local/bin= is on =PATH=, and some call each other.
+- Things that are mine and will need changing: monitor names and positions in =hyprland.lua= and =dock-monitor-layout=, the Dvorak layout, mail folder names in =dashboard-data= and =shell-status=, the latitude and longitude for the sky and weather, and the System76-specific bits (=charge-profile=, power profiles, the Fn-row keys).
+- A few pills read from services I run locally (a Matrix bridge for Teams unread counts, mbsync mail, an Org calendar export). They hide themselves when there is nothing to read.
+
+* License
+
+GPL-3.0; see =LICENSE=.

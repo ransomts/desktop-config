@@ -1,0 +1,31 @@
+#!/bin/sh
+# Store one cliphist entry as a pin for the launcher's clipboard mode (LaunchView.qml).
+#   clip-pin DIR FILE ID KIND       KIND = text | image
+# Writes DIR/FILE (ID.txt up to 64 KB, or ID.png) from `cliphist decode` of entry ID, through
+# a .part file so a half-written pin is never listed. Exit 0 = stored, 3 = text too long,
+# 4 = not a picture that can be made into a PNG, 1 = anything else. The launcher keeps the
+# index (DIR/index.json); nothing here reads or prints the content.
+dir=$1; file=$2; id=$3; kind=$4
+case "$file" in ""|*/*|.*) exit 1 ;; esac
+case "$id" in ""|*[!0-9]*) exit 1 ;; esac
+mkdir -p "$dir" || exit 1
+part="$dir/$file.part"
+trap 'rm -f "$part"' EXIT
+printf '%s\t\n' "$id" | cliphist decode > "$part" || exit 1
+case "$kind" in
+text)
+    [ "$(wc -c < "$part")" -le 65536 ] || exit 3 ;;
+image)
+    [ -s "$part" ] || exit 1
+    # PNG signature; anything else (jpeg, webp...) is converted
+    if [ "$(head -c 8 "$part" | od -An -tx1 | tr -d ' \n')" != 89504e470d0a1a0a ]; then
+        conv="$part.conv"
+        if command -v magick >/dev/null 2>&1; then magick "$part" "png:$conv"
+        elif command -v convert >/dev/null 2>&1; then convert "$part" "png:$conv"
+        else exit 4; fi 2>/dev/null
+        [ -s "$conv" ] || { rm -f "$conv"; exit 4; }
+        mv "$conv" "$part"
+    fi ;;
+*) exit 1 ;;
+esac
+mv "$part" "$dir/$file"

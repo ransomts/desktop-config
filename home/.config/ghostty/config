@@ -1,0 +1,14 @@
+font-family = FiraCode Nerd Font Mono
+font-size = 12
+
+# Desktop palette (themes/Clemson Dark, Clemson Light: the bar's background and
+# accents, with Tomorrow's ANSI colours so it still matches Emacs' doom-tomorrow
+# themes); flips with the portal color-scheme. Stock equivalent: light:Tomorrow,dark:Tomorrow Night
+theme = light:Clemson Light,dark:Clemson Dark
+# slightly see-through; Hyprland blurs what is behind
+background-opacity = 0.93
+window-padding-x = 8
+window-padding-y = 6
+# auto/system pin the GTK headerbar to the scheme at load time; ghostty paints it from
+# the terminal colors, which do follow the system live
+window-theme = ghostty

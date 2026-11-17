@@ -1,0 +1,12 @@
+[Unit]
+Description=Swap COSMIC wallpaper to match dark/light mode
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/wallpaper-follows-theme
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

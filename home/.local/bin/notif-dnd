@@ -1,0 +1,13 @@
+#!/bin/sh
+# Do Not Disturb for Quickshell's notification daemon.
+#   notif-dnd status     prints on or off
+#   notif-dnd on | off | toggle
+# While on, only critical notifications pop up; the rest go to the control panel's list.
+qs="$HOME/.nix-profile/bin/qs"
+case "${1:-status}" in
+    status) "$qs" ipc call notif dnd 2>/dev/null || echo off ;;
+    on)     "$qs" ipc call notif setDnd true >/dev/null 2>&1 ;;
+    off)    "$qs" ipc call notif setDnd false >/dev/null 2>&1 ;;
+    toggle) "$qs" ipc call notif toggleDnd >/dev/null 2>&1 ;;
+    *) echo "usage: notif-dnd [status|on|off|toggle]" >&2; exit 2 ;;
+esac

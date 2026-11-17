@@ -1,0 +1,14 @@
+#!/bin/sh
+# Compile the wallpaper shaders: src/common.glsl + src/NAME.frag -> NAME.frag.qsb
+# qsb comes with Qt's shadertools, which is not installed; it is fetched through Nix
+# (same nixpkgs as Quickshell). Run after editing anything in src/.
+cd "$(dirname "$0")" || exit 1
+qsb=$(command -v qsb || true)
+run() { if [ -n "$qsb" ]; then "$qsb" "$@"; else nix shell nixpkgs#qt6.qtshadertools -c qsb "$@"; fi; }
+tmp=$(mktemp -d) && trap 'rm -rf "$tmp"' EXIT
+for f in src/*.frag; do
+    n=$(basename "$f" .frag)
+    cat src/common.glsl "$f" > "$tmp/$n.frag"
+    run --glsl "300 es,330" -o "$n.frag.qsb" "$tmp/$n.frag" || { echo "failed: $n" >&2; exit 1; }
+done
+echo "built: $(ls *.qsb | tr '\n' ' ')"

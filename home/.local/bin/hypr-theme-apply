@@ -1,0 +1,44 @@
+#!/bin/sh
+# Dark/light for the pieces that need a file swapped: fuzzel's palette, btop's theme,
+# the GTK accent colours and the Qt colour scheme. (Quickshell and ghostty follow on their own.)
+# Run by gtk-theme-follows-cosmic on every switch and at login.
+#   hypr-theme-apply [dark|light]     # default: whatever COSMIC's is_dark says
+mode="$1"
+if [ -z "$mode" ]; then
+    if [ "$(cat "$HOME/.config/cosmic/com.system76.CosmicTheme.Mode/v1/is_dark" 2>/dev/null)" = "true" ]; then
+        mode=dark
+    else
+        mode=light
+    fi
+fi
+case "$mode" in dark|light) ;; *) echo "usage: hypr-theme-apply [dark|light]" >&2; exit 2 ;; esac
+
+# fuzzel is only the emergency launcher now (when Quickshell is down); keep its palette right
+ln -sfn "colors-$mode.ini" "$HOME/.config/fuzzel/colors.ini"
+
+# btop reads a fixed theme file; point it at the palette for this mode (new btop windows pick it up)
+[ -d "$HOME/.config/btop/themes" ] && ln -sfn "clemson-$mode.theme" "$HOME/.config/btop/themes/clemson.theme"
+
+# GTK apps' accent colour (see ~/.config/gtk-3.0/accent-dark.css). Only under
+# Hyprland: COSMIC manages gtk.css itself in its own sessions. Apps pick the new
+# file up when they start; running ones keep their accent until restarted.
+if [ "$XDG_CURRENT_DESKTOP" = Hyprland ]; then
+    for v in 3.0 4.0; do
+        d="$HOME/.config/gtk-$v"
+        [ -e "$d/gtk.css" ] && [ ! -L "$d/gtk.css" ] && continue      # someone's real file: leave it
+        ln -sfn "accent-$mode.css" "$d/gtk.css"
+    done
+    # Qt apps (QT_QPA_PLATFORMTHEME=qt5ct: qt5ct for Qt 5, qt6ct for Qt 6) read the colour
+    # scheme Clemson.conf; point it at this mode's file, and flip the icon theme the way
+    # gtk-theme-follows-cosmic flips GTK's (qt5ct/qt6ct have one fixed icon_theme line).
+    # Apps read both when they start; running ones keep theirs.
+    case "$mode" in dark) qicons=Papirus-Dark ;; *) qicons=Papirus-Light ;; esac
+    for q in qt5ct qt6ct; do
+        d="$HOME/.config/$q"
+        [ -e "$d/colors/ClemsonDark.conf" ] || continue
+        ln -sfn "Clemson$( [ "$mode" = dark ] && echo Dark || echo Light ).conf" "$d/colors/Clemson.conf"
+        [ -f "$d/$q.conf" ] && grep -q '^icon_theme=Papirus' "$d/$q.conf" &&
+            sed -i "s/^icon_theme=Papirus.*/icon_theme=$qicons/" "$d/$q.conf"
+    done
+fi
+exit 0

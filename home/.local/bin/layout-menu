@@ -1,0 +1,40 @@
+#!/bin/sh
+# Pick how the desktop in front of you arranges its windows (Super+A).
+# Moving through the list re-arranges the windows straight away so you can see each
+# layout; Enter keeps the highlighted one (remembered per desktop and screen in
+# ~/.local/state/hypr-layouts), Escape puts back what was there.
+# The layouts and each screen's default are in ~/.config/hypr/layouts.lua.
+#   layout-menu                 the menu
+#   layout-menu --preview N     (used by the menu) try the Nth layout on desktop $LAYOUT_WS
+keys="default main centre top dwindle scroll monocle grid columns deck threecol"
+if [ "$1" = --preview ]; then
+    key=$(echo $keys | cut -d' ' -f$(( $2 + 1 )))
+    [ -n "$key" ] && [ -n "$LAYOUT_WS" ] && hyprctl eval "Layouts.preview($LAYOUT_WS, '$key')" >/dev/null
+    exit 0
+fi
+ws=$(hyprctl activeworkspace -j | sed -n 's/^ *"id": *\(-\?[0-9]*\),.*/\1/p' | head -1)
+[ "${ws:-0}" -ge 11 ] 2>/dev/null || exit 0
+# open on the layout this desktop uses now: its remembered choice, else "default"
+now=$(sed -n "s/^$ws \\([a-z]*\\)$/\\1/p" "${XDG_STATE_HOME:-$HOME/.local/state}/hypr-layouts" 2>/dev/null | head -1)
+start=0; i=0
+for k in $keys; do [ "$k" = "$now" ] && start=$i; i=$((i + 1)); done
+choice=$( {
+    echo "default    this screen's usual layout"
+    echo "main       one main window, the rest stacked beside it"
+    echo "centre     main window in the middle, stacks on both sides"
+    echo "top        main window across the top, the rest in a row below"
+    echo "dwindle    each new window splits the one it lands on"
+    echo "scroll     columns on a strip you scroll sideways"
+    echo "monocle    one window at a time, full size"
+    echo "grid       an even grid, every window the same size"
+    echo "columns    one full-height column per window"
+    echo "deck       main window beside a deck: one card open, the rest folded"
+    echo "threecol   main in the centre, up to three open windows each side"
+} | "$HOME/.local/bin/qs-pick" --placeholder "Arrange this desktop" \
+        --start "$start" --on-highlight "LAYOUT_WS=$ws $HOME/.local/bin/layout-menu --preview" )
+if [ -n "$choice" ]; then
+    set -- $choice
+    hyprctl eval "Layouts.keep($ws, '$1')" >/dev/null
+else
+    hyprctl eval "Layouts.apply($ws)" >/dev/null       # cancelled: back to what it was
+fi

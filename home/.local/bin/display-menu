@@ -1,0 +1,79 @@
+#!/bin/sh
+# Display menu for Super+P (Fn+F5 on the Lemur Pro): projector modes plus the
+# laptop panel toggle. The "projector" is any output that is neither eDP-1 nor
+# one of the desk monitors listed as `desc:` rules in hyprland.lua.
+#   display-menu          # fuzzel menu
+#   display-menu check    # hotplug hook: notify if a projector just appeared
+#   display-menu gone     # unplug hook (monitor.removed): end presenting when no projector is left
+# Mirror and Projector-only also start "presenting": Do Not Disturb on and
+# hypridle stopped (screen stays awake). Extend and Laptop-only end it.
+PLACEHOLDER="Displays"
+LUA="$HOME/.config/hypr/hyprland.lua"
+
+# Name of the first output that isn't the laptop or a desk monitor (enabled or not).
+projector() {
+    known=$(sed -n 's/.*output *= *"desc:\([^"]*\)".*/\1/p' "$LUA")
+    hyprctl monitors all -j | KNOWN="$known" python3 -c '
+import json, os, sys
+known = set(filter(None, os.environ["KNOWN"].splitlines()))
+for m in json.load(sys.stdin):
+    if m["name"] != "eDP-1" and m["description"] not in known:
+        print(m["name"]); break'
+}
+
+present() {
+    : > "${XDG_RUNTIME_DIR:-/tmp}/presenting"                    # read by the shell (lecture tools, screensaver)
+    "$HOME/.local/bin/notif-dnd" on
+    systemctl --user stop hypridle.service; pkill -x hypridle     # the service, and any stray copy
+    "$HOME/.local/bin/bar-refresh" 9
+    notify-send -u critical -a Displays "Presenting" "Notifications muted and the screen stays on. Super+P → Extend or Laptop only to stop."
+}
+unpresent() {
+    rm -f "${XDG_RUNTIME_DIR:-/tmp}/presenting"
+    timeout 2 "$HOME/.nix-profile/bin/qs" ipc call lecture off >/dev/null 2>&1    # ink, spotlight, key display, zoom
+    "$HOME/.local/bin/notif-dnd" off
+    timeout 2 "$HOME/.nix-profile/bin/qs" ipc call quiet resync >/dev/null 2>&1   # a class under way gets its quiet back
+    systemctl --user start hypridle.service
+    "$HOME/.local/bin/bar-refresh" 9
+}
+
+if [ "$1" = gone ]; then
+    sleep "${DISPLAY_MENU_SETTLE:-2}"       # a dock re-plug drops and re-adds outputs: look again after it settles
+    [ -e "${XDG_RUNTIME_DIR:-/tmp}/presenting" ] || exit 0     # only ends a presentation that is on
+    hyprctl monitors all -j >/dev/null 2>&1 || exit 0          # cannot tell: leave presenting alone
+    [ -z "$(projector)" ] || exit 0                            # a projector is still there
+    unpresent
+    notify-send -a Displays "Presenting ended" "The projector was unplugged: notifications and the screen timeout are back."
+    exit 0
+fi
+
+proj=$(projector)
+
+if [ "$1" = check ]; then
+    sleep "${DISPLAY_MENU_SETTLE:-1}"   # let Hyprland finish placing it
+    proj=$(projector)
+    [ -n "$proj" ] && notify-send -a Displays "Display connected ($proj)" "Super+P (Fn+F5) to mirror, extend or present"
+    exit 0
+fi
+
+
+if [ -n "$proj" ]; then
+    items="󰍺  Extend: projector as a second screen
+󰍹  Mirror: projector shows the laptop (presenting)
+󰐯  Projector only (presenting)
+󰌢  Laptop only: projector off
+󰶐  Laptop screen on/off"
+else
+    items="󰶐  Laptop screen on/off"
+fi
+n=$(printf '%s\n' "$items" | wc -l)
+choice=$(printf '%s\n' "$items" | "$HOME/.local/bin/qs-pick" --prompt "󰍹  " --placeholder "$PLACEHOLDER${proj:+ — projector: $proj}") || exit 0
+
+set_mode() { hyprctl eval "Display.set('$1', '$proj')" >/dev/null; }
+case "$choice" in
+    *Extend*)          set_mode extend;    unpresent ;;
+    *Mirror*)          set_mode mirror;    present ;;
+    *"Projector only"*) set_mode projector; present ;;
+    *"Laptop only"*)   set_mode laptop;    unpresent ;;
+    *"Laptop screen"*) hyprctl eval 'Display.laptop_toggle()' >/dev/null ;;
+esac

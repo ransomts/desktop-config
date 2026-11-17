@@ -1,0 +1,85 @@
+#!/bin/sh
+# Battery charge limit (System76 Lemur Pro) through `system76-power charge-thresholds`.
+#
+#   charge-profile status            {"profile":"full_charge","start":90,"end":100}
+#   charge-profile list              {"full_charge":{"title":"Full Charge","start":90,"end":100}, ...}
+#   charge-profile set NAME          full_charge | balanced | max_lifespan, then a popup with the result
+#   charge-profile next              the next one in that order, wrapping
+#
+# Setting a profile needs authorisation (polkit action com.system76.powerdaemon.set-charge-thresholds is
+# auth_admin): the desktop's polkit agent asks for the password and the command waits for it, up to
+# 120 s. When it is refused or times out the profile stays as it was and the popup says so (exit 1).
+# The popup is the same kind the power profile uses (notify-send -a osd, replacing its previous one).
+# CHARGE_NOTIFY=0 turns the popup off (tests).
+bin=${SYSTEM76_POWER:-system76-power}
+order="full_charge balanced max_lifespan"
+
+popup() {
+    [ "${CHARGE_NOTIFY:-1}" = 0 ] && return 0
+    notify-send -a osd -h string:x-canonical-private-synchronous:osd-charge -i battery "$1" >/dev/null 2>&1
+}
+
+# "Profile: Balanced (balanced)" / "Start: 86" / "End: 90" -> profile start end (profile is the id in
+# brackets; a custom pair of thresholds has no profile line and becomes "custom")
+status() {
+    out=$("$bin" charge-thresholds 2>/dev/null) || return 1
+    printf '%s\n' "$out" | awk '
+        /^Profile:/ { if (match($0, /\([a-z_]+\)/)) p = substr($0, RSTART + 1, RLENGTH - 2) }
+        /^Start:/   { s = $2 }
+        /^End:/     { e = $2 }
+        END { if (s == "" || e == "") exit 1; if (p == "") p = "custom"; printf "{\"profile\":\"%s\",\"start\":%d,\"end\":%d}\n", p, s, e }'
+}
+
+list() {
+    out=$("$bin" charge-thresholds --list-profiles 2>/dev/null) || return 1
+    printf '%s\n' "$out" | awk '
+        /^[a-z_]+$/ { id = $1; next }
+        /^  Title:/ { sub(/^  Title: */, ""); t[id] = $0; next }
+        /^  Start:/ { s[id] = $2; next }
+        /^  End:/   { e[id] = $2; order[++n] = id; next }
+        END { if (n == 0) exit 1
+              printf "{"
+              for (i = 1; i <= n; i++) printf "%s\"%s\":{\"title\":\"%s\",\"start\":%d,\"end\":%d}", (i > 1 ? "," : ""), order[i], t[order[i]], s[order[i]], e[order[i]]
+              print "}" }'
+}
+
+# the plain name used in the popup (the shell's Charge.qml words it the same way)
+plain() {
+    case "$1" in
+        full_charge)  echo "Full charge" ;;
+        balanced)     echo "Balanced (stops at ${2}%)" ;;
+        max_lifespan) echo "Longest life (stops at ${2}%)" ;;
+        *)            echo "Custom (stops at ${2}%)" ;;
+    esac
+}
+
+field() { printf '%s' "$1" | sed -n "s/.*\"$2\":\"\{0,1\}\([a-z_0-9]*\).*/\1/p"; }
+
+set_profile() {
+    case " $order " in *" $1 "*) ;; *) echo "charge-profile: unknown profile '$1' (full_charge, balanced, max_lifespan)" >&2; return 2 ;; esac
+    if timeout 120 "$bin" charge-thresholds --profile "$1" >/dev/null 2>&1; then
+        now=$(status) || { popup "Charge limit set"; return 0; }
+        popup "Charge limit: $(plain "$(field "$now" profile)" "$(field "$now" end)")"
+        printf '%s\n' "$now"
+    else
+        popup "Charge limit not changed (not authorised)"
+        echo "charge-profile: could not set $1 (authorisation refused or no answer)" >&2
+        return 1
+    fi
+}
+
+case "$1" in
+    status) status || { echo "charge-profile: system76-power gave no thresholds" >&2; exit 1; } ;;
+    list)   list   || { echo "charge-profile: system76-power gave no profile list" >&2; exit 1; } ;;
+    set)    set_profile "$2" ;;
+    next)
+        cur=$(status) || { echo "charge-profile: cannot read the current profile" >&2; exit 1; }
+        cur=$(field "$cur" profile); pick=""; take=0
+        for p in $order $order; do
+            if [ "$take" = 1 ]; then pick=$p; break; fi
+            [ "$p" = "$cur" ] && take=1
+        done
+        [ -n "$pick" ] || pick=full_charge      # custom thresholds: start the cycle at full
+        set_profile "$pick" ;;
+    *) echo "usage: charge-profile status | list | set full_charge|balanced|max_lifespan | next" >&2; exit 2 ;;
+esac

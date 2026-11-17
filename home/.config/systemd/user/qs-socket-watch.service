@@ -1,0 +1,12 @@
+[Unit]
+Description=Restart Quickshell when it loses Hyprland's event socket
+ConditionEnvironment=XDG_CURRENT_DESKTOP=Hyprland
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/qs-socket-watch
+Restart=on-failure
+
+[Install]
+WantedBy=graphical-session.target

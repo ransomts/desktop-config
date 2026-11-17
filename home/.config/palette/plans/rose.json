@@ -1,0 +1,8 @@
+{
+ "name": "rose",
+ "primary": "#e0457b",
+ "secondary": "#005149",
+ "neutral": "tint",
+ "from": "from seed #e0457b, secondary by complement",
+ "overrides": {}
+}

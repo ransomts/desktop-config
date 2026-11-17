@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""sunset-times: the light/dark times and night-light warmth in ~/.config/hypr/hyprsunset.conf.
+
+  sunset-times get              {"light": "07:00", "dark": "20:00", "temp": 4500}
+  sunset-times set light HH:MM  the profile with `identity = true` (normal colours, light theme)
+  sunset-times set dark HH:MM   the profile with `temperature = N` (warm light, dark theme)
+  sunset-times set temp K       that profile's temperature (2500-6000)
+
+hyprsunset reads these profiles, and theme-by-time takes the same two times for the light and
+dark theme. After a change hyprsunset.service is restarted (if it runs) so the new times hold.
+Only the one number or time is rewritten; comments and everything else stay.
+Tests: SUNSET_CONF (the file) and SUNSET_RESTART (the restart command; "" for none).
+"""
+import json, os, re, subprocess, sys
+
+CONF = os.environ.get("SUNSET_CONF") or os.path.expanduser("~/.config/hypr/hyprsunset.conf")
+RESTART = os.environ.get("SUNSET_RESTART", "systemctl --user try-restart hyprsunset.service")
+
+def blocks(text):
+    """(start, end, body) of each `profile { ... }` block."""
+    return [(m.start(), m.end(), m.group(0)) for m in re.finditer(r"profile\s*\{[^}]*\}", text)]
+
+def kind(body):
+    if re.search(r"^\s*identity\s*=\s*true\s*$", body, re.M): return "light"
+    if re.search(r"^\s*temperature\s*=", body, re.M): return "dark"
+    return None
+
+def hm(s):
+    m = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*", s or "")
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59: return None
+    return "%02d:%02d" % (int(m.group(1)), int(m.group(2)))
+
+def read():
+    try: text = open(CONF, encoding="utf-8").read()
+    except OSError as e: sys.exit("sunset-times: cannot read %s: %s" % (CONF, e.strerror))
+    out = {}
+    for _, _, b in blocks(text):
+        k = kind(b)
+        t = re.search(r"^\s*time\s*=\s*(\S+)", b, re.M)
+        if k and t and k not in out: out[k] = hm(t.group(1)) or t.group(1)
+        if k == "dark":
+            n = re.search(r"^\s*temperature\s*=\s*(\d+)", b, re.M)
+            if n: out["temp"] = int(n.group(1))
+    return text, out
+
+def main(argv):
+    if not argv or argv[0] in ("get", "status"):
+        print(json.dumps(read()[1])); return 0
+    if argv[0] != "set" or len(argv) != 3 or argv[1] not in ("light", "dark", "temp"):
+        print(__doc__.strip().split("\n\n")[1], file=sys.stderr); return 2
+    what, val = argv[1], argv[2]
+    text, now = read()
+    if what == "temp":
+        if not val.isdigit() or not 2500 <= int(val) <= 6000: sys.exit("sunset-times: temp wants 2500-6000")
+        new = str(int(val))
+    else:
+        new = hm(val)
+        if not new: sys.exit("sunset-times: %s wants HH:MM" % what)
+        other = now.get("dark" if what == "light" else "light")
+        if other and hm(other) == new: sys.exit("sunset-times: light and dark cannot start at the same time")
+    want = "dark" if what == "temp" else what
+    for s, e, b in blocks(text):
+        if kind(b) != want: continue
+        if what == "temp": nb = re.sub(r"^(\s*temperature\s*=\s*)\d+", lambda m: m.group(1) + new, b, count=1, flags=re.M)
+        else:
+            short = new[1:] if new.startswith("0") else new        # 7:00, as the file writes it
+            nb = re.sub(r"^(\s*time\s*=\s*)\S+", lambda m: m.group(1) + short, b, count=1, flags=re.M)
+        text = text[:s] + nb + text[e:]
+        break
+    else:
+        sys.exit("sunset-times: no %s profile in %s" % (want, CONF))
+    tmp = CONF + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f: f.write(text)
+    os.replace(tmp, CONF)
+    if RESTART: subprocess.run(RESTART, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print(json.dumps(read()[1]))
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

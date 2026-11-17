@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Open one calendar event's Org entry in a new Emacs frame (the agenda band's click).
+
+    agenda-open DATE START TITLE [ID]       # e.g. 2026-11-13 12:25 "Office hours" 0400...
+    agenda-open -n DATE START TITLE [ID]    # only print FILE:LINE, open nothing
+
+The line is looked up now, not when the band last read agenda-day: pull-calendars
+rewrites ~/.emacs.d/org/calendars/*.org every ten minutes, so a remembered line number
+can point at a different event. Recurring events share one :ID:, so the match is the
+heading whose ID (or, for entries without one, title) and timestamp date + start agree.
+Exits 1 when no heading matches. Emacs is reached with `timeout 10 emacsclient -c -n`,
+which only visits a file and so cannot leave the daemon blocked.
+"""
+import glob, os, re, subprocess, sys
+
+args = sys.argv[1:]
+dry = bool(args) and args[0] == "-n"
+if dry:
+    args = args[1:]
+if len(args) not in (3, 4):
+    sys.exit("usage: agenda-open [-n] DATE START TITLE [ID]")
+date, start, title = args[:3]
+want_id = args[3] if len(args) == 4 else ""
+
+STAMP = re.compile(r"<(\d{4}-\d{2}-\d{2})(?: [^\s>\d]+)?(?: (\d{1,2}:\d{2}))?")
+pad = lambda t: t if t is None or len(t) == 5 else "0" + t
+clean = lambda h: re.sub(r"^(TODO|DONE|CANCELLED)\s+", "", re.sub(r"\s+:[\w@:]+:\s*$", "", h.strip()))
+
+def find():
+    for path in sorted(glob.glob(os.path.expanduser("~/.emacs.d/org/calendars/*.org"))):
+        head, head_title, head_id = 0, None, ""
+        try:
+            lines = open(path, encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for n, line in enumerate(lines, 1):
+            if line.startswith("* "):
+                head, head_title, head_id = n, clean(line[2:]), ""
+                continue
+            m = re.match(r":ID:\s*(\S+)", line)
+            if m:
+                head_id = m.group(1)
+                continue
+            if head_title is None or not line.startswith("<"):
+                continue
+            s = STAMP.match(line.strip())
+            if not s or s.group(1) != date or pad(s.group(2)) != start:
+                continue
+            if (want_id and head_id == want_id) or (not want_id and head_title == title):
+                return path, head
+    return None
+
+hit = find()
+if not hit and want_id:                        # the ID changed under us: fall back to the title
+    want_id = ""
+    hit = find()
+if not hit:
+    print(f"agenda-open: no entry for {date} {start} {title!r}", file=sys.stderr)
+    sys.exit(1)
+path, line = hit
+if dry:
+    print(f"{path}:{line}")
+    sys.exit(0)
+sys.exit(subprocess.call(["timeout", "10", "emacsclient", "-c", "-n", f"+{line}", path]))

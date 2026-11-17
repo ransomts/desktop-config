@@ -1,0 +1,17 @@
+#!/bin/sh
+# Clipboard history (cliphist) in a list (qs-pick: Quickshell, or fuzzel as fallback). Super+V.
+#   clip-menu          # pick an entry to copy it back to the clipboard
+#   clip-menu clear    # forget the whole history
+# The history is filled by `wl-paste --watch cliphist store`, started in hyprland.lua.
+PLACEHOLDER="Clipboard history"
+
+if [ "$1" = clear ]; then
+    cliphist wipe && notify-send -a Clipboard "Clipboard history cleared"
+    exit 0
+fi
+# The launcher's clipboard mode when Quickshell is running (`qs ipc call launcher open v`;
+# the same key again closes it); otherwise the list below.
+"$HOME/.nix-profile/bin/qs" ipc call launcher open 'v' >/dev/null 2>&1 && exit 0
+
+pick=$(cliphist list | "$HOME/.local/bin/qs-pick" --prompt "󰅌  " --placeholder "$PLACEHOLDER") || exit 0
+printf '%s' "$pick" | cliphist decode | wl-copy

@@ -1,0 +1,42 @@
+#!/bin/bash
+# gvm-lights: show / hide the GVM light controls (gvm-gui), which live on the
+# special workspace "lights" the way ncmpcpp lives on "music" (~/.local/bin/music).
+#
+#   gvm-lights        toggle them (start gvm-gui first if it isn't running)
+#   gvm-lights hide   hide them, only if showing (Esc in the window)
+#
+# The Hyprland rule "float-gvm-light" puts the window on special:lights, floating
+# and centred at its own size.  Bound to Super+Ctrl+L.  Hiding keeps gvm-gui
+# running and connected (effects keep going); close the window (Super+Q or its
+# close button) to free the lights for the phone app or `gvm`.
+set -u
+ws=lights
+class='org.example.GvmLight'
+toggle() { hyprctl dispatch "hl.dsp.workspace.toggle_special(\"$ws\")" >/dev/null; }
+running() { hyprctl clients -j | grep -q "\"class\": \"$class\""; }
+showing() {
+    hyprctl monitors -j | python3 -c '
+import json, sys
+sys.exit(0 if any(m["focused"] and m["specialWorkspace"]["name"] == "special:'"$ws"'"
+                  for m in json.load(sys.stdin)) else 1)'
+}
+# special:lights follows the focused monitor, so centre on every show.
+centre() { hyprctl dispatch "hl.dsp.window.center({ window = \"class:^org\\\\.example\\\\.GvmLight\$\" })" >/dev/null; }
+
+case "${1:-toggle}" in
+    hide)
+        showing && toggle ;;
+    toggle)
+        if running; then
+            toggle
+            showing && centre
+        else
+            setsid -f "$HOME/.local/bin/gvm-gui" >/dev/null 2>&1
+            # Show the workspace once the window has landed on it.
+            for _ in $(seq 50); do running && break; sleep 0.1; done
+            showing || toggle
+            centre
+        fi ;;
+    *)
+        echo "usage: gvm-lights [toggle|hide]" >&2; exit 2 ;;
+esac

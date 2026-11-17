@@ -1,0 +1,588 @@
+#!/home/user/.local/share/gvm/venv/bin/python -I
+"""gvm - control GVM BLE video lights (tested: GVM 800D-RGB, advertises as BT_LED).
+
+Protocol (from homebridge-gvm-ble-lights, corrected for the 800D-RGB):
+  frame = "LT" <len of rest> <body> <crc16-xmodem of everything before, big-endian>
+  set register:  body = 00 30 57 00 <reg> 01 <value>   (the 800D ignores the plugin's 00 20)
+  info request:  body = 00 00 53 00 00 01 00   -> reply 00 30 53 00 00 02 <cct min> <cct max>
+  light reports: 00 30 02 00 <reg> <val>       one register changed
+                 00 30 03 <reg 0..8 values>    full status, about every 5 s
+  One notification can carry several frames back to back.
+Registers (decoded 2026-11-17, partly by webcam):
+  0 on/off   1 channel   2 brightness 0-100   3 colour temp in K/100 (32-56)
+  4 hue in 5-degree steps (0-71: 0 red, 24 green, 48 blue)   5 saturation 0-100
+  6 mode: 1 white (CCT), 2 colour (HSI)   7, 8 unknown (seen 4, 1; probably effects)
+The light takes one connection at a time: close the phone app first.
+"""
+import argparse, asyncio, math, os, random, signal, sys
+from bleak import BleakClient, BleakScanner
+
+LIGHTS_FILE = os.path.expanduser("~/.config/gvm/lights")  # lines of "name address", first is the default
+
+
+def load_lights() -> dict[str, str]:
+    lights = {}
+    try:
+        for line in open(LIGHTS_FILE):
+            parts = line.split("#")[0].split()
+            if len(parts) >= 2:
+                lights[parts[0]] = parts[1].upper()
+    except OSError:
+        pass
+    return lights
+
+
+LIGHTS = load_lights()
+PRESETS_FILE = os.path.expanduser("~/.config/gvm/presets.json")
+
+
+def load_presets() -> dict:
+    """{"Name": {"note": ..., "<light name>" | "all": {on, mode, cct, hue, sat, bright}}}"""
+    import json
+    try:
+        d = json.load(open(PRESETS_FILE))
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def preset_settings(preset: dict, light: str) -> dict | None:
+    """The settings a preset gives one light (its own entry, else "all"), or None."""
+    s = preset.get(light, preset.get("all"))
+    return s if isinstance(s, dict) else None
+DEFAULT_ADDR = os.environ.get("GVM_ADDR") or next(iter(LIGHTS.values()), "A4:C1:38:5C:81:F8")
+
+
+def resolve(which: str) -> list[tuple[str, str]]:
+    """A light name, an address, or "all" -> [(label, address)]."""
+    if which == "all":
+        if not LIGHTS:
+            sys.exit(f"gvm: no lights named in {LIGHTS_FILE}")
+        return list(LIGHTS.items())
+    if which in LIGHTS:
+        return [(which, LIGHTS[which])]
+    if which.count(":") == 5:
+        addr = which.upper()
+        return [(next((n for n, a in LIGHTS.items() if a == addr), addr), addr)]
+    sys.exit(f"gvm: unknown light {which!r} (names: {', '.join(LIGHTS) or 'none'}; see {LIGHTS_FILE})")
+CH = "00010203-0405-0607-0809-0a0b0c0d2b10"
+ON, CHANNEL, BRIGHT, CCT, HUE, SAT, MODE = range(7)
+MODE_WHITE, MODE_COLOUR = 1, 2
+
+
+def crc16(b: bytes) -> bytes:
+    c = 0
+    for x in b:
+        c ^= x << 8
+        for _ in range(8):
+            c = ((c << 1) ^ 0x1021) if c & 0x8000 else c << 1
+            c &= 0xFFFF
+    return c.to_bytes(2, "big")
+
+
+def frame(body: bytes) -> bytes:
+    u = bytes([0x4C, 0x54, len(body) + 2]) + body
+    return u + crc16(u)
+
+
+def setreg(reg: int, val: int) -> bytes:
+    return frame(bytes([0x00, 0x30, 0x57, 0x00, reg, 0x01, val & 0xFF]))
+
+
+INFO = frame(bytes([0x00, 0x00, 0x53, 0x00, 0x00, 0x01, 0x00]))
+
+
+def hue_reg(degrees: float) -> int:
+    return round((degrees % 360) / 5) % 72
+
+
+def parse(data: bytes):
+    """Split a notification into frames and yield ("status", [values]),
+    ("change", reg, val) or ("range", lo, hi) for each one with a good CRC."""
+    i = 0
+    while i + 3 <= len(data):
+        if data[i:i + 2] != b"LT":
+            i += 1
+            continue
+        end = i + 3 + data[i + 2]
+        f = data[i:end]
+        i = end
+        if len(f) < 8 or crc16(f[:-2]) != f[-2:]:
+            continue
+        body = f[5:-2]  # after "LT", length and the 00 30 prefix
+        if body[0] == 0x03 and len(body) >= 5:
+            yield ("status", list(body[1:]))
+        elif body[0] == 0x02 and len(body) >= 4:
+            yield ("change", body[2], body[3])
+        elif body[0] == 0x53 and len(body) >= 6:
+            yield ("range", body[4], body[5])
+
+
+def describe(v: list[int]) -> str:
+    parts = ["on" if v[ON] else "off", f"bright {v[BRIGHT]}%"]
+    if len(v) > MODE and v[MODE] == MODE_COLOUR:
+        parts.append(f"colour hue {v[HUE] * 5}° sat {v[SAT]}%")
+    else:
+        parts.append(f"white {v[CCT] * 100}K")
+    parts.append(f"ch {v[CHANNEL]}")
+    return "  ".join(parts) + f"  raw {v}"
+
+
+_connecting: asyncio.Lock | None = None
+
+
+async def connect(addr: str, tries: int = 3) -> BleakClient:
+    """BlueZ runs one discovery at a time, so with several lights the connects take turns."""
+    global _connecting
+    if _connecting is None:
+        _connecting = asyncio.Lock()
+    async with _connecting:
+        return await _connect(addr, tries)
+
+
+async def _connect(addr: str, tries: int) -> BleakClient:
+    last = None
+    for _ in range(tries):
+        dev = await BleakScanner.find_device_by_address(addr, timeout=8)
+        if dev is None:
+            last = f"light {addr} not found (off, out of range, or held by the phone app?)"
+            continue
+        c = BleakClient(dev, timeout=15)
+        try:
+            await c.connect()
+            return c
+        except Exception as e:  # noqa: BLE001
+            last = str(e)
+    raise RuntimeError(last)
+
+
+WRITE_GAP = 0.15  # seconds after each write; the light drops writes sent too close together
+
+
+async def session(addr: str, verbose: bool, plan) -> None:
+    """Connect, subscribe, read the status, then let `plan(status, write)` act."""
+    status: dict = {}
+    got = asyncio.Event()
+
+    def note(_, d: bytearray) -> None:
+        if verbose:
+            print("<<", d.hex(), file=sys.stderr)
+        for item in parse(bytes(d)):
+            if item[0] == "status":
+                status["v"] = item[1]
+                got.set()
+
+    c = await connect(addr)
+    try:
+        await c.start_notify(CH, note)
+
+        async def write(reg: int, val: int) -> None:
+            if verbose:
+                print(">> reg", reg, "=", val, file=sys.stderr)
+            await c.write_gatt_char(CH, setreg(reg, val), response=False)
+            await asyncio.sleep(WRITE_GAP)
+
+        async def read() -> list[int]:
+            got.clear()
+            await c.write_gatt_char(CH, INFO, response=False)
+            try:
+                await asyncio.wait_for(got.wait(), 7)
+            except asyncio.TimeoutError:
+                raise RuntimeError("no status report from the light")
+            return status["v"]
+
+        await plan(read, write)
+        await asyncio.sleep(0.3)
+    finally:
+        await c.disconnect()
+
+
+
+# ---------------------------------------------------------------- effects
+# Effects are run from this side: a stream of register writes. Each effect gets
+# an FX with one writer per light, so they can do different things per light.
+ORANGE, PURPLE = 25, 270  # Clemson orange #F56600 and Regalia #522D80, as light hues (degrees)
+# mode is written after colour/temperature: those switch the light's mode themselves
+_KEYS = (("cct", CCT), ("hue", HUE), ("sat", SAT), ("mode", MODE), ("bright", BRIGHT), ("on", ON))
+
+
+class FX:
+    def __init__(self, writers, bases, speed=lambda: 1.0):
+        self.w, self.base, self.speed, self.n = writers, bases, speed, len(writers)
+
+    async def set(self, i, **kw):
+        """set(i, mode="colour"|"white", cct=K, hue=degrees, sat=%, bright=%, on=0/1)"""
+        for key, reg in _KEYS:
+            if key in kw:
+                v = kw[key]
+                v = {"mode": lambda x: MODE_COLOUR if x == "colour" else MODE_WHITE,
+                     "hue": hue_reg, "cct": lambda x: round(x / 100)}.get(key, lambda x: x)(v)
+                await self.w[i](reg, max(0, min(255, int(round(v)))))
+
+    async def all(self, **kw):
+        for i in range(self.n):
+            await self.set(i, **kw)
+
+    async def sleep(self, s):
+        await asyncio.sleep(s / max(0.1, self.speed()))
+
+    def b(self, i, frac=1.0):
+        """Brightness as a fraction of what the light was at when the effect started."""
+        return max(1, round(self.base[i] * frac))
+
+
+async def fx_tiger_rag(fx):
+    await fx.all(mode="colour", sat=100)
+    k = 0
+    while True:
+        for i in range(fx.n):
+            await fx.set(i, hue=ORANGE if (i + k) % 2 == 0 else PURPLE, bright=fx.b(i))
+        k += 1
+        await fx.sleep(1.0)
+
+
+async def fx_touchdown(fx):
+    await fx.all(mode="colour", sat=100)
+    for colour in (ORANGE, PURPLE, ORANGE):
+        await fx.all(hue=colour)
+        for k in range(8):
+            for i in range(fx.n):
+                await fx.set(i, bright=100 if (k + i) % 2 == 0 else 0)
+            await fx.sleep(0.15)
+    for k in range(6):
+        for i in range(fx.n):
+            await fx.set(i, hue=ORANGE if (i + k) % 2 == 0 else PURPLE, bright=100)
+        await fx.sleep(0.45)
+
+
+async def fx_paw_pulse(fx):
+    await fx.all(mode="colour", sat=100, hue=ORANGE)
+    while True:
+        for _beat in range(2):
+            await fx.all(bright=100)
+            await fx.sleep(0.12)
+            for i in range(fx.n):
+                await fx.set(i, bright=fx.b(i, 0.25))
+            await fx.sleep(0.2)
+        await fx.sleep(0.9)
+
+
+async def fx_death_valley(fx):
+    await fx.all(mode="colour", sat=100)
+    k = 0
+    while True:
+        for i in range(fx.n):
+            await fx.set(i, hue=ORANGE if (i + k) % 2 == 0 else PURPLE)
+        for step in list(range(0, 101, 10)) + list(range(90, -1, -10)):
+            for i in range(fx.n):
+                await fx.set(i, bright=fx.b(i, step / 100))
+            await fx.sleep(0.12)
+        k += 1
+
+
+async def fx_solid_orange(fx):
+    await fx.all(mode="colour", sat=100, hue=ORANGE)
+    for i in range(fx.n):
+        await fx.set(i, bright=fx.b(i))
+
+
+async def fx_rainbow(fx):
+    await fx.all(mode="colour", sat=100)
+    for i in range(fx.n):
+        await fx.set(i, bright=fx.b(i))
+    h = 0
+    while True:
+        for i in range(fx.n):
+            await fx.set(i, hue=(h + i * 360 / fx.n) % 360)
+        h = (h + 5) % 360
+        await fx.sleep(0.15)
+
+
+async def fx_breathe(fx):
+    t = 0.0
+    while True:
+        f = 0.12 + 0.88 * (0.5 - 0.5 * math.cos(t))
+        for i in range(fx.n):
+            await fx.set(i, bright=fx.b(i, f))
+        t += 0.25
+        await fx.sleep(0.12)
+
+
+async def fx_candle(fx):
+    await fx.all(mode="white", cct=3200)
+    while True:
+        for i in range(fx.n):
+            await fx.set(i, bright=fx.b(i, random.uniform(0.45, 1.0)))
+        await fx.sleep(random.uniform(0.08, 0.25))
+
+
+async def fx_lightning(fx):
+    await fx.all(mode="white", cct=5600, bright=2)
+    while True:
+        await fx.sleep(random.uniform(1.5, 5))
+        for _flash in range(random.randint(1, 3)):
+            hit = [i for i in range(fx.n) if random.random() < 0.8] or [random.randrange(fx.n)]
+            for i in hit:
+                await fx.set(i, bright=100)
+            await fx.sleep(random.uniform(0.05, 0.12))
+            for i in hit:
+                await fx.set(i, bright=2)
+            await fx.sleep(random.uniform(0.05, 0.2))
+
+
+async def fx_police(fx):
+    await fx.all(mode="colour", sat=100)
+    k = 0
+    while True:
+        for i in range(fx.n):
+            await fx.set(i, hue=0 if (i + k // 6) % 2 == 0 else 240, bright=100 if k % 2 == 0 else 0)
+        k += 1
+        await fx.sleep(0.1)
+
+
+async def fx_disco(fx):
+    await fx.all(mode="colour", sat=100)
+    for i in range(fx.n):
+        await fx.set(i, bright=fx.b(i))
+    while True:
+        for i in range(fx.n):
+            await fx.set(i, hue=random.randrange(0, 360, 5))
+        await fx.sleep(0.4)
+
+
+# name: (title, function, Clemson-themed, keep the result when it ends instead of restoring)
+EFFECTS = {
+    "tiger-rag":    ("Tiger Rag",    fx_tiger_rag,    True,  False),
+    "touchdown":    ("Touchdown!",   fx_touchdown,    True,  False),
+    "paw-pulse":    ("Paw Pulse",    fx_paw_pulse,    True,  False),
+    "death-valley": ("Death Valley", fx_death_valley, True,  False),
+    "solid-orange": ("Solid Orange", fx_solid_orange, True,  True),
+    "rainbow":      ("Rainbow",      fx_rainbow,      False, False),
+    "breathe":      ("Breathe",      fx_breathe,      False, False),
+    "candle":       ("Candle",       fx_candle,       False, False),
+    "lightning":    ("Lightning",    fx_lightning,    False, False),
+    "police":       ("Police",       fx_police,       False, False),
+    "disco":        ("Disco",        fx_disco,        False, False),
+}
+
+
+async def restore(writers, snaps):
+    """Put each light back as it was: snaps[i][reg] for the registers effects touch."""
+    for w, v in zip(writers, snaps):
+        # mode last: writing a hue or saturation switches the light to colour mode,
+        # and writing a colour temperature switches it to white
+        for reg in (CCT, HUE, SAT, MODE, BRIGHT, ON):
+            await w(reg, v[reg])
+
+
+async def run_effect(name, writers, snaps, speed=lambda: 1.0, should_restore=lambda: True):
+    """Run an effect until it ends or is cancelled, then restore the lights
+    (unless it is a keeper like Solid Orange, or should_restore() says not to)."""
+    _title, func, _clemson, keep = EFFECTS[name]
+    fx = FX(writers, [v[BRIGHT] if v[BRIGHT] >= 20 else 60 for v in snaps], speed)
+    await fx.all(on=1)
+    finished = False
+    try:
+        await func(fx)
+        finished = True
+    finally:
+        if not (finished and keep) and should_restore():
+            await restore(writers, snaps)
+
+
+async def effect_cli(targets, name, speed, seconds, verbose):
+    """Connect to every light, run the effect until Ctrl-C / --seconds / it ends, restore."""
+    global WRITE_GAP
+    WRITE_GAP = 0.06
+    arrived, joined = [], asyncio.Event()
+    done = asyncio.Event()
+    count = {"n": 0}
+
+    def arrive():
+        count["n"] += 1
+        if count["n"] == len(targets):
+            joined.set()
+
+    async def plan(read, write, label):
+        arrived.append((label, write, await read()))
+        arrive()
+        await done.wait()
+
+    async def one(label, addr):
+        try:
+            await session(addr, verbose, lambda r, w: plan(r, w, label))
+        except Exception as e:  # noqa: BLE001
+            print(f"gvm: {label}: {e}", file=sys.stderr)
+            if not any(lbl == label for lbl, _, _ in arrived):
+                arrive()
+
+    sessions = [asyncio.ensure_future(one(n, ad)) for n, ad in targets]
+    await joined.wait()
+    if not arrived:
+        done.set()
+        await asyncio.gather(*sessions)
+        sys.exit("gvm: no lights connected")
+    print(f"{EFFECTS[name][0]} on {', '.join(l for l, _, _ in arrived)}"
+          + ("" if EFFECTS[name][3] else " (Ctrl-C to stop)"), file=sys.stderr)
+    task = asyncio.ensure_future(run_effect(name, [w for _, w, _ in arrived], [v for _, _, v in arrived],
+                                            lambda: speed))
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGINT, task.cancel)
+    loop.add_signal_handler(signal.SIGTERM, task.cancel)
+    if seconds:
+        loop.call_later(seconds, task.cancel)
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    done.set()
+    await asyncio.gather(*sessions)
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(
+        prog="gvm",
+        description="Control a GVM Bluetooth light (800D-RGB, shows up as BT_LED).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  gvm status          show on/off, brightness, mode and colour, channel
+  gvm toggle          flip the light on or off
+  gvm bright 60       brightness to 60%
+  gvm cct 5600        white light, daylight (3200-5600K)
+  gvm color 240       colour mode, blue (hue in degrees: 0 red, 120 green, 240 blue)
+  gvm color 30 50     orange at half saturation
+  gvm white           back to white light at the last colour temperature
+  gvm -l all off      every light in the lights file
+  gvm -l fill bright 20
+  gvm scan            find lights in range and their addresses
+  gvm preset camera   the saved webcam look (gvm preset: list presets)
+  gvm -l all effect tiger-rag      Clemson orange/purple swap until Ctrl-C
+  gvm effect touchdown -s 1.5      a one-shot celebration, 1.5x speed
+  gvm -v set 7 4      raw register write, printing the frames
+
+Lights file (~/.config/gvm/lights), one per line, first is the default:
+  key   A4:C1:38:5C:81:F8
+
+The light takes one connection at a time: close the GVM phone app (and gvm-gui) first.
+Each command connects, acts, and disconnects (about 3-5 s).""",
+    )
+    p.add_argument("-l", "-a", "--light", dest="light", default=DEFAULT_ADDR,
+                   help=f"light name from {LIGHTS_FILE}, an address, or 'all' (default: the first light listed)")
+    p.add_argument("-v", "--verbose", action="store_true", help="print raw frames sent and received")
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="command")
+    sub.add_parser("status", help="show the light's current state")
+    sub.add_parser("scan", help="list GVM lights in range (closed by the app or gvm-gui: hidden)")
+    sub.add_parser("on", help="turn the light on")
+    sub.add_parser("off", help="turn the light off")
+    sub.add_parser("toggle", help="turn it off if on, on if off")
+    b = sub.add_parser("bright", help="set brightness, 0-100")
+    b.add_argument("value", type=int, help="percent, 0-100")
+    t = sub.add_parser("cct", help="white light at a colour temperature, e.g. 5600")
+    t.add_argument("kelvin", type=int, help="kelvin, rounded to the nearest 100 (3200-5600)")
+    sub.add_parser("white", help="switch to white light (keeps the colour temperature)")
+    col = sub.add_parser("color", aliases=["colour"], help="colour light: hue in degrees, optional saturation")
+    col.add_argument("hue", type=float, help="degrees, 0-360 (0 red, 120 green, 240 blue), in 5-degree steps")
+    col.add_argument("sat", type=int, nargs="?", help="saturation percent, 0-100 (default: leave as is)")
+    e = sub.add_parser("effect", help="run an effect (Ctrl-C stops it and restores the lights)")
+    e.add_argument("name", choices=list(EFFECTS), metavar="name", help="one of: " + ", ".join(EFFECTS))
+    e.add_argument("-s", "--speed", type=float, default=1.0, help="speed multiplier (default 1)")
+    e.add_argument("-t", "--seconds", type=float, help="stop after this many seconds")
+    pr = sub.add_parser("preset", help="apply a saved preset (no name: list them)")
+    pr.add_argument("name", nargs="?", help=f"a preset in {PRESETS_FILE}, any case")
+    r = sub.add_parser("set", help="raw register write")
+    r.add_argument("reg", type=int, help="register (0 on, 1 ch, 2 bright, 3 cct, 4 hue, 5 sat, 6 mode, 7-8 unknown)")
+    r.add_argument("value", type=int, help="value 0-255")
+    a = p.parse_args()
+    clamp = lambda v, lo, hi: max(lo, min(hi, v))  # noqa: E731
+
+    if a.cmd == "preset":
+        presets = load_presets()
+        if not a.name:
+            for n, pdef in presets.items():
+                print(f"{n:14} {pdef.get('note', '')}")
+            if not presets:
+                print(f"no presets in {PRESETS_FILE}")
+            return
+        name = next((n for n in presets if n.lower() == a.name.lower()), None)
+        if name is None:
+            sys.exit(f"gvm: no preset {a.name!r} (have: {', '.join(presets) or 'none'})")
+        pdef = presets[name]
+        # every light the preset names (or all lights for an "all" entry), unless -l narrows it
+        if a.light == DEFAULT_ADDR and "-l" not in sys.argv and "--light" not in sys.argv and "-a" not in sys.argv:
+            names = [n for n in LIGHTS if preset_settings(pdef, n)]
+            a.light = "all" if len(names) != 1 else names[0]
+    targets = resolve(a.light)
+    multi = len(targets) > 1
+
+    async def plan(read, write, label):
+        cmd = {"colour": "color"}.get(a.cmd, a.cmd)
+        say = (lambda t: print(f"{label}: {t}")) if multi else print
+        if cmd == "status":
+            say(describe(await read()))
+        elif cmd == "on":
+            await write(ON, 1)
+        elif cmd == "off":
+            await write(ON, 0)
+        elif cmd == "toggle":
+            new = 0 if (await read())[ON] else 1
+            await write(ON, new)
+            say("on" if new else "off")
+        elif cmd == "bright":
+            await write(BRIGHT, clamp(a.value, 0, 100))
+        elif cmd == "cct":
+            await write(CCT, clamp(round(a.kelvin / 100), 32, 56))
+            await write(MODE, MODE_WHITE)
+        elif cmd == "white":
+            await write(MODE, MODE_WHITE)
+        elif cmd == "color":
+            await write(HUE, hue_reg(a.hue))
+            if a.sat is not None:
+                await write(SAT, clamp(a.sat, 0, 100))
+            await write(MODE, MODE_COLOUR)
+        elif cmd == "set":
+            await write(a.reg, a.value)
+        elif cmd == "preset":
+            pdef = next(v for n, v in load_presets().items() if n.lower() == a.name.lower())
+            settings = preset_settings(pdef, label)
+            if settings is None:
+                say("not in this preset, left alone")
+                return
+            await FX([write], [60]).set(0, **settings)
+
+    if a.cmd == "scan":
+        asyncio.run(scan())
+        return
+    if a.cmd == "effect":
+        asyncio.run(effect_cli(targets, a.name, a.speed, a.seconds, a.verbose))
+        return
+
+    async def one(label, addr):
+        try:
+            await session(addr, a.verbose, lambda r, w: plan(r, w, label))
+            return True
+        except Exception as e:  # noqa: BLE001
+            print(f"gvm: {label}: {e}", file=sys.stderr)
+            return False
+
+    async def every():
+        return await asyncio.gather(*(one(n, ad) for n, ad in targets))
+
+    sys.exit(0 if all(asyncio.run(every())) else 1)
+
+
+async def scan() -> None:
+    found = await BleakScanner.discover(timeout=10, return_adv=True)
+    names = {ad: n for n, ad in LIGHTS.items()}
+    hits = [(ad, adv.rssi) for ad, (d, adv) in found.items()
+            if adv.local_name == "BT_LED" or "00001812-0000-1000-8000-00805f9b34fb" in adv.service_uuids and ad.startswith("A4:C1:38")]
+    for ad, rssi in sorted(hits, key=lambda h: -h[1]):
+        print(f"{ad}  {rssi} dBm  {names.get(ad, '(not in lights file)')}")
+    missing = [n for n, ad in LIGHTS.items() if ad not in dict(hits)]
+    if missing:
+        print("not seen:", ", ".join(missing), "(off, or connected to the app or gvm-gui)")
+    if not hits:
+        print("no GVM lights advertising")
+
+
+if __name__ == "__main__":
+    main()

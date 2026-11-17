@@ -1,0 +1,16 @@
+# Desktop palette: orange for the active pane and selection marks, the terminal's purple
+# and grey for the rest (terminal colour names follow dark/light with Ghostty).
+gui:
+  nerdFontsVersion: "3"
+  theme:
+    activeBorderColor: ["#f56600", bold]
+    inactiveBorderColor: [default]
+    searchingActiveBorderColor: [magenta, bold]
+    optionsTextColor: [magenta]
+    selectedLineBgColor: [reverse]
+    inactiveViewSelectedLineBgColor: [bold]
+    cherryPickedCommitFgColor: ["#f56600"]
+    cherryPickedCommitBgColor: [default]
+    markedBaseCommitFgColor: ["#f56600"]
+    unstagedChangesColor: [red]
+    defaultFgColor: [default]

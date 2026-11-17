@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""Save which apps are open on which desktop, for the opt-in session restore.
+
+  session-save              write $XDG_STATE_HOME/session/last.json (the old one becomes prev.json)
+  session-save --print      print what would be saved, write nothing
+  session-save --if-enabled do nothing unless ~/.config/shell/session.json has "enabled": true
+                            (the timer and the logout hook use this)
+
+Saved per window on a normal desktop (workspace 11 and up; special workspaces, dialogs, shell
+helpers and apps with no .desktop file are left out): the .desktop id, desktop number, monitor
+slot (1 = leftmost, as in hyprland.lua's Desk), floating and size when floating, and for
+ghostty the working directory when it can be told (see session_lib.terminal_cwds). Window
+titles, addresses and pids are never stored. An empty result does not replace a saved session.
+"""
+import argparse, json, os, sys, time
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import session_lib as L
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--print", action="store_true", dest="show")
+    ap.add_argument("--if-enabled", action="store_true")
+    ap.add_argument("--force", action="store_true", help="replace a saved session even with an empty one")
+    a = ap.parse_args()
+    if a.if_enabled and not L.load_config().get("enabled"):
+        return 0
+    try:
+        clients, monitors = L.hyprctl_json("clients"), L.hyprctl_json("monitors")
+    except Exception as ex:
+        print("session-save:", ex, file=sys.stderr)
+        return 1
+    entries, skipped = L.snapshot(clients, monitors, L.desktop_table())
+    doc = {"version": 1, "saved": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "monitors": len(monitors), "entries": entries}
+    if a.show:
+        print(json.dumps(doc, indent=1, ensure_ascii=False))
+        if skipped:
+            print("left out:", ", ".join("%d %s" % (v, k) for k, v in skipped.items()), file=sys.stderr)
+        return 0
+    d = L.state_dir()
+    last = os.path.join(d, "last.json")
+    old = L.load_last()
+    if not entries and old and old["entries"] and not a.force:
+        print("session-save: nothing to save, kept the earlier session", file=sys.stderr)
+        return 0
+    if old and old["entries"] == entries and old.get("monitors") == doc["monitors"]:
+        return 0        # unchanged: no new timestamp, and prev.json stays the session before this one
+    if old:
+        L.write_json(os.path.join(d, "prev.json"), old)
+    L.write_json(last, doc)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

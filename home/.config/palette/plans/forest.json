@@ -1,0 +1,8 @@
+{
+ "name": "forest",
+ "primary": "#3fa34d",
+ "secondary": "#4b4700",
+ "neutral": "tint",
+ "from": "from seed #3fa34d, secondary by analogous",
+ "overrides": {}
+}

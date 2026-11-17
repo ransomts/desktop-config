@@ -1,0 +1,19 @@
+#!/bin/sh
+# Do Not Disturb (through notif-dnd), used by the bar pill.
+#   dnd-toggle          # flip it
+#   dnd-toggle status   # print JSON (text, tooltip, class) for the pill
+# While it is on, only critical notifications pop up; the rest are listed under the bell pill (Super+N).
+# (The pill itself now reads the state straight from Quickshell; "status" is still used by the control panel.)
+on() { [ "$("$HOME/.local/bin/notif-dnd" status)" = on ]; }
+
+case "$1" in
+    status)
+        if on; then
+            printf '{"text":"󰂛","tooltip":"<b>Notifications</b>: Do Not Disturb\\nClick: turn notifications back on\\nRight-click: notification history","class":"on"}\n'
+        else
+            printf '{"text":"󰂚","tooltip":"<b>Notifications</b>: on\\nClick: Do Not Disturb\\nRight-click: notification history","class":"off"}\n'
+        fi ;;
+    *)
+        "$HOME/.local/bin/notif-dnd" toggle
+        "$HOME/.local/bin/bar-refresh" 9 ;;
+esac

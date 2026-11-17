@@ -1,0 +1,84 @@
+[
+  {
+    "path": ".config/quickshell/Theme.qml"
+  },
+  {
+    "path": ".config/quickshell/palettes.js"
+  },
+  {
+    "path": ".config/hypr/hyprland.lua",
+    "bare": true
+  },
+  {
+    "path": ".config/hypr/hyprlock.conf",
+    "bare": true
+  },
+  {
+    "path": ".config/ghostty/themes/Clemson Dark",
+    "skip": "^palette = (?!208=)"
+  },
+  {
+    "path": ".config/ghostty/themes/Clemson Light",
+    "skip": "^palette = (?!208=)"
+  },
+  {
+    "path": ".config/fuzzel/colors-dark.ini",
+    "bare": true
+  },
+  {
+    "path": ".config/fuzzel/colors-light.ini",
+    "bare": true
+  },
+  {
+    "path": ".config/gtk-3.0/accent-dark.css"
+  },
+  {
+    "path": ".config/gtk-3.0/accent-light.css"
+  },
+  {
+    "path": ".config/gtk-4.0/accent-dark.css"
+  },
+  {
+    "path": ".config/gtk-4.0/accent-light.css"
+  },
+  {
+    "path": ".config/btop/themes/clemson-dark.theme"
+  },
+  {
+    "path": ".config/btop/themes/clemson-light.theme"
+  },
+  {
+    "path": ".config/cava/config"
+  },
+  {
+    "path": ".config/lazygit/config.yml"
+  },
+  {
+    "path": ".config/mpv/mpv.conf"
+  },
+  {
+    "path": ".config/mpv/script-opts/uosc.conf",
+    "bare": true
+  },
+  {
+    "path": ".config/git/config"
+  },
+  {
+    "path": ".config/drift/config.toml"
+  },
+  {
+    "path": ".mozilla/firefox/idcdk0p9.default-release/chrome/userChrome.css"
+  },
+  {
+    "path": ".config/qt5ct/colors/ClemsonDark.conf"
+  },
+  {
+    "path": ".config/qt5ct/colors/ClemsonLight.conf"
+  },
+  {
+    "path": ".config/qt6ct/colors/ClemsonDark.conf"
+  },
+  {
+    "path": ".config/qt6ct/colors/ClemsonLight.conf"
+  }
+]

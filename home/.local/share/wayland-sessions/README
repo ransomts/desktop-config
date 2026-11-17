@@ -1,0 +1,5 @@
+hyprland.desktop lives here (not /usr/share) so cosmic-greeter doesn't list the
+plain, non-uwsm "Hyprland" session, while uwsm (which searches XDG_DATA_HOME
+first) can still resolve "hyprland.desktop" for the "Hyprland (uwsm-managed)"
+entry. The system copy is dpkg-diverted to hyprland.desktop.no-greeter.
+Added 2026-11-10.

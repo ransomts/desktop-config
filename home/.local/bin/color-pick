@@ -1,0 +1,5 @@
+#!/bin/sh
+# Super+Ctrl+C: click any pixel; its hex color is copied and shown.
+hex=$(hyprpicker -a -f hex 2>/dev/null) || exit 0
+[ -n "$hex" ] || exit 0
+notify-send -a "Color picker" -i color-select "Copied $hex" "<span background='$hex'>            </span>"

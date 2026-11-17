@@ -1,0 +1,19 @@
+# Quickshell polkit agent (~/.config/quickshell/authprompt.qml). Started only by
+# ~/.local/bin/polkit-agent-start (no [Install]: never by COSMIC's graphical-session.target).
+# If it crashes or gives up (exit 3: polkit did not accept it), hyprpolkitagent comes back.
+# Starting hyprpolkitagent (by hand or by graphical-session.target) stops this one: one agent per session.
+[Unit]
+Description=Quickshell polkit agent (authprompt.qml)
+PartOf=graphical-session.target
+After=graphical-session.target
+Conflicts=hyprpolkitagent.service
+OnFailure=hyprpolkitagent.service
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env -u QT_QPA_PLATFORMTHEME %h/.nix-profile/bin/nixGLIntel %h/.nix-profile/bin/qs -p %h/.config/quickshell/authprompt.qml
+ExecStopPost=/bin/rm -f %t/qs-polkit.state
+Restart=no
+Slice=session.slice
+TimeoutStopSec=5

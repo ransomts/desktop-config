@@ -1,0 +1,13 @@
+[Unit]
+Description=Count what the mouse does under Hyprland (~/.local/state/keystats/mouse.json)
+Documentation=file://%h/.local/bin/mousestats
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/mousestats
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,90 @@
+#!/bin/sh
+# Pick the session's polkit agent: the password prompt for pkexec, mounting, package installs
+# and systemd actions. Run by Hyprland at login; safe to run again.
+#
+#   polkit-agent-start           the Quickshell prompt (~/.config/quickshell/authprompt.qml); if it
+#                                has not registered with polkit within 3 s, hyprpolkitagent instead
+#   polkit-agent-start --hypr    hyprpolkitagent (the old prompt); also the one-command revert
+#   polkit-agent-start --status  which one is active: quickshell | hyprpolkitagent | none
+#
+# Only one agent can be registered per session, so the other one is stopped first, always by
+# its systemd user unit (never by process name). The Quickshell prompt runs as
+# qs-polkit.service: the installed unit file if there is one, else a transient unit of the same
+# name made here with the same settings. Either way OnFailure= starts hyprpolkitagent if the
+# prompt crashes or gives up later, and Conflicts= stops the prompt if hyprpolkitagent is started
+# (by hand, or by graphical-session.target, which it is enabled under).
+# The prompt writes "registered" (or "failed") to $XDG_RUNTIME_DIR/qs-polkit.state.
+qs="$HOME/.nix-profile/bin/qs"
+gl="$HOME/.nix-profile/bin/nixGLIntel"
+cfg="$HOME/.config/quickshell/authprompt.qml"
+state="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/qs-polkit.state"
+unit=qs-polkit.service
+old=hyprpolkitagent.service
+wait_tenths=${POLKIT_AGENT_WAIT:-30}            # 3 s
+
+sc() { systemctl --user "$@"; }
+is_active() { sc -q is-active "$1" 2>/dev/null; }
+registered() { [ "$(cat "$state" 2>/dev/null)" = registered ]; }
+
+status() {
+    if is_active "$unit" && registered; then echo quickshell
+    elif is_active "$old"; then echo hyprpolkitagent
+    elif is_active "$unit"; then echo "none (the Quickshell prompt is running but not registered)"
+    else echo none; fi
+}
+
+use_hypr() {
+    sc stop "$unit" 2>/dev/null
+    sc reset-failed "$unit" 2>/dev/null
+    rm -f "$state"
+    sc start "$old"
+}
+
+use_quickshell() {
+    if [ ! -x "$qs" ] || [ ! -f "$cfg" ]; then
+        echo "polkit-agent-start: no $qs or no $cfg; using hyprpolkitagent" >&2
+        use_hypr; return 1
+    fi
+    if is_active "$unit" && registered; then return 0; fi     # already the agent
+    # At login graphical-session.target may still be starting hyprpolkitagent (it is enabled
+    # there); a late start would stop the prompt again (Conflicts=). Wait for that, up to 10 s.
+    i=0
+    while [ "$i" -lt 100 ]; do
+        is_active graphical-session.target && ! sc list-jobs --no-legend 2>/dev/null | grep -qF "$old" && break
+        sleep 0.1; i=$((i + 1))
+    done
+    sc stop "$old" 2>/dev/null                               # only one agent per session
+    sc stop "$unit" 2>/dev/null
+    sc reset-failed "$unit" 2>/dev/null
+    rm -f "$state"
+    if sc cat "$unit" >/dev/null 2>&1; then
+        sc start "$unit" || { use_hypr; return 1; }
+    else
+        if [ -x "$gl" ]; then run="$gl"; else run="env QT_QUICK_BACKEND=software"; fi
+        # shellcheck disable=SC2086  # $run is one or two words on purpose
+        systemd-run --user --quiet --collect --unit="$unit" \
+            --description="Quickshell polkit agent (authprompt.qml)" \
+            -p PartOf=graphical-session.target -p After=graphical-session.target \
+            -p Conflicts="$old" -p OnFailure="$old" -p Slice=session.slice -p TimeoutStopSec=5 \
+            -p ExecStopPost="/bin/rm -f $state" \
+            -E WAYLAND_DISPLAY -E HYPRLAND_INSTANCE_SIGNATURE -E XDG_RUNTIME_DIR -E XDG_SESSION_ID \
+            -E XDG_CURRENT_DESKTOP -E XCURSOR_THEME -E XCURSOR_SIZE \
+            env -u QT_QPA_PLATFORMTHEME $run "$qs" -p "$cfg" || { use_hypr; return 1; }
+    fi
+    i=0
+    while [ "$i" -lt "$wait_tenths" ]; do
+        registered && return 0
+        is_active "$unit" || break                            # gave up or crashed already
+        sleep 0.1; i=$((i + 1))
+    done
+    echo "polkit-agent-start: the Quickshell prompt did not register with polkit within 3 s; using hyprpolkitagent" >&2
+    use_hypr
+    return 1
+}
+
+case "${1:-}" in
+    --status) status ;;
+    --hypr) use_hypr; status ;;
+    "") use_quickshell; rc=$?; status; exit $rc ;;
+    *) echo "usage: polkit-agent-start [--hypr | --status]" >&2; exit 2 ;;
+esac

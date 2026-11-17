@@ -1,0 +1,44 @@
+#!/bin/sh
+# Waybar pill for removable drives that udiskie mounted (under /media or /run/media).
+#   drives          # waybar JSON; empty (pill hidden) when nothing is mounted
+#   drives eject    # fuzzel menu: unmount and power off the chosen drive
+#   drives open     # open the most recently mounted drive in the file manager
+# Fixed mounts such as /mnt/archive are not listed.
+
+mounted() {  # mountpoint<TAB>label<TAB>size, removable mounts only
+    findmnt -rn -o TARGET,SOURCE,SIZE 2>/dev/null | while read -r target source size; do
+        case "$target" in /media/*|/run/media/*) ;; *) continue ;; esac
+        # findmnt -r escapes spaces as \x20; dash's printf %b can't decode \x, so sed does
+        target=$(printf '%s' "$target" | sed 's/\\x20/ /g; s/\\x09/\t/g; s/\\x5c/\\/g')
+        printf '%s\t%s\t%s\n' "$target" "$(basename "$target")" "$size"
+    done
+}
+
+case "$1" in
+    eject)
+        list=$(mounted)
+        [ -n "$list" ] || { notify-send -a Drives "No removable drives mounted"; exit 0; }
+        n=$(printf '%s\n' "$list" | wc -l)
+        i=$(printf '%s\n' "$list" | awk -F'\t' '{printf "󰕓  %s  (%s)\n", $2, $3}' |
+            "$HOME/.local/bin/qs-pick" --index --prompt "󰭽  " --placeholder "Eject drive") || exit 0
+        [ "$i" -ge 0 ] 2>/dev/null || exit 0
+        target=$(printf '%s\n' "$list" | sed -n "$((i + 1))p" | cut -f1)
+        name=$(basename "$target")
+        if out=$(udiskie-umount --detach "$target" 2>&1); then
+            notify-send -a Drives "$name ejected" "Safe to remove"
+        else
+            notify-send -a Drives -u critical "Couldn't eject $name" "$(printf '%s' "$out" | tail -1)"
+        fi
+        "$HOME/.local/bin/bar-refresh" 11 ;;
+    open)
+        target=$(mounted | tail -1 | cut -f1)
+        [ -n "$target" ] && exec xdg-open "$target" ;;
+    *)
+        list=$(mounted)
+        [ -n "$list" ] || { printf '{"text":""}\n'; exit 0; }
+        n=$(printf '%s\n' "$list" | wc -l)
+        names=$(printf '%s\n' "$list" | cut -f2 | paste -sd, - | sed 's/,/, /g')
+        if [ "$n" -eq 1 ]; then text="󰕓 $names"; else text="󰕓 $n"; fi
+        jq -cn --arg text "$text" --arg names "$(printf '%s' "$names" | sed 's/&/\&amp;/g; s/</\&lt;/g')" \
+            '{text: $text, tooltip: "<b>Drives</b>: \($names)\nClick: open in Files\nRight-click: eject"}' ;;
+esac

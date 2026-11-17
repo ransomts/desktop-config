@@ -1,0 +1,34 @@
+#!/bin/sh
+# Super+/: every Hyprland keybinding with its description, read live from
+# `hyprctl binds` (the description = "..." on each hl.bind in hyprland.lua),
+# so it can't go stale. Searchable; Enter or Esc closes it.
+PLACEHOLDER="Keybindings"
+# The launcher's keybinding mode when Quickshell is running (`qs ipc call launcher open ?`;
+# the same key again closes it); otherwise the list below.
+"$HOME/.nix-profile/bin/qs" ipc call launcher open '?' >/dev/null 2>&1 && exit 0
+hyprctl binds -j | python3 -c '
+import json, sys
+mods = [(64, "Super"), (4, "Ctrl"), (8, "Alt"), (1, "Shift")]
+names = {"Return": "Enter", "slash": "/", "bracketleft": "[", "bracketright": "]",
+         "left": "←", "right": "→", "up": "↑", "down": "↓", "Print": "PrtSc",
+         "mouse_down": "scroll down", "mouse_up": "scroll up",
+         "mouse:272": "left-drag", "mouse:273": "right-drag"}
+rows = []
+for b in json.load(sys.stdin):
+    if not b.get("description"):
+        continue
+    key = b["key"]
+    if key.startswith("XF86"):
+        key = "Fn key"
+    elif key.startswith("switch:"):
+        key = "Lid"
+    else:
+        key = names.get(key, key)
+    lead = {"lecture": "Super + Z, then "}.get(b.get("submap") or "", "")   # keys inside a submap
+    combo = lead + " + ".join([n for bit, n in mods if b["modmask"] & bit] + [key])
+    rows.append((combo, b["description"]))
+w = max(len(c) for c, _ in rows)
+for c, d in rows:
+    print(f"{c.ljust(w)}   {d}")
+' | "$HOME/.local/bin/qs-pick" --placeholder "$PLACEHOLDER" >/dev/null
+exit 0

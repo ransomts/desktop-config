@@ -1,0 +1,8 @@
+[Unit]
+Description=Dark/light mode on the night-light schedule (Hyprland)
+# COSMIC switches by itself (CosmicTheme.Mode auto_switch); only act under Hyprland.
+ConditionEnvironment=XDG_CURRENT_DESKTOP=Hyprland
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/theme-by-time

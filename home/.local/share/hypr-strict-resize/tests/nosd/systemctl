@@ -1,0 +1,3 @@
+#!/bin/sh
+# stand-in for nested Hyprland tests: keeps the nested instance out of the session environment (README.org)
+exit 0

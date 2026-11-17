@@ -1,0 +1,9 @@
+#!/bin/sh
+# Lock the screen now (Super+L, the power menu's Lock).
+# Normally `loginctl lock-session`: logind tells hypridle, which runs lock-screen (lock_cmd).
+# While presenting, display-menu stops hypridle so the screen stays awake, and nobody would
+# hear logind: then lock-screen is run directly.
+if pgrep -x hypridle >/dev/null 2>&1; then
+    exec loginctl lock-session
+fi
+exec "${LOCK_SCREEN:-$HOME/.local/bin/lock-screen}"

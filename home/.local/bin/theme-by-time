@@ -1,0 +1,32 @@
+#!/bin/sh
+# Dark mode in the evening, light in the morning, on the night light's schedule:
+# the `identity` profile time in hyprsunset.conf starts the light period, the
+# `temperature` profile time starts the dark one. Run by theme-by-time.timer
+# (Hyprland sessions only; COSMIC has its own auto switch).
+# Only acts when the period changes since its last run, so a manual toggle
+# (Super+Ctrl+T or the ◐ pill) holds until the next boundary.
+CONF="$HOME/.config/hypr/hyprsunset.conf"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/theme-by-time"
+
+times=$(awk '
+    /profile *\{/ { t=""; kind="" }
+    /time *=/     { gsub(/[ \t]/, ""); split($0, a, "="); t=a[2] }
+    /identity *= *true/ { kind="light" }
+    /temperature *=/    { kind="dark" }
+    /\}/ { if (t != "" && kind != "") print kind, t; t=""; kind="" }
+' "$CONF")
+light=$(printf '%s\n' "$times" | awk '$1=="light"{print $2; exit}')
+dark=$(printf '%s\n' "$times" | awk '$1=="dark"{print $2; exit}')
+[ -n "$light" ] && [ -n "$dark" ] || { echo "no light/dark profile times in $CONF" >&2; exit 1; }
+
+mins() { h=${1%%:*}; m=${1#*:}; echo $(( ${h#0} * 60 + ${m#0} )); }
+now=$(mins "$(date +%H:%M)"); l=$(mins "$light"); d=$(mins "$dark")
+if [ "$now" -ge "$l" ] && [ "$now" -lt "$d" ]; then want=light; else want=dark; fi
+period="$(date +%F) $want"
+[ "$want" = dark ] && [ "$now" -lt "$l" ] && period="$(date -d yesterday +%F) dark"   # after midnight = last night's period
+
+mkdir -p "$(dirname "$STATE")"
+[ "$(cat "$STATE" 2>/dev/null)" = "$period" ] && exit 0
+"$HOME/.local/bin/cosmic-theme-toggle" "$want"
+printf '%s\n' "$period" > "$STATE"
+echo "switched to $want ($period)"

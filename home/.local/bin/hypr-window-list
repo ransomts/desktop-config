@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""Window lists for fuzzel, shared by window-switcher (Alt+Tab) and desk-overview (Super+Tab).
+
+Prints one fuzzel dmenu line per entry -- `label\\0icon\\x1f<icon>` -- followed by a
+TAB and the action for that line:
+  switcher   every window, most recently used first (current one last)
+             action: window address
+  overview   desktops 1-10 that have windows (plus the next empty one), each followed
+             by its windows; action: `desk N` or a window address
+Desktop N is workspace N*10 + monitor index (see Desk in hyprland.lua).
+"""
+import configparser, glob, json, os, subprocess, sys
+
+def icon_table():
+    """window class -> icon name, from .desktop files (StartupWMClass, then file name)."""
+    icons = {}
+    dirs = [os.path.expanduser("~/.local/share/applications"), "/usr/share/applications",
+            "/var/lib/flatpak/exports/share/applications",
+            os.path.expanduser("~/.local/share/flatpak/exports/share/applications")]
+    for d in dirs:
+        for f in glob.glob(d + "/*.desktop"):
+            cp = configparser.RawConfigParser(strict=False, interpolation=None)
+            try:
+                cp.read(f, encoding="utf-8")
+                e = cp["Desktop Entry"]
+            except Exception:
+                continue
+            icon = e.get("Icon")
+            if not icon:
+                continue
+            icons.setdefault(os.path.basename(f)[:-8].lower(), icon)
+            if e.get("StartupWMClass"):
+                icons[e["StartupWMClass"].lower()] = icon
+    return icons
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "switcher"
+    icons = icon_table()
+    icon_for = lambda cls: icons.get(cls.lower()) or icons.get(cls.lower().split(".")[-1]) or cls.lower()
+    clients = json.loads(subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True).stdout)
+    clients = [c for c in clients if c.get("mapped") and c["workspace"]["id"] != 0]
+    clients.sort(key=lambda c: c.get("focusHistoryID", 99))
+    title = lambda c: " ".join(c["title"].split())[:90]
+    line = lambda label, icon, action: print(f"{label}\0icon\x1f{icon}\t{action}")
+
+    if mode == "switcher":
+        ws_label = lambda i: "scratch" if i < 0 else (f"desk {i // 10}" if i >= 11 else f"ws {i}")
+        for c in clients[1:] + clients[:1]:     # current window last: Enter = previous window
+            line(f"{ws_label(c['workspace']['id']):8} {c['class'][:18]:18} {title(c)}", icon_for(c["class"]), c["address"])
+        return
+
+    # overview
+    active = json.loads(subprocess.run(["hyprctl", "activeworkspace", "-j"], capture_output=True, text=True).stdout)
+    current = active["id"] // 10 if active.get("id", 0) >= 11 else 1
+    by_desk = {}
+    for c in clients:
+        wid = c["workspace"]["id"]
+        if wid >= 11:
+            by_desk.setdefault(wid // 10, []).append(c)
+    for n in sorted(by_desk):
+        mark = "  ← you are here" if n == current else ""
+        line(f"Desktop {n}  ({len(by_desk[n])} windows){mark}", "preferences-desktop-display", f"desk {n}")
+        for c in sorted(by_desk[n], key=lambda c: c["workspace"]["id"]):
+            line(f"      {c['class'][:18]:18} {title(c)}", icon_for(c["class"]), c["address"])
+    free = next((n for n in range(1, 11) if n not in by_desk), None)
+    if free:
+        line(f"Desktop {free}  (empty)", "list-add", f"desk {free}")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,26 @@
+#!/bin/sh
+# Start Quickshell (bar, control panel, launcher, overview, notifications, level
+# popups) if it isn't running. Run by Hyprland at login; safe to run again.
+# It is a Nix build, so it goes through nixGLIntel to find the system GPU drivers
+# (software rendering if that wrapper is missing).
+qs="$HOME/.nix-profile/bin/qs"
+gl="$HOME/.nix-profile/bin/nixGLIntel"
+up() { "$qs" ipc call bar status >/dev/null 2>&1; }
+
+# Quickshell draws the wallpaper too; without it, put the plain hyprpaper image up.
+paper() { pgrep -x hyprpaper >/dev/null || setsid -f uwsm app -- hyprpaper >/dev/null 2>&1; }
+
+[ -x "$qs" ] || { notify-send -u critical "Quickshell is not installed" "nix profile add nixpkgs#quickshell"; paper; exit 1; }
+# mako can be D-Bus-started by an early notification and would keep the notification name
+pkill -x mako 2>/dev/null
+up && exit 0
+# What Quickshell prints goes to the user journal (journalctl --user -t quickshell; add
+# -p warning for problems only), with its WARN/ERROR lines at those priorities. The whole
+# pipeline runs inside the app scope, so nothing outside it can close Quickshell's output.
+# qs-socket-watch reads these lines.
+piped='"$@" 2>&1 | sed -u -e "s/^ *WARN/<4>&/" -e "s/^ *ERROR/<3>&/" -e "s/^ *\\(CRIT\\|FATAL\\)/<2>&/" | systemd-cat -t quickshell'
+if [ -x "$gl" ]; then setsid -f uwsm app -- sh -c "$piped" sh "$gl" "$qs" -n --no-color >/dev/null 2>&1
+else QT_QUICK_BACKEND=software setsid -f uwsm app -- sh -c "$piped" sh "$qs" -n --no-color >/dev/null 2>&1; fi
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do sleep 1; up && exit 0; done
+paper
+exit 1

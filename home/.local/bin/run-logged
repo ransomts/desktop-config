@@ -1,0 +1,18 @@
+#!/bin/sh
+# run-logged 'shell command'      (one argument: run through sh -c)
+# run-logged PROGRAM ARG...       (several: run as given)
+#
+# Run a command whose output would otherwise be thrown away (Hyprland key bindings and
+# autostart, things Quickshell launches) and, only if it fails, write one line to the user
+# journal: the exit status and the last lines of what it printed on stderr.
+#     journalctl --user -t run-logged
+# A command that succeeds leaves nothing. stdout is discarded, as it was before.
+if [ $# -eq 1 ]; then set -- sh -c "$1"; fi
+out=$( { "$@" 2>&1 >/dev/null; echo "run-logged-rc=$?"; } | tail -n 7 )
+rc=${out##*run-logged-rc=}
+case "$rc" in ''|*[!0-9]*) rc=0 ;; esac
+[ "$rc" -eq 0 ] && exit 0
+err=$(printf '%s\n' "$out" | sed '$d' | tr '\n' ' ' | cut -c1-600)
+[ "$1" = sh ] && [ "$2" = -c ] && shift 2
+printf 'exit %s: %s%s\n' "$rc" "$(printf '%s' "$*" | cut -c1-300)" "${err:+ | $err}" | logger -t run-logged -p user.warning
+exit "$rc"

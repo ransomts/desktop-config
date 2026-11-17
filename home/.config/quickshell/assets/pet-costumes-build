@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Costume sheets for the bar pet: every animal's first coat redrawn as a ghost, a shadow and
+in gold (pet-ANIMAL-ghost.png, -shadow.png, -shiny.png). PetSecrets.qml says when they are worn.
+
+    assets/pet-costumes-build              # run after assets/pet-build (it reads the sheets that wrote)
+    assets/pet-costumes-build PREVIEW.png  # also a picture of them all on the dark, light and purple backgrounds
+
+Each pixel keeps its lightness and takes the costume's colours; the darkest pixels (eyes,
+stripes) stay dark for the ghost and the gold, and the eyes glow amber in the shadow. Every
+costume gets a one-pixel edge so it reads on any of the three backgrounds.
+"""
+import glob, os, sys
+from PIL import Image
+
+here = os.path.dirname(os.path.abspath(__file__))
+def rgb(h): return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+def mix(a, b, t): return tuple(round(a[i] + (b[i] - a[i]) * t) for i in range(3))
+# lo, hi: the colours for the darkest and lightest parts; dark: what near-black pixels become;
+# alpha: how solid; edge: outline
+COSTUMES = {
+    "ghost":  dict(lo="aab6cc", hi="f6f9fd", dark="3a4256", alpha=225, edge="6f7a92"),
+    "shadow": dict(lo="1c1c24", hi="4c4c5a", dark="f5b800", alpha=255, edge="8a8a94"),
+    "shiny":  dict(lo="b07a08", hi="ffe58a", dark="4a3200", alpha=255, edge="7a5200"),
+}
+COSTUME_NAMES = set(COSTUMES)
+
+first = {}          # animal -> its first coat's sheet (by name order of pet-build's tables: the oldest file wins a tie)
+for path in sorted(glob.glob(os.path.join(here, "pet-*-*.png")), key=os.path.getmtime):
+    _, animal, coat = os.path.basename(path)[:-4].split("-", 2)
+    if coat not in COSTUME_NAMES:
+        first.setdefault(animal, path)
+# the sheets are all written within a moment of each other, so say which coat to start from
+BASE = {"cat": "tabby", "dog": "golden", "frog": "pond", "bird": "wren", "turtle": "slider", "fox": "red", "dragon": "jade"}
+for animal, coat in BASE.items():
+    p = os.path.join(here, "pet-%s-%s.png" % (animal, coat))
+    if os.path.exists(p):
+        first[animal] = p
+
+made = []
+for animal, path in sorted(first.items()):
+    src = Image.open(path).convert("RGBA")
+    w, h = src.size
+    px = src.load()
+    lum = {}
+    for y in range(h):
+        for x in range(w):
+            r, g, b, a = px[x, y]
+            if a > 0:
+                lum[(x, y)] = (0.299 * r + 0.587 * g + 0.114 * b) / 255
+    lo, hi = min(lum.values()), max(lum.values())
+    for name, c in COSTUMES.items():
+        out = Image.new("RGBA", (w, h))
+        for (x, y), v in lum.items():
+            t = (v - lo) / (hi - lo) if hi > lo else 0.5
+            dark = t < 0.12
+            if dark and name == "shadow":       # only a lone dark pixel is an eye; legs and stripes just go black
+                dark = not any((lum.get((x + dx, y + dy), 1) - lo) / ((hi - lo) or 1) < 0.12 for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)))
+            col = rgb(c["dark"]) if dark else mix(rgb(c["lo"]), rgb(c["hi"]), t)
+            out.putpixel((x, y), col + (255 if dark else c["alpha"],))
+        for y in range(h):              # the edge: empty pixels touching the body, inside the same frame
+            for x in range(w):
+                if (x, y) in lum:
+                    continue
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    nx, ny = x + dx, y + dy
+                    if (nx, ny) in lum and nx // 16 == x // 16:
+                        out.putpixel((x, y), rgb(c["edge"]) + (255,))
+                        break
+        out.save(os.path.join(here, "pet-%s-%s.png" % (animal, name)))
+        made.append((animal, name))
+
+if len(sys.argv) > 1:
+    animals = sorted(first)
+    rows = [(a, n) for a in animals for n in COSTUMES]
+    fw = 16 * 12 * 2
+    big = Image.new("RGBA", (fw * 3, len(rows) * 36), (22, 22, 26, 255))
+    big.paste((246, 243, 238, 255), (fw, 0, fw * 2, big.height))
+    big.paste((82, 45, 128, 255), (fw * 2, 0, fw * 3, big.height))
+    for i, (a, n) in enumerate(rows):
+        s = Image.open(os.path.join(here, "pet-%s-%s.png" % (a, n))).resize((fw, 32), Image.NEAREST)
+        for k in range(3):
+            big.alpha_composite(s, (fw * k, i * 36 + 2))
+    big.save(sys.argv[1])
+print("costumes:", len(made))
