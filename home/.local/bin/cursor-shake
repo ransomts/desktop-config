@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""Shake-to-find for the pointer: watch the Hyprland cursor position and report shakes.
+
+Prints one line per sample while the pointer is being shaken, "S <x> <y>" (layout
+pixels), and "E" when the shaking stops. Quickshell's CursorFind.qml runs this and
+draws a large pointer at that spot. Polls slowly while the pointer is at rest.
+"""
+import os, socket, sys, time
+
+SOCK = "%s/hypr/%s/.socket.sock" % (os.environ["XDG_RUNTIME_DIR"], os.environ["HYPRLAND_INSTANCE_SIGNATURE"])
+MIN_LEG = 170      # px the pointer must travel before a change of direction counts
+WINDOW = 1.1       # s: this many reversals on one axis inside the window is a shake
+REVERSALS = 6
+HOLD = 0.45        # s the big pointer stays after the last reversal
+
+def pos():
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(0.5)
+    s.connect(SOCK)
+    s.send(b"cursorpos")
+    x, y = s.recv(64).decode().split(",")
+    s.close()
+    return int(x), int(y)
+
+def main():
+    last = pos()
+    anchor = [last[0], last[1]]     # per axis: where the current leg started
+    sign = [0, 0]
+    turns = [[], []]                # per axis: times of recent reversals
+    active_until = 0.0
+    active = False
+    idle = 0
+    while True:
+        try:
+            p = pos()
+        except (OSError, ValueError):
+            time.sleep(1)
+            if not os.path.exists(SOCK): return
+            continue
+        now = time.monotonic()
+        moved = p != last
+        idle = 0 if moved else idle + 1
+        for a in (0, 1):
+            d = p[a] - anchor[a]
+            if sign[a] == 0:
+                if abs(d) >= MIN_LEG: sign[a] = 1 if d > 0 else -1; anchor[a] = p[a]
+            elif d * sign[a] > 0:
+                anchor[a] = p[a]                      # still going the same way: extend the leg
+            elif abs(d) >= MIN_LEG:
+                sign[a] = -sign[a]; anchor[a] = p[a]; turns[a].append(now)
+        turns = [[t for t in ts if now - t <= WINDOW] for ts in turns]
+        if max(len(turns[0]), len(turns[1])) >= REVERSALS: active_until = now + HOLD
+        if now < active_until:
+            active = True
+            print("S %d %d" % p, flush=True)
+        elif active:
+            active = False
+            turns = [[], []]
+            print("E", flush=True)
+        if idle > 40: sign = [0, 0]; anchor = [p[0], p[1]]
+        last = p
+        time.sleep(1 / 60 if active else 1 / 40 if idle < 20 else 1 / 8)
+
+try:
+    main()
+except (KeyboardInterrupt, BrokenPipeError):
+    sys.exit(0)

@@ -1,0 +1,13 @@
+#!/bin/sh
+# Flip COSMIC between dark and light mode. Every COSMIC app, applet and the
+# GTK bridge in cosmic-settings-daemon watch this file, so the change is live.
+dir="$HOME/.config/cosmic/com.system76.CosmicTheme.Mode/v1"
+f="$dir/is_dark"
+mkdir -p "$dir"
+case "$1" in
+    dark)  new=true ;;
+    light) new=false ;;
+    *)     [ "$(cat "$f" 2>/dev/null)" = true ] && new=false || new=true ;;
+esac
+# write-then-rename, same as cosmic-config does, so readers never see a half-written file
+printf '%s' "$new" > "$f.tmp" && mv "$f.tmp" "$f"

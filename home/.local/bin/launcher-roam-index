@@ -1,0 +1,22 @@
+#!/bin/sh
+# Title index of the org-roam notes for the launcher's `n ` mode (LaunchView.qml).
+#   launcher-roam-index DIR OUT       OUT = $XDG_CACHE_HOME/launcher-roam.tsv
+# One line per note with a #+title: PATH <tab> TITLE <tab> MODIFIED (epoch seconds). Does nothing
+# when OUT is less than 10 minutes old ($ROAM_INDEX_MAX_MIN changes that); otherwise builds it
+# beside OUT and moves it into place, so a reader never sees half a file. Only titles and
+# paths are read from the notes (rg -m1), nothing is logged.
+dir=$1; out=$2; max=${ROAM_INDEX_MAX_MIN:-10}
+[ -d "$dir" ] && [ -n "$out" ] || { echo "usage: launcher-roam-index DIR OUT" >&2; exit 2; }
+if [ -s "$out" ] && [ -n "$(find "$out" -mmin "-$max" 2>/dev/null)" ]; then exit 0; fi
+mkdir -p "$(dirname "$out")" || exit 1
+tmp=$(mktemp "$out.XXXXXX") || exit 1
+mt=$(mktemp "$out.XXXXXX") || { rm -f "$tmp"; exit 1; }
+trap 'rm -f "$tmp" "$mt"' EXIT
+find "$dir" -name '*.org' -printf '%p\t%T@\n' > "$mt" 2>/dev/null
+# --null ends the path with a NUL, which tr turns into the tab that separates it from the title
+rg --no-heading --null -m1 -i '^#\+title:' "$dir" -g '*.org' 2>/dev/null | tr '\0' '\t' |
+    sed -e 's/\t#+[Tt][Ii][Tt][Ll][Ee]:[[:space:]]*/\t/' -e 's/[[:space:]]*$//' |
+    awk -F'\t' 'NR==FNR { m[$1] = int($2); next } ($1 in m) && $2 != "" { print $1 "\t" $2 "\t" m[$1] }' "$mt" - > "$tmp"
+# a failed run (no rg) must not replace a good index with an empty one
+[ -s "$tmp" ] || { [ -s "$out" ] && exit 0; : > "$out"; exit 0; }
+mv "$tmp" "$out"

@@ -1,0 +1,14 @@
+#!/bin/sh
+# Switch Hyprland's animation feel, live, and remember it.
+#   anim-preset              # show the current one and the choices
+#   anim-preset snappy       # quick; desktops slide a little; unfocused windows dim
+#   anim-preset calm         # slower, everything fades, no dimming
+#   anim-preset stock        # Hyprland's defaults
+# The presets themselves are the Anim table in ~/.config/hypr/hyprland.lua.
+state="${XDG_STATE_HOME:-$HOME/.local/state}/anim-preset"
+case "$1" in
+    snappy|calm|stock)
+        hyprctl eval "Anim.use('$1', true)" >/dev/null && echo "animations: $1" ;;
+    "") echo "current: $(cat "$state" 2>/dev/null || echo snappy)   choices: snappy calm stock" ;;
+    *)  echo "usage: anim-preset [snappy|calm|stock]" >&2; exit 2 ;;
+esac

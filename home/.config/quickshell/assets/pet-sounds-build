@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Synthesises the bar pet's sounds into assets/sounds/NAME.oga (played by PetSound.qml).
+Everything is made here from sine, triangle, pulse waves and noise: nothing is sampled or downloaded.
+
+    assets/pet-sounds-build             # writes assets/sounds/*.oga next to this script
+    assets/pet-sounds-build --wav DIR   # also leaves the plain WAV files in DIR (to look at them)
+
+Voices, one per animal (a trick like speak, croak or sing, and the greeting on unlock):
+  cat    a mew: a soft pulse wave that rises and falls, the tone opening and closing like a mouth
+  dog    a yip, twice: a quick falling bark with a breath of noise at the start
+  frog   a croak in two parts ("rib-bit"): a low buzz chopped up by a fast flutter
+  bird   a chirp: three quick whistles, two up and one down
+Shared:
+  pat    a soft pop, like a bubble (petting it)
+  munch  three small crunches (eating)
+  tada   a four-note arpeggio, the last note held (a focus timer finished, the moth caught)
+
+They are short (80 to 400 ms), mono, and peak at PEAK (or less, see LOUD) so the volume steps in PetSound.qml
+stay below the shell's own cues. Change the recipes below and run this again; the shell
+reads the files each time it plays one, so no reload is needed.
+"""
+import math, os, random, struct, subprocess, sys, tempfile, wave
+
+RATE = 44100
+PEAK = 0.32                 # about -10 dBFS: quiet before any volume step is applied
+LOUD = 0.08                 # and an RMS of at most about -22 dBFS, so a long, full sound (the mew) is no louder than a pop
+here = os.path.dirname(os.path.abspath(__file__))
+out_dir = os.path.join(here, "sounds")
+
+
+# ---- building blocks: each returns a list of samples ----
+def secs(n): return int(n * RATE)
+
+def tone(dur, freq, shape="sine", duty=0.5, vibrato=0.0, vib_rate=6.0):
+    """A tone whose frequency follows freq(t) (t from 0 to 1 over the tone)."""
+    n, out, ph = secs(dur), [], 0.0
+    for i in range(n):
+        t = i / max(1, n - 1)
+        f = freq(t) * (1 + vibrato * math.sin(2 * math.pi * vib_rate * i / RATE))
+        ph = (ph + f / RATE) % 1.0
+        if shape == "sine": v = math.sin(2 * math.pi * ph)
+        elif shape == "tri": v = 4 * abs(ph - 0.5) - 1
+        else: v = 1.0 if ph < duty else -1.0          # pulse: softened later by a low-pass
+        out.append(v)
+    return out
+
+def sweep(a, b, curve=1.0):         # a frequency path from a to b (exponential, so it sounds even)
+    return lambda t: a * (b / a) ** (t ** curve)
+
+def path(points):                   # a frequency path through [(t, Hz), ...]
+    def f(t):
+        for (t0, f0), (t1, f1) in zip(points, points[1:]):
+            if t <= t1: return f0 * (f1 / f0) ** ((t - t0) / max(1e-9, t1 - t0))
+        return points[-1][1]
+    return f
+
+def noise(dur, seed):
+    r = random.Random(seed)
+    return [r.uniform(-1, 1) for _ in range(secs(dur))]
+
+def lowpass(x, cutoff, poles=2):
+    """Low-pass made of `poles` one-pole stages (two by default: one alone leaves the pulse
+    wave buzzy up to 10 kHz). cutoff may be a number or a function of t (0..1)."""
+    n = len(x)
+    for _ in range(poles):
+        out, y = [], 0.0
+        for i, v in enumerate(x):
+            c = cutoff(i / max(1, n - 1)) if callable(cutoff) else cutoff
+            a = 1 - math.exp(-2 * math.pi * c / RATE)
+            y += a * (v - y)
+            out.append(y)
+        x = out
+    return x
+
+def highpass(x, cutoff):
+    lp = lowpass(x, cutoff, 1)
+    return [v - l for v, l in zip(x, lp)]
+
+def env(x, attack, decay=None, release=0.0):
+    """Attack (s) to full, then either an exponential decay (time constant `decay`) or a hold,
+    and a release (s) to silence at the end."""
+    n, out = len(x), []
+    a, r = max(1, secs(attack)), secs(release)
+    for i, v in enumerate(x):
+        g = min(1.0, i / a)
+        if decay: g *= math.exp(-max(0, i - a) / (decay * RATE))
+        if r and i > n - r: g *= (n - i) / r
+        out.append(v * g)
+    return out
+
+def gate(x, rate, duty):            # chops a sound on and off (smoothly): the frog's flutter
+    return [v * (0.5 - 0.5 * math.cos(2 * math.pi * min(1.0, ((i * rate / RATE) % 1.0) / duty))) for i, v in enumerate(x)]
+
+def mix(*parts):                    # (start seconds, samples, gain), laid over each other
+    n = max(secs(s) + len(x) for s, x, g in parts)
+    out = [0.0] * n
+    for s, x, g in parts:
+        o = secs(s)
+        for i, v in enumerate(x): out[o + i] += v * g
+    return out
+
+def finish(x):                      # 3 ms fades at both ends (no clicks), then scaled to PEAK or LOUD, whichever is lower
+    f = secs(0.003)
+    x = [v * min(1.0, i / f, (len(x) - 1 - i) / f) for i, v in enumerate(x)]
+    top = max(abs(v) for v in x) or 1.0
+    rms = math.sqrt(sum(v * v for v in x) / len(x)) or 1.0
+    g = min(PEAK / top, LOUD / rms)
+    return [v * g for v in x]
+
+
+# ---- the recipes ----
+def cat():
+    # "mi-aow": up from 620 to 920 Hz, then slowly down to 540; the low-pass opens and
+    # closes like a mouth, which is most of what makes a pulse wave sound like a mew
+    f = path([(0, 620), (0.28, 920), (1, 540)])
+    body = tone(0.34, f, "pulse", duty=0.3, vibrato=0.012, vib_rate=7)
+    body = lowpass(body, lambda t: 900 + 2600 * math.sin(math.pi * min(1, t * 1.15)))
+    return finish(env(body, 0.03, release=0.13))
+
+def dog():
+    def yip(hi, lo, dur, seed):
+        b = mix((0, tone(dur, sweep(hi, lo, 0.7), "tri"), 0.8), (0, tone(dur, sweep(hi, lo, 0.7), "pulse", duty=0.25), 0.25),
+                (0, env(lowpass(noise(0.02, seed), 3000), 0.001, decay=0.006), 0.4))
+        return env(lowpass(b, 2600), 0.004, decay=0.07, release=0.02)
+    return finish(mix((0, yip(1150, 620, 0.12, 1), 1.0), (0.16, yip(1250, 680, 0.11, 2), 0.85)))
+
+def frog():
+    # a low buzz (two notes, the second a little higher) chopped up 38 times a second
+    def part(f0, dur):
+        b = tone(dur, sweep(f0, f0 * 0.88), "pulse", duty=0.2)
+        b = gate(b, 38, 0.55)
+        return env(lowpass(b, 1100), 0.01, release=0.04)
+    return finish(mix((0, part(170, 0.13), 1.0), (0.17, part(210, 0.11), 0.9)))
+
+def bird():
+    def chirp(a, b, dur):
+        return env(tone(dur, sweep(a, b), "sine"), 0.004, decay=0.03, release=0.01)
+    return finish(mix((0, chirp(2600, 4200, 0.06), 1.0), (0.085, chirp(2800, 4400, 0.06), 0.9),
+                      (0.175, chirp(4300, 3000, 0.08), 0.8)))
+
+def pat():
+    # a bubble pop: a sine dropping fast, gone in under a tenth of a second
+    return finish(env(tone(0.09, sweep(900, 260, 0.6), "sine"), 0.002, decay=0.025))
+
+def munch():
+    def crunch(seed):
+        n = highpass(lowpass(noise(0.07, seed), 2400), 300)
+        thump = tone(0.05, sweep(160, 90), "sine")
+        return env(mix((0, n, 0.7), (0, thump, 0.6)), 0.003, decay=0.022)
+    return finish(mix((0, crunch(3), 1.0), (0.12, crunch(4), 0.8), (0.24, crunch(5), 0.9)))
+
+def tada():
+    # C5 E5 G5, then C6 held: a triangle with a little pulse in it, softened (chiptune, gently)
+    def note(hz, dur, hold=False):
+        b = mix((0, tone(dur, lambda t: hz, "tri", vibrato=0.006 if hold else 0), 0.8),
+                (0, tone(dur, lambda t: hz, "pulse", duty=0.25), 0.18))
+        return env(lowpass(b, 3500), 0.004, decay=None if hold else 0.09, release=0.12 if hold else 0.01)
+    return finish(mix((0, note(523.25, 0.08), 0.8), (0.075, note(659.25, 0.08), 0.85),
+                      (0.15, note(783.99, 0.08), 0.9), (0.225, note(1046.5, 0.18, True), 1.0)))
+
+SOUNDS = {"cat": cat, "dog": dog, "frog": frog, "bird": bird, "pat": pat, "munch": munch, "tada": tada}
+
+
+def write_wav(path_, x):
+    with wave.open(path_, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(RATE)
+        w.writeframes(b"".join(struct.pack("<h", int(max(-1, min(1, v)) * 32767)) for v in x))
+
+keep = sys.argv[2] if len(sys.argv) > 2 and sys.argv[1] == "--wav" else None
+os.makedirs(out_dir, exist_ok=True)
+with tempfile.TemporaryDirectory() as tmp:
+    for name, make in SOUNDS.items():
+        wav = os.path.join(keep or tmp, name + ".wav")
+        if keep: os.makedirs(keep, exist_ok=True)
+        write_wav(wav, make())
+        # Ogg Vorbis like the freedesktop cues; no metadata, so a rerun gives the same bytes
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", wav, "-map_metadata", "-1", "-fflags", "+bitexact",
+                        "-flags:a", "+bitexact", "-c:a", "libvorbis", "-q:a", "4", os.path.join(out_dir, name + ".oga")], check=True)
+        print(name + ".oga")

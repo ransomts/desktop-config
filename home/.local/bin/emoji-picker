@@ -1,0 +1,76 @@
+#!/bin/sh
+# Super+.: pick an emoji or symbol from a list (qs-pick; search by name or keyword); it is
+# typed into the focused window (wtype) and also left on the clipboard.
+#
+# The list is built once into ~/.cache/emoji-picker.txt (delete it to rebuild):
+#   - typing symbols (arrows, maths, Greek, punctuation), named from Python's Unicode data;
+#   - every emoji from the system's emoji table, flags and families included (skin-tone
+#     variants left out to keep the list short);
+#   - search keywords from Unicode's CLDR list in ~/.local/share/emoji-picker/annotations-en.xml
+#     (downloaded 2026-11-11), which is what makes "poop", "lol" or "party" find things.
+#     Without that file the emoji are still listed, by name only.
+#   - flags also answer to their country code ("us", "de", "jp"; "usa" and "uk" too).
+PLACEHOLDER="Emoji and symbols"
+LIST="${XDG_CACHE_HOME:-$HOME/.cache}/emoji-picker.txt"
+if [ ! -s "$LIST" ]; then
+    mkdir -p "$(dirname "$LIST")"
+    python3 - > "$LIST" <<'PY'
+import os, re, unicodedata
+symbols = [(0x2010, 0x2027), (0x2030, 0x205E), (0x2190, 0x21FF), (0x2200, 0x22FF), (0x2300, 0x23FF),
+           (0x0391, 0x03C9), (0x00A1, 0x00BF), (0x00D7, 0x00D7), (0x00F7, 0x00F7), (0x2100, 0x214F),
+           (0x2460, 0x24FF), (0x25A0, 0x25FF)]
+keywords = {}
+try:
+    xml = open(os.path.expanduser("~/.local/share/emoji-picker/annotations-en.xml"), encoding="utf-8").read()
+    for cp, words in re.findall(r'<annotation cp="([^"]+)">([^<]*)</annotation>', xml):
+        keywords[cp] = [w.strip() for w in words.split("|")]
+except OSError:
+    pass
+bare = lambda s: s.replace("️", "")            # the keyword list leaves the "emoji style" mark out
+MORE_CODES = {"us": ["usa", "america"], "gb": ["uk", "britain"], "ae": ["uae"], "kr": ["korea"], "nl": ["holland"]}
+# The plain everyday ones go first among the emoji, so they win ties: "heart" gives the red
+# heart before the forty other hearts. (Your own recently used ones still come before these.)
+FIRST = ["❤️", "👍", "😂", "🙂", "😊", "😀", "🎉", "🔥", "✅", "🙏", "👀", "💯", "😭", "🥳", "😅", "🤔", "👏", "💩", "⭐", "☀️", "✨", "🙌"]
+seen, emoji = set(), []
+try:
+    for line in open("/usr/share/unicode/emoji/emoji-test.txt", encoding="utf-8"):
+        m = re.match(r"^([0-9A-F ]+?)\s*; fully-qualified\s*# (\S+) E[\d.]+ (.*)$", line)
+        if not m: continue
+        cps = [int(c, 16) for c in m[1].split()]
+        if any(0x1F3FB <= c <= 0x1F3FF for c in cps): continue          # skin-tone variants
+        ch, name = m[2], m[3]
+        extra = [w for w in keywords.get(bare(ch), []) if w not in name]
+        if len(cps) == 2 and all(0x1F1E6 <= c <= 0x1F1FF for c in cps):  # a flag: its country code is a keyword
+            code = "".join(chr(c - 0x1F1E6 + ord("a")) for c in cps)
+            extra = [code] + MORE_CODES.get(code, []) + extra
+        emoji.append(f"{ch}  {name}" + ("   " + " ".join(extra) if extra else ""))
+        seen.add(ch)
+except OSError:
+    pass
+if not emoji:                                       # no emoji table on this system: the old way, by code block
+    for a, b in [(0x2600, 0x27BF), (0x1F300, 0x1F5FF), (0x1F600, 0x1F64F), (0x1F680, 0x1F6FF), (0x1F900, 0x1F9FF), (0x1FA70, 0x1FAFF)]:
+        for cp in range(a, b + 1):
+            n = unicodedata.name(chr(cp), "")
+            if n: emoji.append(f"{chr(cp)}  {n.lower()}"); seen.add(chr(cp))
+for a, b in symbols:
+    for cp in range(a, b + 1):
+        ch = chr(cp); n = unicodedata.name(ch, "")
+        if n and ch not in seen: print(f"{ch}  {n.lower()}")
+rank = {bare(c): i for i, c in enumerate(FIRST)}
+emoji.sort(key=lambda line: rank.get(bare(line.split("  ")[0]), len(rank)))   # stable: the rest keep their order
+print("\n".join(emoji))
+PY
+fi
+# The launcher's emoji mode when Quickshell is running (`qs ipc call launcher open :`;
+# the same key again closes it); otherwise the list below.
+"$HOME/.nix-profile/bin/qs" ipc call launcher open ':' >/dev/null 2>&1 && exit 0
+# The ones you used most recently come first (and so win ties when searching).
+RECENT="${XDG_STATE_HOME:-$HOME/.local/state}/emoji-recent"
+pick=$( { [ -s "$RECENT" ] && cat "$RECENT"; grep -v -x -F -f "${RECENT:-/dev/null}" "$LIST" 2>/dev/null || cat "$LIST"; } |
+        "$HOME/.local/bin/qs-pick" --rank --prompt "󰞅  " --placeholder "$PLACEHOLDER" ) || exit 0
+ch=${pick%%  *}
+[ -n "$ch" ] || exit 0
+{ printf '%s\n' "$pick"; [ -f "$RECENT" ] && grep -v -x -F -- "$pick" "$RECENT"; } | head -24 > "$RECENT.new" && mv "$RECENT.new" "$RECENT"
+printf '%s' "$ch" | wl-copy
+sleep 0.25            # let focus return to the window the list covered
+wtype "$ch"

@@ -1,0 +1,786 @@
+#!/home/tsranso/.local/share/gvm/venv/bin/python -I
+"""gvm-gui [NAME|ADDRESS|all ...] - one GTK4 window for GVM Bluetooth lights.
+
+With no arguments it shows every light in ~/.config/gvm/lights, a panel each,
+side by side. "Link" in the header bar applies every change to all of them.
+
+Holds one BLE connection per light while open (sliders need it; `gvm`
+reconnects per command) and drops them on close so the phone app or `gvm`
+can have the lights back. Protocol code comes from ~/.local/bin/gvm.
+"""
+import asyncio, os, sys, threading
+from importlib.machinery import SourceFileLoader
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+from bleak import BleakClient  # noqa: E402
+
+gvm = SourceFileLoader("gvm", os.path.expanduser("~/.local/bin/gvm")).load_module()
+
+
+def targets() -> list[tuple[str, str]]:
+    args = sys.argv[1:] or (["all"] if gvm.LIGHTS else [gvm.DEFAULT_ADDR])
+    seen, out = set(), []
+    for a in args:
+        for name, addr in gvm.resolve(a):
+            if addr not in seen:
+                seen.add(addr)
+                out.append((name, addr))
+    return out
+
+
+# All lights share one asyncio loop in one background thread, and connect one
+# at a time: BlueZ runs a single discovery at once.
+LOOP = asyncio.new_event_loop()
+threading.Thread(target=LOOP.run_forever, daemon=True).start()
+CONNECTING = asyncio.Lock()  # bound to LOOP on first use
+
+
+class Link:
+    """The BLE side of one light."""
+
+    def __init__(self, panel, addr):
+        self.panel, self.addr = panel, addr
+        self.client: BleakClient | None = None
+        self.pending: dict[int, int] = {}  # latest value per register, coalesced
+        self.wake: asyncio.Event | None = None
+
+    def call(self, coro):
+        return asyncio.run_coroutine_threadsafe(coro, LOOP)
+
+    # --- called from the GTK thread ---
+    def connect(self):
+        self.call(self._connect())
+
+    def set(self, reg, val):
+        def put():
+            # oldest first, a repeated register moves to the back: order matters
+            # (a hue or saturation write switches the light to colour mode)
+            self.pending.pop(reg, None)
+            self.pending[reg] = val
+            if self.wake:
+                self.wake.set()
+        LOOP.call_soon_threadsafe(put)
+
+    def close(self):
+        try:
+            self.call(self._disconnect()).result(timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+
+    # --- on the shared loop ---
+    async def _connect(self):
+        ui = self.panel
+        GLib.idle_add(ui.on_state, "waiting")
+        async with CONNECTING:
+            GLib.idle_add(ui.on_state, "connecting")
+            dev = None
+            for _ in range(3):
+                dev = await gvm.BleakScanner.find_device_by_address(self.addr, timeout=8)
+                if dev:
+                    break
+            if dev is None:
+                GLib.idle_add(ui.on_state, "notfound")
+                return
+            self.client = BleakClient(dev, timeout=15, disconnected_callback=self._lost)
+            try:
+                await self.client.connect()
+                await self.client.start_notify(gvm.CH, self._note)
+                await self.client.write_gatt_char(gvm.CH, gvm.INFO, response=False)
+            except Exception as e:  # noqa: BLE001
+                self.client = None
+                GLib.idle_add(ui.on_state, "error", str(e))
+                return
+        GLib.idle_add(ui.on_state, "connected")
+        self.wake = asyncio.Event()
+        asyncio.ensure_future(self._writer())
+
+    async def _writer(self):
+        while self.client and self.client.is_connected:
+            await self.wake.wait()
+            self.wake.clear()
+            while self.pending:
+                reg = next(iter(self.pending))
+                val = self.pending.pop(reg)
+                try:
+                    await self.client.write_gatt_char(gvm.CH, gvm.setreg(reg, val), response=False)
+                except Exception:  # noqa: BLE001
+                    break
+                await asyncio.sleep(0.06)  # the light drops writes sent too close together
+
+    async def _disconnect(self):
+        if self.client:
+            for _ in range(20):  # let queued writes (e.g. an effect's restore) reach the light first
+                if not self.pending:
+                    break
+                await asyncio.sleep(0.05)
+            await asyncio.sleep(0.1)
+            c, self.client = self.client, None
+            await c.disconnect()
+
+    def _lost(self, _client):
+        if self.client is not None:
+            self.client = None
+            GLib.idle_add(self.panel.on_state, "lost")
+
+    def _note(self, _, d: bytearray):
+        for item in gvm.parse(bytes(d)):
+            if item[0] == "status":
+                GLib.idle_add(self.panel.on_values, dict(enumerate(item[1][:7])), False)
+            elif item[0] == "change":
+                GLib.idle_add(self.panel.on_values, {item[1]: item[2]}, True)
+            elif item[0] == "range":  # colour temperature range in K/100
+                GLib.idle_add(self.panel.on_range, item[1], item[2])
+
+
+class LightPanel(Gtk.Box):
+    """The controls for one light."""
+
+    def __init__(self, window, name, addr):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12, hexpand=True,
+                         margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+        self.window, self.name = window, name
+        self.updating = False   # the light's own reports are moving the controls
+        self.mirroring = False  # Sync is copying another panel's change into this one
+        self.connected = False
+        self.known = False      # a full status report has arrived since connecting
+        self.sent: dict[int, list[tuple[int, float]]] = {}  # recent writes, to recognise their echoes
+
+        # title line: name, address, connection state, reconnect
+        head = Gtk.Box(spacing=8)
+        titles = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True)
+        self.title_lbl = Gtk.Label(label=name if name != addr else "GVM Light", xalign=0, css_classes=["title-4"])
+        self.addr_lbl = Gtk.Label(label=addr, xalign=0, css_classes=["dim-label", "caption"], ellipsize=3)
+        titles.append(self.title_lbl)
+        titles.append(self.addr_lbl)
+        self.own_title, self.addr = self.title_lbl.get_label(), addr
+        self.state_name, self.state_text = "waiting", "Waiting…"
+        head.append(titles)
+        self.state = Gtk.Label(css_classes=["dim-label", "caption"], valign=Gtk.Align.CENTER)
+        head.append(self.state)
+        self.retry = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Reconnect", visible=False,
+                                valign=Gtk.Align.CENTER, css_classes=["flat"])
+        self.retry.connect("clicked", lambda *_: self.window.retry(self))
+        head.append(self.retry)
+        self.append(head)
+
+        self.controls = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, sensitive=False)
+        self.append(self.controls)
+
+        self.power = Adw.SwitchRow(title="Power")
+        self.power.connect("notify::active", lambda r, _p: self.changed("power", r.get_active()))
+        self.bright = self.slider(0, 100, 1, "{:.0f}%")
+        self.bright.connect("value-changed", lambda s: self.changed("bright", s.get_value()))
+        main = Adw.PreferencesGroup()
+        main.add(self.power)
+        main.add(self.row("Brightness", self.bright))
+        self.controls.append(main)
+
+        self.mode_white = Gtk.ToggleButton(label="White", active=True)
+        self.mode_colour = Gtk.ToggleButton(label="Colour", group=self.mode_white)
+        self.mode_colour.connect("toggled", lambda b: self.changed("mode", b.get_active()))
+        modes = Gtk.Box(css_classes=["linked"], halign=Gtk.Align.CENTER)
+        modes.append(self.mode_white)
+        modes.append(self.mode_colour)
+        self.controls.append(modes)
+
+        self.cct = self.slider(3200, 5600, 100, "{:.0f}K", snap=100)
+        self.cct.connect("value-changed", lambda s: self.changed("cct", s.get_value()))
+        white = Adw.PreferencesGroup()
+        white.add(self.row("Temperature", self.cct))
+        presets = Gtk.Box(spacing=6, halign=Gtk.Align.CENTER, margin_top=12)
+        for label, k in (("Warm", 3200), ("Neutral", 4400), ("Daylight", 5600)):
+            b = Gtk.Button(label=label, css_classes=["pill"])
+            b.connect("clicked", lambda _b, k=k: self.cct.set_value(k))
+            presets.append(b)
+        white.add(presets)
+
+        self.hue = self.slider(0, 355, 5, "{:.0f}°", snap=5)
+        self.hue.add_css_class("gvm-hue")
+        self.hue.connect("value-changed", lambda s: self.changed("hue", s.get_value()))
+        self.sat = self.slider(0, 100, 1, "{:.0f}%")
+        self.sat.connect("value-changed", lambda s: self.changed("sat", s.get_value()))
+        colour = Adw.PreferencesGroup()
+        colour.add(self.row("Hue", self.hue))
+        colour.add(self.row("Saturation", self.sat))
+        swatches = Gtk.Box(spacing=6, halign=Gtk.Align.CENTER, margin_top=12)
+        for cname, deg in SWATCHES.items():
+            b = Gtk.Button(tooltip_text=cname, css_classes=["circular", "gvm-swatch", f"gvm-{cname}"])
+            b.connect("clicked", lambda _b, d=deg: (self.hue.set_value(d), self.sat.set_value(100)))
+            swatches.append(b)
+        colour.add(swatches)
+
+        self.pages = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE,
+                               vhomogeneous=False, interpolate_size=True)
+        self.pages.add_named(white, "white")
+        self.pages.add_named(colour, "colour")
+        self.controls.append(self.pages)
+
+        self.link = Link(self, addr)
+        self.link.connect()
+
+    @staticmethod
+    def slider(lo, hi, step, fmt, snap=1):
+        s = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, lo, hi, step)
+        s.set_hexpand(True)
+        s.set_draw_value(True)
+        s.set_value_pos(Gtk.PositionType.RIGHT)
+        # show what the light gets: it takes hue in 5-degree and temperature in 100K steps
+        s.set_format_value_func(lambda _s, v: fmt.format(round(v / snap) * snap % (360 if snap == 5 else 10**6)))
+        return s
+
+    @staticmethod
+    def row(title, widget):
+        r = Adw.ActionRow(title=title)
+        widget.set_size_request(170, -1)
+        r.add_suffix(widget)
+        return r
+
+    # --- a control moved: tell the light, and the other lights when synced ---
+    def changed(self, what, value):
+        if what == "mode":
+            self.pages.set_visible_child_name("colour" if value else "white")
+        if self.updating:
+            return
+        reg, val = {
+            "power": (gvm.ON, 1 if value else 0),
+            "bright": (gvm.BRIGHT, round(value)),
+            "cct": (gvm.CCT, round(value / 100)),
+            "hue": (gvm.HUE, gvm.hue_reg(value)),
+            "sat": (gvm.SAT, round(value)),
+            "mode": (gvm.MODE, gvm.MODE_COLOUR if value else gvm.MODE_WHITE),
+        }[what]
+        if self.connected:
+            now = GLib.get_monotonic_time() / 1e6
+            self.sent[reg] = [(v, t) for v, t in self.sent.get(reg, []) if now - t < 3] + [(val, now)]
+            self.link.set(reg, val)
+        if not self.mirroring:
+            self.window.touched(self)
+            self.window.mirror(self, what, value)
+
+    def is_echo(self, reg, val):
+        """True if the light is only confirming a value this window sent it."""
+        now = GLib.get_monotonic_time() / 1e6
+        recent = [(v, t) for v, t in self.sent.get(reg, []) if now - t < 3]
+        self.sent[reg] = recent
+        return any(v == val for v, _ in recent)
+
+    def recently_written(self, reg):
+        now = GLib.get_monotonic_time() / 1e6
+        return any(now - t < 3 for _, t in self.sent.get(reg, []))
+
+    def register_values(self):
+        """What the window currently shows, in register units."""
+        return {gvm.ON: int(self.power.get_active()), gvm.BRIGHT: round(self.bright.get_value()),
+                gvm.CCT: round(self.cct.get_value() / 100), gvm.HUE: gvm.hue_reg(self.hue.get_value()),
+                gvm.SAT: round(self.sat.get_value()),
+                gvm.MODE: gvm.MODE_COLOUR if self.mode_colour.get_active() else gvm.MODE_WHITE}
+
+    def snapshot(self):
+        """The current settings, in the order they are best applied."""
+        # mode after colour/temperature: writing those switches the light's mode by itself
+        return [("cct", self.cct.get_value()), ("hue", self.hue.get_value()), ("sat", self.sat.get_value()),
+                ("mode", self.mode_colour.get_active()),
+                ("bright", self.bright.get_value()), ("power", self.power.get_active())]
+
+    def apply_settings(self, st):
+        """Set this light from preset settings {on, mode, cct, hue, sat, bright}; mode after colour."""
+        order = [("cct", "cct"), ("hue", "hue"), ("sat", "sat"), ("mode", "mode"), ("bright", "bright"), ("on", "power")]
+        for key, what in order:
+            if key in st:
+                v = st[key]
+                if key == "mode":
+                    v = v == "colour"
+                elif key == "on":
+                    v = bool(v)
+                self.apply(what, v)
+
+    def apply(self, what, value):
+        """Set a control because Link copied it from another panel."""
+        self.mirroring = True
+        try:
+            w = {"power": self.power, "bright": self.bright, "cct": self.cct, "hue": self.hue, "sat": self.sat}.get(what)
+            if what == "mode":
+                (self.mode_colour if value else self.mode_white).set_active(True)
+            elif what == "power":
+                w.set_active(value)
+            else:
+                w.set_value(value)
+        finally:
+            self.mirroring = False
+
+    # --- callbacks from the BLE thread (via idle_add) ---
+    def on_state(self, state, detail=""):
+        self.state_name = state
+        self.state_text = ({
+            "waiting": "Waiting…",
+            "connecting": "Connecting…",
+            "connected": "Connected",
+            "notfound": "Not found",
+            "lost": "Connection lost",
+            "error": "Couldn't connect",
+        }[state])
+        self.state.set_label(self.state_text)
+        tip = {"notfound": "Is it on, and the phone app (or gvm) not using it?", "error": detail}.get(state)
+        self.state.set_tooltip_text(tip)
+        print(f"gvm-gui: {self.name}: {state} {detail}".rstrip(), file=sys.stderr, flush=True)
+        self.connected = state == "connected"
+        if not self.connected:
+            self.known = False
+        self.controls.set_sensitive(self.connected)
+        self.retry.set_visible(self.failed())
+        self.window.relayout()
+        return False
+
+    def failed(self):
+        return self.state_name in ("notfound", "lost", "error")
+
+    def on_values(self, vals, single=False):
+        """The light reported its state: a full status, or one changed register."""
+        external = []  # changes made on the light itself (knobs, phone app), not echoes of ours
+        if single:
+            for reg, val in vals.items():
+                if not self.is_echo(reg, val):
+                    external.append((reg, val))
+        else:
+            # a periodic report can trail our own writes: ignore registers written lately,
+            # and treat any other difference from the window as a change made on the light
+            vals = {r: v for r, v in vals.items() if not self.recently_written(r)}
+            if self.known:
+                current = self.register_values()
+                external = [(r, v) for r, v in vals.items() if r in current and current[r] != v]
+        self.apply_values(vals)
+        if not single and not self.known:
+            self.known = True
+            self.window.panel_ready(self)
+        if self.window.fx_task:
+            return False  # an effect is driving the lights: nothing here is a change to copy
+        for reg, val in external:
+            ui = {gvm.ON: ("power", bool(val)), gvm.BRIGHT: ("bright", val), gvm.CCT: ("cct", val * 100),
+                  gvm.HUE: ("hue", val * 5), gvm.SAT: ("sat", val),
+                  gvm.MODE: ("mode", val == gvm.MODE_COLOUR)}.get(reg)
+            if ui:
+                self.window.touched(self)
+                self.window.mirror(self, *ui)
+        return False
+
+    def apply_values(self, vals):
+        self.updating = True
+        try:
+            if gvm.ON in vals:
+                self.power.set_active(bool(vals[gvm.ON]))
+            if gvm.BRIGHT in vals and not dragging(self.bright):
+                self.bright.set_value(vals[gvm.BRIGHT])
+            if gvm.CCT in vals and not dragging(self.cct):
+                self.cct.set_value(vals[gvm.CCT] * 100)
+            if gvm.HUE in vals and not dragging(self.hue):
+                self.hue.set_value(vals[gvm.HUE] * 5)
+            if gvm.SAT in vals and not dragging(self.sat):
+                self.sat.set_value(vals[gvm.SAT])
+            if gvm.MODE in vals:
+                (self.mode_colour if vals[gvm.MODE] == gvm.MODE_COLOUR else self.mode_white).set_active(True)
+        finally:
+            self.updating = False
+
+    def on_range(self, lo, hi):
+        if 0 < lo < hi:
+            self.cct.set_range(lo * 100, hi * 100)
+        return False
+
+
+def json_key(d):
+    import json
+    return json.dumps(d, sort_keys=True)
+
+
+def dragging(scale):
+    return scale.has_focus() and scale.get_state_flags() & Gtk.StateFlags.ACTIVE
+
+
+SWATCHES = {"red": 0, "orange": 30, "yellow": 60, "green": 120, "cyan": 180,
+            "blue": 240, "purple": 270, "magenta": 300}
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app, lights):
+        super().__init__(application=app, title="GVM Lights")
+        header = Adw.HeaderBar()
+        header.set_title_widget(Adw.WindowTitle(title="GVM Lights" if len(lights) > 1 else "GVM Light"))
+        # Sync: every light follows the one last changed (here, on its knobs, or in the phone app)
+        sync = Gtk.Box(spacing=6, visible=len(lights) > 1,
+                       tooltip_text="Keep every light the same: changes to one, here or on the light, go to all")
+        sync.append(Gtk.Label(label="Sync"))
+        self.synced = Gtk.Switch(valign=Gtk.Align.CENTER, active=load_prefs().get("sync", False))
+        self.synced.connect("notify::active", self.on_sync)
+        sync.append(self.synced)
+        header.pack_start(sync)
+        self.leader = None  # the panel changed most recently; Sync copies it onto the others
+
+        row = Gtk.Box(homogeneous=True)
+        self.row = row
+        self.panels = []
+        for name, addr in lights:
+            p = LightPanel(self, name, addr)
+            self.panels.append(p)
+            row.append(p)
+
+        # Presets (~/.config/gvm/presets.json): one click sets each light to its saved settings
+        pbox = Gtk.Box(spacing=8, margin_start=12, margin_end=12, margin_bottom=12)
+        pbox.append(Gtk.Label(label="Presets", css_classes=["title-4"], xalign=0))
+        self.preset_flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, hexpand=True,
+                                       min_children_per_line=1, max_children_per_line=4,
+                                       column_spacing=6, row_spacing=6)
+        pbox.append(self.preset_flow)
+        self.preset_box = pbox
+        self.load_preset_buttons()
+
+        # Effects: run from here on every connected light; stopping one restores the lights
+        self.fx_task = None        # the running effect (a concurrent future for its task on LOOP)
+        self.fx_run = None         # that run's state: its asyncio task, and whether it restores
+        self.fx_snaps = None       # the lights as they were before the first effect in a row
+        self.fx_buttons = {}
+        self.fx_switching = False
+        self.speed = 1.0
+        fxbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                        margin_start=12, margin_end=12, margin_bottom=12)
+        top = Gtk.Box(spacing=8)
+        top.append(Gtk.Label(label="Effects", xalign=0, css_classes=["title-4"]))
+        self.fx_stop = Gtk.Button(label="Stop", sensitive=False, css_classes=["destructive-action", "pill", "gvm-stop"],
+                                  tooltip_text="Stop the effect and put the lights back (Esc; Esc again hides the panel)")
+        self.fx_stop.connect("clicked", lambda *_: self.stop_effect())
+        top.append(self.fx_stop)
+        top.append(Gtk.Box(hexpand=True))
+        top.append(Gtk.Label(label="Speed", css_classes=["dim-label", "caption"]))
+        speed = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, -2, 2, 0.1)  # log2 of the multiplier
+        speed.set_value(0)
+        speed.set_size_request(130, -1)
+        speed.set_draw_value(True)
+        speed.set_value_pos(Gtk.PositionType.RIGHT)
+        speed.set_format_value_func(lambda _s, v: f"{2 ** v:.1f}×")
+        speed.connect("value-changed", lambda s: setattr(self, "speed", 2 ** s.get_value()))
+        top.append(speed)
+        fxbox.append(top)
+        flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True,
+                           min_children_per_line=3, max_children_per_line=3,
+                           column_spacing=6, row_spacing=6)
+        self.fx_flow = flow
+        for name, (title, _f, clemson, keep) in gvm.EFFECTS.items():
+            b = Gtk.ToggleButton(label=title, css_classes=["gvm-clemson"] if clemson else [])
+            b.set_tooltip_text("Sets the lights and leaves them" if keep else "Click again to stop and put the lights back")
+            b.connect("toggled", lambda btn, n=name: self.on_fx_button(n, btn))
+            self.fx_buttons[name] = b
+            flow.append(b)
+        fxbox.append(flow)
+
+        esc = Gtk.ShortcutController()
+        esc.add_shortcut(Gtk.Shortcut.new(Gtk.ShortcutTrigger.parse_string("Escape"),
+                                          Gtk.CallbackAction.new(lambda *_: self.on_escape() or True)))
+        self.add_controller(esc)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.append(header)
+        box.append(row)
+        box.append(Gtk.Separator(margin_bottom=8))
+        box.append(pbox)
+        box.append(fxbox)
+        self.set_content(box)
+        install_css()
+        self.relayout()
+        # however the window is closed (its button, Super+Q, gvm-lights), stop any effect
+        # (restoring the lights) and disconnect before it goes: once it is gone the app
+        # has no windows left to clean up after
+        self.closed = False
+        self.connect("close-request", self.on_close_request)
+
+    def on_escape(self):
+        """Esc stops a running effect; otherwise it hides the panel (special:lights, like ncmpcpp's q)."""
+        if self.fx_task:
+            self.stop_effect()
+        else:
+            import subprocess
+            subprocess.Popen([os.path.expanduser("~/.local/bin/gvm-lights"), "hide"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def on_close_request(self, *_):
+        if not self.closed:
+            self.closed = True
+            self.close_links()
+        return False
+
+    # --- presets ---
+    def load_preset_buttons(self):
+        while (child := self.preset_flow.get_first_child()):
+            self.preset_flow.remove(child)
+        presets = gvm.load_presets()
+        for name, pdef in presets.items():
+            b = Gtk.Button(label=name, css_classes=["pill", "suggested-action"],
+                           tooltip_text=pdef.get("note") or f"Apply the {name} preset")
+            b.connect("clicked", lambda _b, n=name: self.apply_preset(n))
+            self.preset_flow.append(b)
+        self.preset_box.set_visible(bool(presets))
+
+    def apply_preset(self, name):
+        pdef = gvm.load_presets().get(name)  # read fresh: hand edits take effect without a restart
+        if not pdef:
+            self.load_preset_buttons()
+            return
+        if self.fx_task:  # a preset replaces a running effect outright: no restore
+            self.fx_run["restore"] = False
+            self.fx_task.cancel()
+        targets = [(p, gvm.preset_settings(pdef, p.name)) for p in self.panels]
+        targets = [(p, st) for p, st in targets if st and p.known]
+        # lights set differently can't stay synced: Sync would copy one over the other
+        if self.synced.get_active() and len({json_key(st) for _, st in targets}) > 1:
+            self.synced.set_active(False)
+        for p, st in targets:
+            p.apply_settings(st)
+
+    # --- effects ---
+    def on_fx_button(self, name, button):
+        if self.fx_switching:
+            return
+        if button.get_active():
+            self.start_effect(name)
+        elif self.fx_task and self.fx_name == name:
+            self.stop_effect()
+
+    def set_fx_buttons(self, active):
+        self.fx_switching = True
+        for n, b in self.fx_buttons.items():
+            b.set_active(n == active)
+        self.fx_switching = False
+
+    def start_effect(self, name):
+        panels = [p for p in self.panels if p.known]
+        if not self.fx_task and not panels:
+            self.set_fx_buttons(None)
+            return
+        if self.fx_task:
+            # switching: the old run must not restore (the new one restores to the original state)
+            self.fx_run["restore"] = False
+            self.fx_task.cancel()
+        else:
+            self.fx_snaps = [p.register_values() for p in panels]
+            self.fx_panels = panels
+        self.set_fx_buttons(name)
+        self.fx_name = name
+        run = {"restore": True, "task": None}  # this run's own state
+        self.fx_run = run
+        writers = [self.writer(p) for p in self.fx_panels]
+        snaps = self.fx_snaps
+
+        async def runner():
+            run["task"] = asyncio.current_task()
+            await gvm.run_effect(name, writers, snaps, lambda: self.speed, lambda: run["restore"])
+
+        # cancelling this future cancels the task on LOOP; its finally-block then restores
+        self.fx_task = asyncio.run_coroutine_threadsafe(runner(), LOOP)
+        self.fx_task.add_done_callback(lambda f: GLib.idle_add(self.fx_ended, run))
+        self.relayout()
+
+    def stop_effect(self, wait=False):
+        if not self.fx_task:
+            return
+        run = self.fx_run
+        self.fx_task.cancel()
+        if wait and run["task"]:  # closing: let the restore reach the lights before disconnecting
+            async def settle():
+                await asyncio.wait([run["task"]], timeout=4)
+            try:
+                asyncio.run_coroutine_threadsafe(settle(), LOOP).result(5)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def fx_ended(self, run):
+        if run is not self.fx_run:
+            return False  # an earlier run we switched away from
+        self.fx_task = None
+        self.fx_snaps = None
+        self.set_fx_buttons(None)
+        self.relayout()
+        return False
+
+    def writer(self, panel):
+        async def write(reg, val):
+            now = GLib.get_monotonic_time() / 1e6
+            panel.sent[reg] = [(v, t) for v, t in panel.sent.get(reg, []) if now - t < 3] + [(val, now)]
+            panel.link.set(reg, val)
+            await asyncio.sleep(0)
+        return write
+
+    def mirror(self, source, what, value):
+        if self.synced.get_active():
+            for p in self.panels:
+                if p is not source and p.known:
+                    p.apply(what, value)
+
+    def touched(self, panel):
+        self.leader = panel
+
+    def copy_from(self, leader, targets):
+        for p in targets:
+            if p is not leader and p.known:
+                for what, value in leader.snapshot():
+                    p.apply(what, value)
+
+    def on_sync(self, switch, _pspec):
+        save_prefs(sync=switch.get_active())
+        if switch.get_active():
+            leader = self.leader or next((p for p in self.panels if p.known), None)
+            if leader and leader.known:
+                self.copy_from(leader, self.panels)
+        self.relayout()
+
+    def relayout(self):
+        """Synced: one set of controls for all lights. Otherwise: a panel per light."""
+        synced = self.synced.get_active() and len(self.panels) > 1
+        if synced:
+            shown = next((p for p in self.panels if p.connected), self.panels[0])
+            ok = sum(p.connected for p in self.panels)
+            for p in self.panels:
+                p.set_visible(p is shown)
+            shown.title_lbl.set_label("All lights")
+            shown.addr_lbl.set_label(" + ".join(p.name for p in self.panels))
+            shown.state.set_label(f"{ok} of {len(self.panels)} connected")
+            shown.state.set_tooltip_text("\n".join(f"{p.name}: {p.state_text}" for p in self.panels))
+            shown.retry.set_visible(any(p.failed() for p in self.panels))
+            shown.controls.set_sensitive(ok > 0)
+            visible = 1
+        else:
+            for p in self.panels:
+                p.set_visible(True)
+                p.title_lbl.set_label(p.own_title)
+                p.addr_lbl.set_label(p.addr)
+                p.state.set_label(p.state_text)
+                p.retry.set_visible(p.failed())
+                p.controls.set_sensitive(p.connected)
+            visible = len(self.panels)
+        if getattr(self, "fx_task", None):
+            for p in self.panels:  # an effect owns the lights until it stops
+                p.controls.set_sensitive(False)
+        if hasattr(self, "fx_stop"):
+            self.fx_stop.set_sensitive(bool(self.fx_task))
+        if hasattr(self, "fx_flow"):  # three effect buttons per row for each panel column
+            self.fx_flow.set_max_children_per_line(3 * visible)
+            self.fx_flow.set_min_children_per_line(3 * visible)
+        self.set_default_size(380 * visible, -1)
+        if self.get_mapped():
+            GLib.idle_add(self.fit)
+
+    def fit(self):
+        """Shrink to the content. GTK grows a shown window to fit but never shrinks it,
+        so under Hyprland ask the compositor to resize this window."""
+        if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+            return False
+        import json, subprocess
+        content = self.get_content()
+        w = max(380, content.measure(Gtk.Orientation.HORIZONTAL, -1)[1])
+        h = content.measure(Gtk.Orientation.VERTICAL, w)[1]
+        try:
+            clients = json.loads(subprocess.run(["hyprctl", "clients", "-j"], capture_output=True,
+                                                text=True, timeout=2).stdout)
+            me = next(c for c in clients if c["pid"] == os.getpid())
+            if me["size"] != [w, h]:
+                subprocess.Popen(["hyprctl", "dispatch",
+                                  f"hl.dsp.window.resize({{x={w}, y={h}, window='address:{me['address']}'}})"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:  # noqa: BLE001  (not under Hyprland, or no window yet: leave the size alone)
+            pass
+        return False
+
+    def retry(self, panel):
+        if self.synced.get_active():
+            for p in self.panels:
+                if p.failed():
+                    p.link.connect()
+        else:
+            panel.link.connect()
+
+    def panel_ready(self, panel):
+        """A light just reported its full state after connecting."""
+        if not self.synced.get_active():
+            return
+        leader = self.leader if self.leader and self.leader.known and self.leader is not panel else None
+        leader = leader or next((p for p in self.panels if p.known and p is not panel), None)
+        if leader:
+            self.copy_from(leader, [panel])  # a late arrival joins the others
+
+    def close_links(self):
+        self.stop_effect(wait=True)
+        futures = [p.link.call(p.link._disconnect()) for p in self.panels]
+        for f in futures:
+            try:
+                f.result(timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+PREFS = os.path.expanduser("~/.local/state/gvm/gui.json")
+
+
+def load_prefs() -> dict:
+    import json
+    try:
+        return json.load(open(PREFS))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_prefs(**kv):
+    import json
+    prefs = load_prefs() | kv
+    try:
+        os.makedirs(os.path.dirname(PREFS), exist_ok=True)
+        with open(PREFS, "w") as f:
+            json.dump(prefs, f)
+    except OSError:
+        pass
+
+
+def install_css():
+    css = """
+    .gvm-hue trough { min-height: 8px;
+        background-image: linear-gradient(to right, hsl(0,100%,50%), hsl(60,100%,50%),
+          hsl(120,100%,50%), hsl(180,100%,50%), hsl(240,100%,50%), hsl(300,100%,50%), hsl(355,100%,50%)); }
+    .gvm-hue highlight { background: transparent; }
+    .gvm-swatch { min-width: 22px; min-height: 22px; padding: 0; }
+    .gvm-clemson { color: #F56600; font-weight: bold; }
+    .gvm-stop { padding: 0 14px; min-height: 26px; }
+    .gvm-clemson:checked { background: #F56600; color: white; }
+    button.toggle:checked:not(.gvm-clemson) { background: #522D80; color: white; }
+    """ + "".join(f".gvm-{n} {{ background: hsl({d},100%,50%); }}\n" for n, d in SWATCHES.items())
+    provider = Gtk.CssProvider()
+    provider.load_from_string(css)
+    Gtk.StyleContext.add_provider_for_display(
+        Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+
+class App(Adw.Application):
+    def __init__(self, lights):
+        # NON_UNIQUE: each launch is its own window (e.g. `gvm-gui light2` beside the full one)
+        super().__init__(application_id="edu.clemson.tsranso.GvmLight", flags=Gio.ApplicationFlags.NON_UNIQUE)
+        self.lights = lights
+
+    def do_activate(self):
+        win = self.get_active_window() or Window(self, self.lights)
+        win.present()
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        import signal
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, self.quit)
+
+    def do_shutdown(self):
+        # however the app ends (window closed, killed, logout), give the lights back
+        for w in self.get_windows():
+            if isinstance(w, Window) and not w.closed:
+                w.closed = True
+                w.close_links()
+        Adw.Application.do_shutdown(self)
+
+
+if __name__ == "__main__":
+    App(targets()).run([sys.argv[0]])

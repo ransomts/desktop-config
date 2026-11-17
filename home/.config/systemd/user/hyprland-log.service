@@ -1,0 +1,15 @@
+[Unit]
+Description=Hyprland warnings and errors to the journal; keep each session's full log
+ConditionEnvironment=XDG_CURRENT_DESKTOP=Hyprland
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStartPre=-%h/.local/bin/hyprland-log save
+ExecStart=%h/.local/bin/hyprland-log follow
+ExecStopPost=-%h/.local/bin/hyprland-log save
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target

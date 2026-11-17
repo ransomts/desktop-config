@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=GVM Lights
+Comment=Control the GVM video lights over Bluetooth
+Exec=/home/tsranso/.local/bin/gvm-gui
+Icon=display-brightness-symbolic
+Categories=Utility;
+Keywords=light;gvm;video;lamp;
+StartupWMClass=edu.clemson.tsranso.GvmLight

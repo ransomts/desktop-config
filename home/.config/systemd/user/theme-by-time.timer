@@ -1,0 +1,10 @@
+[Unit]
+Description=Check the dark/light schedule every 10 minutes
+
+[Timer]
+OnCalendar=*:0/10
+# also right after resume/login, via Persistent catching up on missed runs
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,31 @@
+#!/bin/sh
+# Quickshell 0.3.2 loses Hyprland's event socket now and then (PeerClosedError, seen at
+# 12:31 and at an undock on 2026-11-12) and never reconnects: the desktop pill, titles
+# and everything else fed by Hyprland events go stale. Follow its log and restart it
+# when that line appears. At most one restart a minute.
+# The log is followed in the user journal (quickshell-start sends Quickshell's output there,
+# identifier "quickshell"). It used to be `qs log -f`, which aborts on its own every 20-60 min
+# (QThread destroyed while running) and left a core dump each time, about 70 a day, even
+# with `ulimit -c 0` (systemd-coredump is a pipe handler; the limit does not stop it).
+qs="$HOME/.nix-profile/bin/qs"
+last=0
+while :; do
+    if "$qs" ipc call bar status >/dev/null 2>&1 &&
+       journalctl --user -t quickshell -f -n 0 -o cat 2>/dev/null | {
+           grep -m1 -q 'Hyprland event socket error'; found=$?
+           pkill -P $$ -x journalctl       # it would otherwise sit there until its next line
+           exit $found; }; then
+        now=$(date +%s)
+        if [ $((now - last)) -ge 60 ]; then
+            last=$now
+            echo "event socket dropped, restarting Quickshell"
+            "$qs" kill >/dev/null 2>&1
+            for _ in 1 2 3 4 5 6 7 8 9 10; do pgrep -f quickshell-wra >/dev/null || break; sleep 0.5; done
+            sleep 1
+            "$HOME/.local/bin/quickshell-start"
+        else
+            echo "event socket dropped again within a minute; leaving it"
+        fi
+    fi
+    sleep 5
+done

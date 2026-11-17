@@ -1,0 +1,13 @@
+[Unit]
+Description=Count Moonlander key presses for layout tuning (~/.local/state/keystats)
+Documentation=file://%h/.local/bin/keystats
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/keystats
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=graphical-session.target

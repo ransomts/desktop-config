@@ -1,0 +1,45 @@
+#!/bin/sh
+# On-screen level for the laptop's media keys: a Quickshell popup, or a mako
+# notification with a progress bar when Quickshell isn't running. Each kind replaces its previous popup instead of stacking.
+#   osd vol | mic | bright | airplane | touchpad on|off
+show() {  # show KIND ICON TEXT [PERCENT]
+    # Quickshell draws the popup when it is running (see ~/.config/quickshell/Osd.qml);
+    # the mako notification below is the fallback.
+    qs="$HOME/.nix-profile/bin/qs"
+    [ -x "$qs" ] && "$qs" ipc call osd level "$1" "$3" "${4:--1}" >/dev/null 2>&1 && return
+    if [ -n "$4" ]; then
+        notify-send -a osd -t 1500 -i "$2" -h "string:x-canonical-private-synchronous:osd-$1" \
+            -h "int:value:$4" "$3"
+    else
+        notify-send -a osd -t 2000 -i "$2" -h "string:x-canonical-private-synchronous:osd-$1" "$3"
+    fi
+}
+
+case "$1" in
+    vol)
+        out=$(wpctl get-volume @DEFAULT_AUDIO_SINK@)          # "Volume: 0.65 [MUTED]"
+        pct=$(printf '%s' "$out" | awk '{printf "%d", $2*100 + 0.5}')
+        case "$out" in
+            *MUTED*) show vol audio-volume-muted "Muted" "$pct" ;;
+            *)       show vol audio-volume-high "Volume $pct%" "$pct" ;;
+        esac ;;
+    mic)
+        case "$(wpctl get-volume @DEFAULT_AUDIO_SOURCE@)" in
+            *MUTED*) show mic microphone-sensitivity-muted "Microphone muted" ;;
+            *)       show mic audio-input-microphone "Microphone on" ;;
+        esac ;;
+    bright)
+        cur=$(brightnessctl get); max=$(brightnessctl max)
+        pct=$(( (cur * 100 + max / 2) / max ))
+        show bright display-brightness "Brightness $pct%" "$pct" ;;
+    airplane)
+        sleep 0.4   # the kernel flips the radios itself; read the result
+        if rfkill list wlan 2>/dev/null | grep -q 'Soft blocked: yes'; then
+            show airplane airplane-mode "Airplane mode on"
+        else
+            show airplane network-wireless "Airplane mode off"
+        fi ;;
+    touchpad)
+        if [ "$2" = off ]; then show touchpad input-touchpad "Touchpad off"
+        else show touchpad input-touchpad "Touchpad on"; fi ;;
+esac

@@ -1,0 +1,46 @@
+#!/bin/sh
+# The cameras, one per line: PATH<TAB>NAME, for the webcam bubble (Quickshell CamState.qml).
+#   cams          list them as PATH<TAB>NAME<TAB>/dev/videoN (PATH is the stable /dev/v4l/by-id name, not /dev/videoN, which
+#                 changes with plug order; a camera without one gets its /dev/videoN)
+#   cams pick     choose one in a list and show it in the bubble (Super+Ctrl+Shift+W, or
+#                 right-click the bubble); while the bubble shows, the last line hides it
+# Each camera has several /dev/video nodes; only index 0 gives pictures (the rest are metadata).
+list() {
+    seen=""
+    for f in /dev/v4l/by-id/*-video-index0; do
+        [ -e "$f" ] || continue
+        dev=$(readlink -f "$f")
+        seen="$seen $dev "
+        name=$(cat "/sys/class/video4linux/${dev##*/}/name" 2>/dev/null || echo "${dev##*/}")
+        printf '%s\t%s\t%s\n' "$f" "${name%%:*}" "$dev"
+    done
+    for d in /sys/class/video4linux/video*; do
+        [ -e "$d" ] || continue
+        dev="/dev/${d##*/}"
+        case "$seen" in *" $dev "*) continue ;; esac
+        [ "$(cat "$d/index" 2>/dev/null)" = 0 ] || continue
+        name=$(cat "$d/name"); printf '%s\t%s\t%s\n' "$dev" "${name%%:*}" "$dev"
+    done
+}
+
+case "$1" in
+    "") list ;;
+    pick)
+        qs="$HOME/.nix-profile/bin/qs"
+        cams=$(list)
+        [ -n "$cams" ] || { notify-send "Webcam" "No camera found"; exit 1; }
+        status=$("$qs" ipc call cam status 2>/dev/null)
+        current=$(printf '%s' "$status" | sed -n 's/.*"device":"\([^"]*\)".*/\1/p')
+        n=$(printf '%s\n' "$cams" | wc -l)
+        i=$({ printf '%s\n' "$cams" | while IFS="$(printf '\t')" read -r path name _; do
+                  [ "$(readlink -f "$path")" = "$(readlink -f "$current" 2>/dev/null)" ] && mark="  (in use)" || mark=""
+                  printf '%s%s\n' "$name" "$mark"
+              done
+              case "$status" in *'"shown":true'*) echo "Hide the bubble" ;; esac
+            } | "$HOME/.local/bin/qs-pick" --index --placeholder "Webcam for the bubble") || exit 1
+        if [ "$i" -ge "$n" ]; then "$qs" ipc call cam off >/dev/null; exit 0; fi
+        path=$(printf '%s\n' "$cams" | sed -n "$((i + 1))p" | cut -f1)
+        "$qs" ipc call cam use "$path" >/dev/null
+        ;;
+    *) sed -n '2,5p' "$0" >&2; exit 2 ;;
+esac

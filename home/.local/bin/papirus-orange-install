@@ -1,0 +1,27 @@
+#!/bin/sh
+# Install the Papirus icon themes for this user (no sudo) with orange folders.
+# Safe to re-run: skips the download if the themes are there, re-does the links.
+#   papirus-orange-install [colour]     # any Papirus folder colour; default orange
+set -e
+colour="${1:-orange}"
+dest="$HOME/.local/share/icons"
+mkdir -p "$dest"
+if [ ! -d "$dest/Papirus" ] || [ ! -d "$dest/Papirus-Dark" ]; then
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    (cd "$tmp" && apt download papirus-icon-theme && dpkg-deb -x papirus-icon-theme_*.deb .)
+    for t in Papirus Papirus-Dark Papirus-Light; do
+        [ -d "$dest/$t" ] || cp -a "$tmp/usr/share/icons/$t" "$dest/"
+    done
+fi
+# What papirus-folders does: folder.svg -> folder-blue.svg becomes folder-<colour>.svg.
+for t in Papirus Papirus-Dark Papirus-Light; do
+    [ -d "$dest/$t" ] || continue
+    find "$dest/$t" -path '*/places/*' -type l | while read -r link; do
+        case "$(basename "$link")" in *-blue*|*-"$colour"*) continue ;; esac
+        new=$(readlink "$link" | sed -E "s/^(folder|user)-[a-z]+(-|\.svg$)/\1-$colour\2/")
+        [ -e "$(dirname "$link")/$new" ] && ln -sfn "$new" "$link"
+    done
+    gtk-update-icon-cache -q -f "$dest/$t" 2>/dev/null || true
+done
+echo "Papirus installed in $dest with $colour folders"

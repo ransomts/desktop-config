@@ -1,0 +1,45 @@
+#!/bin/sh
+# Lecture tools menu (Super+Z then Z, or Enter): draw, spotlight, zoom, key display and a timer, each with
+# its key and whether it is on now. The tools are Quickshell's (Lecture*.qml); this only
+# asks `qs ipc call lecture status` and calls the matching IPC function.
+#   lecture-menu
+qs="$HOME/.nix-profile/bin/qs"
+st=$("$qs" ipc call lecture status 2>/dev/null) || { notify-send "Lecture tools" "Quickshell is not running"; exit 1; }
+val() { echo " $st " | sed -n "s/.* $1=\([^ ]*\) .*/\1/p"; }
+draw=$(val draw); spot=$(val spot); keys=$(val keys); zoom=$(val zoom); timer=$(val timer); size=$(val spotsize)
+label=$(val label | tr _ ' ')
+case "$draw" in on) dnow="on  (Esc leaves, Tab holds)" ;; hold) dnow="held (ink on screen)" ;; *) dnow="off" ;; esac
+choice=$( {
+    echo "draw       Super+Z D       $dnow"
+    [ "$draw" != off ] && echo "ink undo                    the last stroke"
+    [ "$draw" != off ] && echo "ink clear                   wipe the ink"
+    echo "spot       Super+Z L       $spot   (radius $size px)"
+    [ "$spot" = on ] && { echo "spotsize   100"; echo "spotsize   150"; echo "spotsize   250"; echo "spotsize   400"; }
+    echo "zoomin     Super+=         now ${zoom}x"
+    echo "zoomout    Super+-"
+    echo "zoomreset  Super+\\         back to 1x"
+    echo "keys       Super+Z K       $keys   show keys pressed, for students"
+    if [ "$timer" != off ]; then
+        echo "timerpause                  pause / carry on   ($timer${label:+, $label})"
+        echo "timerreset                  start the timer over"
+        echo "timerstop                   stop the timer"
+    fi
+    for m in 5 10 15 20 50 75; do echo "timer      $m min"; done
+    echo "timer      ... min, with a label"
+    echo "off                        Everything off"
+} | "$HOME/.local/bin/qs-pick" --placeholder "Lecture tools" ) || exit 0
+set -- $choice
+case "$1" in
+    draw|spot|zoomin|zoomout|zoomreset|keys|timerstop|timerpause|timerreset|off) "$qs" ipc call lecture "$1" >/dev/null ;;
+    ink)      "$qs" ipc call lecture ink "$2" >/dev/null ;;
+    spotsize) "$qs" ipc call lecture spotsize "$2" >/dev/null ;;
+    timer)
+        if [ "$2" = "..." ]; then
+            m=$("$HOME/.local/bin/qs-pick" --input --placeholder "Minutes (e.g. 12 or 2.5)") || exit 0
+            case "$m" in ''|*[!0-9.]*) exit 0 ;; esac
+            l=$("$HOME/.local/bin/qs-pick" --input --placeholder "Label (Enter for none)") || l=""
+            "$qs" ipc call lecture timer "$m" "$l" >/dev/null
+        else
+            "$qs" ipc call lecture timer "$2" "" >/dev/null
+        fi ;;
+esac

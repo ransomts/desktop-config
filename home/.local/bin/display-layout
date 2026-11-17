@@ -1,0 +1,691 @@
+#!/usr/bin/env python3
+"""display-layout: the monitor layout behind Settings > Displays.
+
+Monitors are always keyed by their description (the dock's DP-N names change at every
+attach); the laptop panel (eDP-*) by its name, the way hyprland.lua does it.
+
+  display-layout current        live monitors as JSON (mode, position, scale, transform,
+                                the modes each one offers and the scales that suit each mode)
+  display-layout saved          the saved layout (~/.config/shell/displays.json) as JSON
+  display-layout validate FILE  check a layout: no overlaps, nothing stranded, modes exist,
+                                integer positions, scales that give whole logical pixels
+  display-layout lua FILE       the hl.monitor({...}) lines for a layout
+  display-layout apply FILE     change the live layout (see below)
+  display-layout keep           the applied layout stays: drop the pending rollback
+  display-layout revert         put back the layout from before the last apply
+  display-layout status         is a rollback pending, and since when
+  display-layout save FILE      write the layout to ~/.config/shell/displays.json and the
+                                Hyprland rules to ~/.config/hypr/monitors.lua (checked with
+                                luac and `Hyprland --verify-config` before it replaces anything)
+
+A layout FILE is {"primary": DESCRIPTION, "monitors": [{"description", "mode",
+"x", "y", "scale", "transform"}, ...]}; other keys are kept and ignored.
+
+Safety (Hyprland 0.57 has crashed during monitor changes on this machine):
+  - apply and revert are the only commands that change Hyprland, and they only ever send
+    `hyprctl eval 'hl.monitor({output, mode, position, scale, transform})'`, one per monitor
+    that actually changes. Never disabled, mirror, a new monitor, a reload or a dispatch.
+  - apply refuses while presenting ($XDG_RUNTIME_DIR/presenting), while any screen mirrors
+    another, while a screen has no workspace yet, when a monitor in FILE is not connected (or
+    is off), and when the result would not validate.
+  - before it sends anything, apply writes the live state to $XDG_RUNTIME_DIR/display-layout/
+    rollback.json (kept from the FIRST of several applies, so revert always goes back to the
+    layout you started from), and starts a detached watchdog that reverts by itself after
+    DISPLAY_LAYOUT_WATCHDOG seconds (default 25) unless `keep` is run. The settings page counts
+    down 15 s; the watchdog is the backstop if the shell dies or its screen goes dark.
+  - revert works from a TTY (Ctrl+Alt+F3): the rollback file remembers the Hyprland instance.
+
+Environment for tests: HYPRCTL (command, default hyprctl), DISPLAY_LAYOUT_SAVED,
+DISPLAY_LAYOUT_LUA, DISPLAY_LAYOUT_RUNDIR, DISPLAY_LAYOUT_WATCHDOG (0: none),
+DISPLAY_LAYOUT_VERIFY (0: skip `Hyprland --verify-config`).
+"""
+import json
+import math
+import os
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+HOME = os.path.expanduser("~")
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+SAVED = os.environ.get("DISPLAY_LAYOUT_SAVED") or os.path.join(HOME, ".config/shell/displays.json")
+LUA_OUT = os.environ.get("DISPLAY_LAYOUT_LUA") or os.path.join(HOME, ".config/hypr/monitors.lua")
+RUNDIR = os.environ.get("DISPLAY_LAYOUT_RUNDIR") or os.path.join(RUNTIME, "display-layout")
+ROLLBACK = os.path.join(RUNDIR, "rollback.json")
+PRESENTING = os.path.join(RUNTIME, "presenting")
+MIN_TOUCH = 64          # a shared edge shorter than this is hard to cross with the pointer: warn
+MONITOR_FIELDS = ("output", "mode", "position", "scale", "transform")   # all apply ever sends
+
+
+class Refused(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- hyprctl
+
+def hyprctl_cmd():
+    return (os.environ.get("HYPRCTL") or "hyprctl").split()
+
+
+def hyprctl(*args, check=True):
+    p = subprocess.run(hyprctl_cmd() + list(args), capture_output=True, text=True, timeout=10)
+    if check and p.returncode != 0:
+        raise Refused("hyprctl %s failed: %s" % (" ".join(args[:1]), (p.stderr or p.stdout).strip()))
+    return p
+
+
+def live_raw():
+    p = hyprctl("-j", "monitors", "all")
+    try:
+        data = json.loads(p.stdout)
+    except ValueError:
+        raise Refused("hyprctl gave no monitor list (is Hyprland running? %s)" % p.stdout.strip()[:120])
+    if not isinstance(data, list):
+        raise Refused("hyprctl gave no monitor list")
+    return data
+
+
+# ---------------------------------------------------------------- modes and geometry
+
+MODE_RE = re.compile(r"^\s*(\d+)x(\d+)(?:@([0-9.]+))?(?:Hz)?\s*$")
+
+
+def parse_mode(s):
+    m = MODE_RE.match(str(s or ""))
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2)), float(m.group(3)) if m.group(3) else None
+
+
+def fmt_refresh(r):
+    return ("%.3f" % r).rstrip("0").rstrip(".")
+
+
+def mode_string(w, h, r):
+    return "%dx%d@%s" % (w, h, fmt_refresh(r))
+
+
+def same_mode(a, b):
+    pa, pb = parse_mode(a), parse_mode(b)
+    if not pa or not pb or pa[:2] != pb[:2]:
+        return False
+    if pa[2] is None or pb[2] is None:
+        return True
+    return abs(pa[2] - pb[2]) < 0.02
+
+
+def find_mode(mode, modes):
+    for m in modes:
+        if same_mode(mode, m):
+            return m
+    return None
+
+
+def fmt_num(x):
+    x = float(x)
+    if abs(x - round(x)) < 1e-9:
+        return str(int(round(x)))
+    return ("%.6f" % x).rstrip("0").rstrip(".")
+
+
+def scales_for(w, h):
+    """Scales between 1 and 3 that give whole logical pixels: steps of 1/120 (what Hyprland
+    accepts), kept to the readable ones (multiples of 0.05, and thirds)."""
+    out = []
+    for k in range(120, 361):
+        s = k / 120
+        if not (abs(s * 20 - round(s * 20)) < 1e-9 or (s < 2 and abs(s * 3 - round(s * 3)) < 1e-9)):
+            continue
+        if abs(w / s - round(w / s)) < 1e-6 and abs(h / s - round(h / s)) < 1e-6:
+            out.append(round(s, 6))
+    return out
+
+
+def logical_size(mode, scale, transform):
+    p = parse_mode(mode)
+    if not p:
+        return None
+    w, h = p[0], p[1]
+    if int(transform) % 2 == 1:
+        w, h = h, w
+    s = float(scale) or 1
+    return w / s, h / s
+
+
+def rect_of(m):
+    size = logical_size(m["mode"], m["scale"], m["transform"])
+    lw, lh = size
+    return (float(m["x"]), float(m["y"]), round(lw), round(lh))
+
+
+def overlap_area(a, b):
+    w = min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0])
+    h = min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1])
+    return w * h if w > 0 and h > 0 else 0
+
+
+def touch_length(a, b):
+    """Length of the edge two rectangles share (0 if they only meet at a corner, or not at all)."""
+    if a[0] + a[2] == b[0] or b[0] + b[2] == a[0]:
+        return max(0, min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1]))
+    if a[1] + a[3] == b[1] or b[1] + b[3] == a[1]:
+        return max(0, min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0]))
+    return 0
+
+
+def output_key(name, description, duplicate=False):
+    if name.startswith("eDP") or not description or duplicate:
+        return name
+    return "desc:" + description
+
+
+# ---------------------------------------------------------------- live state
+
+def label_of(m):
+    model = (m.get("model") or "").strip()
+    if m["name"].startswith("eDP"):
+        return "Laptop"
+    if not model or re.match(r"^0x[0-9a-fA-F]+$", model):
+        return (m.get("make") or m["name"]).strip() or m["name"]
+    return model
+
+
+def current():
+    raw = live_raw()
+    descs = [m.get("description", "") for m in raw]
+    out = []
+    for m in raw:
+        modes = []
+        for s in m.get("availableModes") or []:
+            p = parse_mode(s)
+            if p and p[2]:
+                ms = mode_string(*p)
+                if ms not in modes:
+                    modes.append(ms)
+        # the live mode keeps its exact refresh (60.049, not the list's rounded 60.05): the
+        # same string hyprland.lua uses, so an unchanged monitor reads as unchanged
+        mode = mode_string(m["width"], m["height"], float(m.get("refreshRate") or 60))
+        near = find_mode(mode, modes)
+        if near:
+            modes[modes.index(near)] = mode
+        else:
+            modes.insert(0, mode)
+        modes.sort(key=lambda s: (-parse_mode(s)[0] * parse_mode(s)[1], -parse_mode(s)[2]))
+        aw = m.get("activeWorkspace") or {}
+        mirror = m.get("mirrorOf") or "none"
+        lw, lh = logical_size(mode, m.get("scale", 1), m.get("transform", 0))
+        out.append({
+            "description": m.get("description", ""),
+            "name": m["name"],
+            "label": label_of(m),
+            "output": output_key(m["name"], m.get("description", ""), descs.count(m.get("description", "")) > 1),
+            "mode": mode,
+            "modes": modes,
+            "scales": {ms: scales_for(*parse_mode(ms)[:2]) for ms in modes},
+            "x": m.get("x", 0), "y": m.get("y", 0),
+            "scale": m.get("scale", 1),
+            "transform": m.get("transform", 0),
+            "logicalWidth": round(lw), "logicalHeight": round(lh),
+            "focused": bool(m.get("focused")),
+            "disabled": bool(m.get("disabled")),
+            "mirrorOf": "" if mirror in ("none", "") else mirror,
+            "workspace": aw.get("id") or 0,
+        })
+    out.sort(key=lambda d: (d["disabled"], d["x"], d["y"]))
+    return out
+
+
+def status():
+    rb = read_json(ROLLBACK)
+    return {"pending": bool(rb), "since": rb.get("time") if rb else None, "token": rb.get("token") if rb else None}
+
+
+# ---------------------------------------------------------------- files
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            o = json.load(f)
+        return o if isinstance(o, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def write_atomic(path, text, mode=0o644):
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix="." + os.path.basename(path) + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def load_layout(path):
+    if path == "-":
+        o = json.load(sys.stdin)
+    else:
+        o = read_json(path)
+    if not o or not isinstance(o.get("monitors"), list):
+        raise Refused("%s: not a layout (needs a \"monitors\" list)" % path)
+    mons = []
+    for m in o["monitors"]:
+        if not isinstance(m, dict) or not m.get("description") and not m.get("output"):
+            raise Refused("%s: a monitor without a description" % path)
+        mons.append({
+            "description": m.get("description") or "",
+            "name": m.get("name") or "",
+            "output": m.get("output") or "",
+            "label": m.get("label") or "",
+            "mode": str(m.get("mode") or ""),
+            "x": m.get("x", 0), "y": m.get("y", 0),
+            "scale": m.get("scale", 1),
+            "transform": m.get("transform", 0),
+        })
+    o["monitors"] = mons
+    return o
+
+
+def live_by_desc(live):
+    return {m["description"]: m for m in live}
+
+
+# ---------------------------------------------------------------- validation
+
+def validate(layout, live=None):
+    """errors, warnings, and the full picture (the layout plus the live monitors it leaves alone)."""
+    errors, warnings = [], []
+    if live is None:
+        try:
+            live = current()
+        except Refused as e:
+            live = []
+            warnings.append("cannot read the live monitors (%s): modes not checked" % e)
+    lbd = live_by_desc(live)
+    seen = set()
+    rects = []        # (label, rect)
+    for m in layout["monitors"]:
+        name = m["description"] or m["output"]
+        if name in seen:
+            errors.append("%s is listed twice" % name)
+            continue
+        seen.add(name)
+        if not isinstance(m["x"], (int, float)) or not isinstance(m["y"], (int, float)) \
+                or isinstance(m["x"], bool) or isinstance(m["y"], bool):
+            errors.append("%s: position is not a number" % name)
+            continue
+        if m["x"] != int(m["x"]) or m["y"] != int(m["y"]):
+            errors.append("%s: position %sx%s is not on the logical pixel grid (whole numbers only)" % (name, m["x"], m["y"]))
+        if m["transform"] not in range(8):
+            errors.append("%s: transform %r is not 0-7" % (name, m["transform"]))
+            continue
+        try:
+            s = float(m["scale"])
+        except (TypeError, ValueError):
+            s = 0
+        if not (0.25 <= s <= 4):
+            errors.append("%s: scale %r is out of range" % (name, m["scale"]))
+            continue
+        p = parse_mode(m["mode"])
+        if not p or p[2] is None:
+            errors.append("%s: mode %r is not WIDTHxHEIGHT@REFRESH" % (name, m["mode"]))
+            continue
+        lv = lbd.get(m["description"])
+        if lv and not find_mode(m["mode"], lv["modes"]):
+            errors.append("%s: mode %s is not one this monitor offers" % (name, m["mode"]))
+        lw, lh = logical_size(m["mode"], s, m["transform"])
+        if abs(lw - round(lw)) > 0.01 or abs(lh - round(lh)) > 0.01:
+            warnings.append("%s: scale %s gives %.2fx%.2f logical pixels; Hyprland will pick a nearby scale (try %s)"
+                            % (name, fmt_num(s), lw, lh, ", ".join(fmt_num(x) for x in scales_for(p[0], p[1])[:5])))
+        rects.append((m.get("label") or (lv or {}).get("label") or name, rect_of(m), name))
+    # monitors the layout leaves alone still take room
+    for lv in live:
+        if lv["description"] in seen or lv["disabled"] or lv["mirrorOf"]:
+            continue
+        rects.append((lv["label"], rect_of(lv), lv["description"]))
+    for i in range(len(rects)):
+        for j in range(i + 1, len(rects)):
+            if overlap_area(rects[i][1], rects[j][1]) > 0:
+                errors.append("%s and %s overlap" % (rects[i][0], rects[j][0]))
+    if len(rects) > 1:
+        # every screen reachable from every other by shared edges
+        adj = {i: [j for j in range(len(rects)) if j != i and touch_length(rects[i][1], rects[j][1]) > 0] for i in range(len(rects))}
+        reach, todo = {0}, [0]
+        while todo:
+            for j in adj[todo.pop()]:
+                if j not in reach:
+                    reach.add(j)
+                    todo.append(j)
+        for i in range(len(rects)):
+            if i not in reach:
+                errors.append("%s does not touch the other screens (the pointer could not reach it)" % rects[i][0])
+            elif adj[i] and max(touch_length(rects[i][1], rects[j][1]) for j in adj[i]) < MIN_TOUCH:
+                warnings.append("%s shares less than %d px of edge with its neighbours" % (rects[i][0], MIN_TOUCH))
+    prim = layout.get("primary")
+    if prim and prim not in seen and prim not in lbd:
+        warnings.append("primary %s is not in this layout" % prim)
+    return errors, warnings
+
+
+# ---------------------------------------------------------------- Lua
+
+def lua_str(s):
+    return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
+
+
+def monitor_fields(m):
+    return [("output", lua_str(m["output"])), ("mode", lua_str(m["mode"])),
+            ("position", lua_str("%dx%d" % (int(m["x"]), int(m["y"])))),
+            ("scale", fmt_num(m["scale"])), ("transform", str(int(m["transform"])))]
+
+
+def monitor_call(m):
+    return "hl.monitor({ " + ", ".join("%s = %s" % kv for kv in monitor_fields(m)) + " })"
+
+
+def resolve_outputs(layout, live=None):
+    """Fill in each monitor's rule key (desc:..., or eDP-1) from the live monitors or its description."""
+    lbd = live_by_desc(live or [])
+    for m in layout["monitors"]:
+        if m["description"] in lbd:
+            m["output"] = lbd[m["description"]]["output"]
+            m["name"] = lbd[m["description"]]["name"]
+            m["label"] = m["label"] or lbd[m["description"]]["label"]
+        elif not m["output"]:
+            m["output"] = output_key(m["name"], m["description"])
+    return layout
+
+
+def lua_text(layout):
+    mons = sorted(layout["monitors"], key=lambda m: (m["x"], m["y"]))
+    prim = layout.get("primary") or ""
+    prim_out = next((m["output"] for m in mons if m["description"] == prim), "")
+    lines = [
+        "-- Monitor layout from Settings > Displays (display-layout save, %s)." % time.strftime("%Y-%m-%d %H:%M"),
+        "-- Loaded by hyprland.lua after its own monitor rules; each rule here replaces that",
+        "-- monitor's built-in one. Edit in the settings window, or by hand, then: Hyprland --verify-config",
+        "-- Delete this file to go back to the rules in hyprland.lua.",
+        "DisplayLayout = { primary = %s, rules = {} }" % lua_str(prim_out),
+    ]
+    for m in mons:
+        lines.append("DisplayLayout.rules[%s] = { mode = %s, position = %s, scale = %s, transform = %s }"
+                     % (lua_str(m["output"]), lua_str(m["mode"]), lua_str("%dx%d" % (int(m["x"]), int(m["y"]))),
+                        fmt_num(m["scale"]), int(m["transform"])))
+    for m in mons:
+        lines.append(monitor_call(m) + ("  -- " + (m.get("label") or m["description"]) if (m.get("label") or m["description"]) else ""))
+    return "\n".join(lines) + "\n"
+
+
+def check_lua(path):
+    """Syntax with luac (if any), then Hyprland's own parser in an empty runtime dir (if any)."""
+    path = os.path.abspath(path)          # Hyprland runs in the empty runtime dir
+    luac = shutil.which("luac") or shutil.which("luac5.4")
+    if luac:
+        p = subprocess.run([luac, "-p", path], capture_output=True, text=True)
+        if p.returncode != 0:
+            raise Refused("generated Lua does not parse: " + p.stderr.strip())
+    if os.environ.get("DISPLAY_LAYOUT_VERIFY", "1") == "0":
+        return "luac" if luac else "none"
+    hypr = shutil.which("Hyprland")
+    if not hypr:
+        return "luac" if luac else "none"
+    with tempfile.TemporaryDirectory() as rt:
+        os.chmod(rt, 0o700)
+        env = {k: v for k, v in os.environ.items() if k not in ("HYPRLAND_INSTANCE_SIGNATURE", "WAYLAND_DISPLAY", "DISPLAY")}
+        env["XDG_RUNTIME_DIR"] = rt          # its socket and lock land here, never next to the live session's
+        p = subprocess.run([hypr, "--config", path, "--verify-config"], capture_output=True, text=True, env=env, timeout=30, cwd=rt)
+        tail = p.stdout.split("Config parsing result:")[-1].strip()
+        if p.returncode != 0 or "config ok" not in tail:
+            raise Refused("Hyprland --verify-config: " + (tail or p.stderr.strip())[-400:])
+    return "Hyprland"
+
+
+# ---------------------------------------------------------------- apply / revert
+
+def changed(m, lv):
+    return (int(m["x"]) != int(lv["x"]) or int(m["y"]) != int(lv["y"])
+            or abs(float(m["scale"]) - float(lv["scale"])) > 1e-4
+            or int(m["transform"]) != int(lv["transform"])
+            or not same_mode(m["mode"], lv["mode"]))
+
+
+def send(m):
+    code = monitor_call(m)
+    p = hyprctl("eval", code, check=False)
+    out = (p.stdout + p.stderr).strip()
+    if p.returncode != 0 or re.search(r"error|unknown|invalid", out, re.I):
+        raise Refused("hyprctl eval failed for %s: %s" % (m["output"], out[:200] or "exit %d" % p.returncode))
+    return code
+
+
+def guard_live(live):
+    if os.path.exists(PRESENTING):
+        raise Refused("presenting is on (Super+P): monitors are not changed while you present")
+    for lv in live:
+        if lv["mirrorOf"]:
+            raise Refused("%s mirrors %s: Super+P \u2192 Extend first" % (lv["label"], lv["mirrorOf"]))
+        if not lv["disabled"] and lv["workspace"] < 1:
+            raise Refused("%s has no workspace yet (Hyprland is still setting it up): try again in a moment" % lv["label"])
+
+
+def send_changes(targets, live):
+    """targets: monitors with output keys; sends one eval per monitor that differs from live.
+    On a failure part-way, puts back the ones already sent and raises."""
+    lbd = live_by_desc(live)
+    sent, done = [], []
+    try:
+        for m in targets:
+            lv = lbd[m["description"]]
+            if changed(m, lv):
+                sent.append(send(m))
+                done.append(lv)
+    except Refused:
+        for lv in done:
+            try:
+                send(lv)
+            except Refused:
+                pass
+        raise
+    return sent
+
+
+def start_watchdog(token):
+    secs = float(os.environ.get("DISPLAY_LAYOUT_WATCHDOG", "25") or 0)
+    if secs <= 0:
+        return None
+    devnull = open(os.devnull, "r+")
+    p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_watchdog", token, str(secs)],
+                         stdin=devnull, stdout=devnull, stderr=devnull, start_new_session=True, close_fds=True)
+    return p.pid
+
+
+def cmd_apply(path):
+    layout = load_layout(path)
+    live = current()
+    guard_live(live)
+    lbd = live_by_desc(live)
+    for m in layout["monitors"]:
+        lv = lbd.get(m["description"])
+        if not lv:
+            raise Refused("%s is not connected" % (m["description"] or m["output"]))
+        if lv["disabled"]:
+            raise Refused("%s is off: turn it on first (this page never turns screens on or off)" % lv["label"])
+    resolve_outputs(layout, live)
+    errors, _ = validate(layout, live)
+    if errors:
+        raise Refused("; ".join(errors))
+    todo = [m for m in layout["monitors"] if changed(m, lbd[m["description"]])]
+    if not todo:
+        return {"ok": True, "sent": [], "pending": status()["pending"]}
+    os.makedirs(RUNDIR, exist_ok=True)
+    rb = read_json(ROLLBACK)
+    token = secrets.token_hex(8)
+    if not rb:                     # the first apply of a series remembers where it started
+        rb = {"time": time.time(), "instance": os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", ""),
+              "monitors": [{k: lv[k] for k in ("description", "name", "output", "label", "mode", "x", "y", "scale", "transform")}
+                           for lv in live if not lv["disabled"] and not lv["mirrorOf"]]}
+    rb["token"] = token
+    write_atomic(ROLLBACK, json.dumps(rb, indent=1) + "\n", 0o600)
+    try:
+        sent = send_changes(todo, live)
+    except Refused as e:
+        try:                        # back to where the series started, then no trial is pending
+            cmd_revert()
+        except Refused:
+            pass
+        raise Refused(str(e) + " (the screens were put back)")
+    wd = start_watchdog(token)
+    return {"ok": True, "sent": sent, "pending": True, "watchdog": wd, "token": token}
+
+
+def cmd_keep():
+    rb = read_json(ROLLBACK)
+    if rb:
+        os.replace(ROLLBACK, ROLLBACK + ".kept")
+    return {"ok": True, "kept": bool(rb)}
+
+
+def cmd_revert(token=None):
+    rb = read_json(ROLLBACK)
+    if not rb:
+        return {"ok": True, "sent": [], "note": "nothing to revert"}
+    if token and rb.get("token") != token:
+        return {"ok": True, "sent": [], "note": "a newer apply or a keep came first"}
+    if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and rb.get("instance"):
+        os.environ["HYPRLAND_INSTANCE_SIGNATURE"] = rb["instance"]       # from a TTY
+    live = current()
+    lbd = live_by_desc(live)
+    targets = [m for m in rb["monitors"] if m["description"] in lbd and not lbd[m["description"]]["disabled"]]
+    missing = [m["label"] or m["description"] for m in rb["monitors"] if m not in targets]
+    sent = send_changes(targets, live)
+    os.replace(ROLLBACK, ROLLBACK + ".reverted")
+    return {"ok": True, "sent": sent, "skipped": missing}
+
+
+def cmd_watchdog(token, secs):
+    time.sleep(float(secs))
+    rb = read_json(ROLLBACK)
+    if rb and rb.get("token") == token:
+        try:
+            cmd_revert(token)
+        except Refused:
+            pass
+
+
+def cmd_save(path):
+    layout = load_layout(path)
+    try:
+        live = current()
+    except Refused:
+        live = []
+    resolve_outputs(layout, live)
+    errors, warnings = validate(layout, live)
+    if errors:
+        raise Refused("; ".join(errors))
+    saved = read_json(SAVED) or {}
+    old = [m for m in (saved.get("monitors") or []) if isinstance(m, dict)]
+    keep = [m for m in old if m.get("description") not in {n["description"] for n in layout["monitors"]}]
+    merged = dict(saved)
+    if layout.get("primary"):
+        merged["primary"] = layout["primary"]
+    merged["version"] = 1
+    merged["monitors"] = keep + [{k: m[k] for k in ("description", "output", "label", "mode", "x", "y", "scale", "transform")}
+                                 for m in layout["monitors"]]
+    full = load_layout_obj(merged)
+    text = lua_text(full)
+    d = os.path.dirname(LUA_OUT) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".monitors.", suffix=".lua")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    try:
+        checked = check_lua(tmp)
+        os.chmod(tmp, 0o644)
+        if os.path.exists(LUA_OUT):
+            shutil.copy2(LUA_OUT, LUA_OUT + ".bak")
+        os.replace(tmp, LUA_OUT)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    write_atomic(SAVED, json.dumps(merged, indent=2) + "\n")
+    return {"ok": True, "lua": LUA_OUT, "saved": SAVED, "checked": checked, "warnings": warnings}
+
+
+def load_layout_obj(o):
+    fd, tmp = tempfile.mkstemp(suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump(o, f)
+    try:
+        return resolve_outputs(load_layout(tmp))
+    finally:
+        os.unlink(tmp)
+
+
+# ---------------------------------------------------------------- main
+
+def emit(o):
+    print(json.dumps(o, indent=1))
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0 if argv else 2
+    cmd, args = argv[0], argv[1:]
+    try:
+        if cmd == "current":
+            emit({"monitors": current(), "presenting": os.path.exists(PRESENTING), **status()})
+        elif cmd == "saved":
+            emit(read_json(SAVED) or {"monitors": []})
+        elif cmd == "status":
+            emit(status())
+        elif cmd == "validate" and len(args) == 1:
+            layout = load_layout(args[0])
+            try:
+                live = current()
+            except Refused:
+                live = None
+            if live is not None:
+                resolve_outputs(layout, live)
+            errors, warnings = validate(layout, live)
+            emit({"ok": not errors, "errors": errors, "warnings": warnings})
+            return 0 if not errors else 1
+        elif cmd == "lua" and len(args) == 1:
+            layout = load_layout(args[0])
+            try:
+                live = current()
+            except Refused:
+                live = []
+            sys.stdout.write(lua_text(resolve_outputs(layout, live)))
+        elif cmd == "apply" and len(args) == 1:
+            emit(cmd_apply(args[0]))
+        elif cmd == "keep":
+            emit(cmd_keep())
+        elif cmd == "revert":
+            emit(cmd_revert())
+        elif cmd == "save" and len(args) == 1:
+            emit(cmd_save(args[0]))
+        elif cmd == "_watchdog" and len(args) == 2:
+            cmd_watchdog(args[0], args[1])
+        else:
+            print("usage: display-layout current|saved|status|validate FILE|lua FILE|apply FILE|keep|revert|save FILE", file=sys.stderr)
+            return 2
+    except Refused as e:
+        emit({"ok": False, "error": str(e)})
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

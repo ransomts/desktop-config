@@ -1,0 +1,44 @@
+#!/bin/sh
+# Keep the COSMIC wallpaper in step with dark/light mode.
+#
+# cosmic-bg has no per-theme wallpaper setting, so this watches the same file
+# every mode switch writes (com.system76.CosmicTheme.Mode/v1/is_dark) and
+# rewrites the `source:` line of cosmic-bg's "all" entry; cosmic-bg reloads
+# its config on change. Only the same-on-all layout is handled -- per-output
+# wallpapers set in Settings live in other files and are left alone.
+#
+#   wallpaper-follows-theme        # apply once, then watch
+#   wallpaper-follows-theme once   # apply once and exit
+
+MODE_DIR="$HOME/.config/cosmic/com.system76.CosmicTheme.Mode/v1"
+BG="$HOME/.config/cosmic/com.system76.CosmicBackground/v1/all"
+LIGHT="/usr/share/backgrounds/System76-Geometric-adapted_by_Kate_Hazen_of_System76.png"
+DARK="$HOME/.local/share/backgrounds/System76-Geometric-dark.png"
+HYPRPAPER="$HOME/.config/hypr/hyprpaper.conf"
+
+apply() {
+    if [ "$(cat "$MODE_DIR/is_dark" 2>/dev/null)" = "true" ]; then
+        want="$DARK"
+    else
+        want="$LIGHT"
+    fi
+    if [ "$XDG_CURRENT_DESKTOP" = Hyprland ]; then
+        # hyprpaper: rewrite the conf (so the next login starts right) and swap live.
+        # The IPC call fails harmlessly if hyprpaper isn't up yet; it reads the conf then.
+        sed -i "s|^\( *path = \).*|\1$want|" "$HYPRPAPER"
+        hyprctl hyprpaper wallpaper ",$want" >/dev/null 2>&1
+        return 0
+    fi
+    [ -f "$BG" ] || return 0
+    grep -qF "Path(\"$want\")" "$BG" && return 0
+    sed -i "s|source: Path(\"[^\"]*\")|source: Path(\"$want\")|" "$BG"
+}
+
+apply
+[ "$1" = "once" ] && exit 0
+
+# Watch the directory, not the file: cosmic-config writes via rename, so the
+# inode changes on every switch.
+inotifywait -m -q -e close_write -e moved_to "$MODE_DIR" | while read -r _ _ file; do
+    [ "$file" = "is_dark" ] && apply
+done

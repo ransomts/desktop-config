@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+"""Clemson football's score right now, for the bar pet's touchdown hop (PetSecrets.qml).
+
+    pet-score        # {"state": "pre" | "in" | "post", "us": 14, "them": 7}
+
+From ESPN's public team feed (the one ~/.local/bin/gameday uses). Asked once a minute by the
+shell, and only on a game day from kickoff until the game ends. Prints nothing on any error.
+"""
+import json, urllib.request
+
+URL = "https://site.api.espn.com/apis/site/v2/sports/football/college-football/teams/228"   # 228: Clemson
+
+
+def points(c):
+    s = c.get("score")
+    if isinstance(s, dict):
+        s = s.get("value", s.get("displayValue"))
+    try:
+        return int(float(s))
+    except (TypeError, ValueError):
+        return 0
+
+
+try:
+    with urllib.request.urlopen(URL, timeout=8) as r:
+        comp = json.load(r)["team"]["nextEvent"][0]["competitions"][0]
+    us = next(c for c in comp["competitors"] if c["team"]["id"] == "228")
+    them = next(c for c in comp["competitors"] if c["team"]["id"] != "228")
+    print(json.dumps({"state": comp["status"]["type"]["state"], "us": points(us), "them": points(them)}))
+except Exception:
+    pass

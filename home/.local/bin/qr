@@ -1,0 +1,46 @@
+#!/bin/sh
+# QR codes.
+#   qr read          drag a box round a QR code on screen: the text is copied (wl-copy) and printed;
+#                    a web address gets an "Open" button in the notification
+#   qr show TEXT     draw TEXT as a QR code (qrencode) in a picture under $XDG_RUNTIME_DIR and show it
+#   qr png TEXT FILE write the picture (the launcher's `qr ` row uses qrencode directly)
+# Needs slurp, grim, zbarimg, wl-copy, qrencode, notify-send. The text that was read is never logged.
+run="${XDG_RUNTIME_DIR:-/tmp}"
+
+case "$1" in
+read)
+    region=$(slurp) || exit 0
+    [ -n "$region" ] || exit 0
+    img=$(mktemp "$run/qr-read.XXXXXX.png") || exit 1
+    trap 'rm -f "$img"' EXIT
+    grim -g "$region" "$img" || { notify-send -a QR "QR code" "Could not capture the region"; exit 1; }
+    text=$(zbarimg --raw -q "$img" 2>/dev/null)
+    if [ -z "$text" ]; then notify-send -a QR "No QR code found" "Try a bigger box with some margin round it"; exit 1; fi
+    printf '%s' "$text" | wl-copy
+    printf '%s\n' "$text"
+    first=$(printf '%s\n' "$text" | head -n 1)
+    case "$first" in
+        http://*|https://*)
+            # -A makes notify-send wait for the answer (and print the action name)
+            if notify-send --help 2>&1 | grep -q -- '-A'; then
+                ans=$(timeout 20 notify-send -a QR -A open=Open "QR code copied" "$first")
+                [ "$ans" = open ] && xdg-open "$first" >/dev/null 2>&1
+            else
+                notify-send -a QR "QR code copied" "$first"
+            fi ;;
+        *) notify-send -a QR "QR code copied" "$(printf '%s' "$text" | head -c 120)" ;;
+    esac ;;
+png)
+    [ -n "$2" ] && [ -n "$3" ] || { echo "usage: qr png TEXT FILE" >&2; exit 2; }
+    qrencode -o "$3" -s 8 -m 2 -- "$2" ;;
+show)
+    shift
+    [ -n "$*" ] || { echo "usage: qr show TEXT" >&2; exit 2; }
+    f="$run/qr-show.png"
+    qrencode -o "$f" -s 10 -m 3 -- "$*" || { notify-send -a QR "QR code" "Too much text for one code"; exit 1; }
+    for v in imv swayimg feh; do
+        command -v "$v" >/dev/null 2>&1 && exec "$v" "$f"
+    done
+    exec xdg-open "$f" ;;
+*) echo "usage: qr read | qr show TEXT" >&2; exit 2 ;;
+esac

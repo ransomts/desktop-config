@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""Put an event on the Outlook calendar from one plain line.
+
+    quick-event parse "Lunch with Sam tomorrow 12-1 at Esso Club"
+    quick-event add [--dry-run] "Faculty meeting Fri 2:30pm 90m McAdams 114"
+
+parse prints JSON {subject, start, end, location, human, problems}; start and end are
+"YYYY-MM-DDTHH:MM" in Eastern time (null when they could not be worked out). A line that
+cannot be read without guessing gets `problems` (strings such as "Which day?") instead.
+
+add parses, refuses when there are problems, writes the spec for the user's own tool
+(~/.emacs.d/scripts/exchange-rules.py event SPEC.json) under $XDG_RUNTIME_DIR, runs it, and
+reports through notify-send: the read-back time on success, the tool's message on failure.
+It never puts attendees in a spec. After a real (not --dry-run) add it starts
+pull-calendars.service so the agenda shows the event soon.
+
+What a line may contain (everything else is the subject):
+  day     today, tomorrow, mon..sun / monday..sunday (the next such day after today, a week on
+          if it is today), "this fri" (today counts), "next tue" (that day in next Mon-Sun week),
+          11/20, 11/20/2027, Nov 20, November 20th 2027, 2026-11-20 (no year: the next one)
+  time    9, 9am, 9:30, 9:30pm, 14:00, noon, midnight; a bare hour is 1-7 pm, 8-11 am, 12 noon,
+          13-23 as 24-hour. A bare hour alone counts only after "at" or right after a date.
+  range   12-1, 2:30-4pm, 9am-10am, 9 to 10, from 11 until 1pm, noon-1
+  length  90m, 1.5h, 2 hours (default 1 hour)
+  place   after " at " or " @ " when what follows is not a time; it ends at the next day/time word
+Times that do not exist (spring forward) or occur twice (fall back) in America/New_York are
+problems, as is anything in the past, a missing day, a missing time, or two of anything.
+Environment: QUICK_EVENT_NOW (test: "2026-11-14T10:36", Eastern), QUICK_EVENT_TOOL (the
+exchange tool, test: a fake).
+"""
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+import uuid
+from zoneinfo import ZoneInfo
+
+ET = ZoneInfo("America/New_York")
+UTC = dt.timezone.utc
+TOOL = os.path.expanduser("~/.emacs.d/scripts/exchange-rules.py")
+MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+MON_RE = r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+WD = {"mon": 0, "tue": 1, "tues": 1, "wed": 2, "thu": 3, "thur": 3, "thurs": 3, "fri": 4, "sat": 5, "sun": 6}
+WD_RE = r"(?:mon(?:day)?|tue(?:s(?:day)?)?|wed(?:nesday)?|thu(?:r(?:s(?:day)?)?)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)"
+T_RE = r"(?:\d{1,2}(?::\d{2})?(?:\s*[ap]m)?|noon|midnight)"
+DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+def now_et():
+    raw = os.environ.get("QUICK_EVENT_NOW")
+    if raw:
+        return dt.datetime.fromisoformat(raw).replace(tzinfo=ET)
+    return dt.datetime.now(ET)
+
+
+# ---- time zone facts -------------------------------------------------------
+
+def wall_state(naive):
+    """'ok', 'gap' (does not exist) or 'fold' (happens twice) for a wall-clock time in Eastern."""
+    a = naive.replace(tzinfo=ET, fold=0)
+    b = naive.replace(tzinfo=ET, fold=1)
+    if a.utcoffset() == b.utcoffset():
+        return "ok"
+    # fold=0 with a later offset than fold=1 would mean a repeated hour; the reverse a gap
+    return "fold" if a.utcoffset() > b.utcoffset() else "gap"
+
+
+def add_elapsed(naive, minutes):
+    """The wall-clock time `minutes` of real time after `naive` (Eastern), across DST changes."""
+    u = naive.replace(tzinfo=ET).astimezone(UTC) + dt.timedelta(minutes=minutes)
+    return u.astimezone(ET).replace(tzinfo=None)
+
+
+# ---- tokens that end a place ----------------------------------------------
+
+def temporal_token(tok, nxt=None):
+    t = tok.lower().strip(",;")
+    if re.fullmatch(r"(?:today|tomorrow|tmrw|tmr|noon|midnight|" + WD_RE + r")", t):
+        return True
+    if re.fullmatch(r"(?:this|next)", t) and nxt and re.fullmatch(WD_RE, nxt.lower().strip(",;")):
+        return True
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}(?:/\d{2,4})?", t):
+        return True
+    if re.fullmatch(MON_RE + r"\.?", t) and nxt and re.match(r"\d", nxt):
+        return True
+    if re.fullmatch(r"\d{1,2}(?::\d{2})?\s*[ap]m|\d{1,2}:\d{2}", t):
+        return True
+    if re.fullmatch(T_RE + r"[-\u2013]" + T_RE, t):
+        return True
+    if re.fullmatch(r"\d+(?:\.\d+)?(?:m|min|mins|h|hr|hrs)", t):
+        return True
+    return False
+
+
+def bare_hour_is_time(tok, rest):
+    """'at 9' is a time when nothing but day/time words follow; 'at 114 Main' is a place."""
+    if not re.fullmatch(r"\d{1,2}", tok) or int(tok) > 23:
+        return False
+    return not rest or temporal_token(rest[0], rest[1] if len(rest) > 1 else None)
+
+
+def split_place(line):
+    """-> (line without the place, place or ''). Place = after ' at '/' @ ' unless a time follows."""
+    toks = line.split()
+    for i, tok in enumerate(toks):
+        if tok.lower() not in ("at", "@") or i == 0 or i + 1 >= len(toks):
+            continue
+        nxt = toks[i + 1]
+        rest = toks[i + 2:]
+        if temporal_token(nxt, rest[0] if rest else None) or bare_hour_is_time(nxt, rest):
+            continue
+        j = i + 1
+        while j < len(toks) and not temporal_token(toks[j], toks[j + 1] if j + 1 < len(toks) else None):
+            j += 1
+        return " ".join(toks[:i] + toks[j:]), " ".join(toks[i + 1:j])
+    return line, ""
+
+
+# ---- the parser ------------------------------------------------------------
+
+class Bag:
+    def __init__(self):
+        self.problems = []
+
+    def problem(self, text):
+        if text not in self.problems:
+            self.problems.append(text)
+
+
+def hour24(h, m, suffix, bag):
+    """-> minutes since midnight or None; suffix is 'am', 'pm' or None (bare)."""
+    if m > 59:
+        bag.problem("Minutes out of range")
+        return None
+    if suffix:
+        if not 1 <= h <= 12:
+            bag.problem("%d%s is not a time" % (h, suffix))
+            return None
+        return ((h % 12) + (12 if suffix == "pm" else 0)) * 60 + m
+    if h > 23:
+        bag.problem("%d is not an hour" % h)
+        return None
+    if h >= 13 or h == 0:
+        return h * 60 + m
+    if h == 12 or h <= 7:
+        return (h % 12 + 12) * 60 + m          # 12 is noon, 1-7 are afternoon
+    return h * 60 + m                          # 8-11 morning
+
+
+def t_parts(s):
+    """'2:30pm' -> (2, 30, 'pm'); 'noon' -> (12, 0, 'pm'); '9' -> (9, 0, None)."""
+    s = s.lower().strip()
+    if s == "noon":
+        return 12, 0, "pm"
+    if s == "midnight":
+        return 12, 0, "am"
+    m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?\s*([ap]m)?", s)
+    return int(m.group(1)), int(m.group(2) or 0), m.group(3)
+
+
+def take(rx, text, flags=re.I):
+    """All matches of rx; returns (matches, text with each replaced by a space)."""
+    ms = list(re.finditer(rx, text, flags))
+    return ms, re.sub(rx, " ", text, flags=flags)
+
+
+def resolve_year(month, day, year, today, bag):
+    try:
+        if year is not None:
+            d = dt.date(year, month, day)
+            if d < today:
+                bag.problem("That date is in the past")
+            return d
+        d = dt.date(today.year, month, day)
+        if d < today:
+            d = dt.date(today.year + 1, month, day)
+        return d
+    except ValueError:
+        bag.problem("%d/%d is not a date" % (month, day))
+        return None
+
+
+def weekday_date(wd, today, kind):
+    ahead = (wd - today.weekday()) % 7
+    if kind == "next":
+        return today + dt.timedelta(days=(7 - today.weekday()) + wd)
+    if kind == "this":
+        return today + dt.timedelta(days=ahead)
+    return today + dt.timedelta(days=ahead or 7)
+
+
+def parse(line, now=None):
+    now = now or now_et()
+    today = now.date()
+    bag = Bag()
+    out = {"subject": "", "start": None, "end": None, "location": "", "human": "", "problems": bag.problems}
+    text = re.sub(r"\s+", " ", line.replace("\u2013", "-").replace("\u2014", "-")).strip()
+    if not text:
+        bag.problem("Nothing to add")
+        return out
+    # "12 to 1", "9 - 10", "from 11 until 1pm" -> "12-1"
+    text = re.sub(r"(?<![\w:/.-])(" + T_RE + r")\s*(?:-|to|until|till)\s*(" + T_RE + r")(?![\w:/-])",
+                  lambda m: m.group(1) + "-" + m.group(2) if _timeish(m.group(1)) and _timeish(m.group(2)) else m.group(0),
+                  text, flags=re.I)
+    text, place = split_place(text)
+    out["location"] = place
+
+    # ---- day
+    dates = []                                  # list of datetime.date or None
+    marks = "\u00a7D\u00a7"
+    ms = list(re.finditer(r"\b(\d{4})-(\d{2})-(\d{2})\b", text))
+    for m in ms:
+        try:
+            dates.append(dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3))))
+            if dates[-1] < today:
+                bag.problem("That date is in the past")
+        except ValueError:
+            bag.problem("%s is not a date" % m.group(0)); dates.append(None)
+    text = re.sub(r"(?:\b(?:on|by)\s+)?\b\d{4}-\d{2}-\d{2}\b", " " + marks + " ", text)
+    for m in re.finditer(r"(?<![\w/:.-])(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?(?![\w/:-])", text):
+        y = m.group(3)
+        y = None if y is None else (int(y) + 2000 if len(y) == 2 else int(y))
+        dates.append(resolve_year(int(m.group(1)), int(m.group(2)), y, today, bag))
+    text = re.sub(r"(?:\b(?:on|by)\s+)?(?<![\w/:.-])\d{1,2}/\d{1,2}(?:/\d{2,4})?(?![\w/:-])", " " + marks + " ", text)
+    rx = r"\b(" + MON_RE + r")\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(\d{4}))?(?![\w:/])"
+    for m in re.finditer(rx, text, re.I):
+        mon = MONTHS.index(m.group(1).lower()[:3]) + 1
+        dates.append(resolve_year(mon, int(m.group(2)), int(m.group(3)) if m.group(3) else None, today, bag))
+    text = re.sub(r"(?:\b(?:on|by)\s+)?" + rx, " " + marks + " ", text, flags=re.I)
+    rx = r"\b(?:(this|next)\s+)?(today|tomorrow|tmrw|tmr|" + WD_RE + r")\b"
+    for m in re.finditer(rx, text, re.I):
+        w = m.group(2).lower()
+        if w == "today":
+            dates.append(today)
+        elif w in ("tomorrow", "tmrw", "tmr"):
+            dates.append(today + dt.timedelta(days=1))
+        else:
+            dates.append(weekday_date(WD[w[:3]], today, (m.group(1) or "").lower()))
+    text = re.sub(r"(?:\b(?:on|by)\s+)?" + rx, " " + marks + " ", text, flags=re.I)
+    if re.search(r"\b(?:this|next)\s+(?:week|month|year|weekend)\b", text, re.I):
+        bag.problem("Which day?")
+    if len([d for d in dates]) > 1:
+        bag.problem("More than one day")
+    date = dates[0] if len(dates) == 1 else None
+    if not dates:
+        bag.problem("Which day?")
+
+    # ---- all day (the tool only takes a start and an end)
+    if re.search(r"\ball[- ]?day\b", text, re.I):
+        bag.problem("All-day events are not supported; give a time")
+        text = re.sub(r"\ball[- ]?day\b", " ", text, flags=re.I)
+
+    # ---- length
+    durs = []
+    rx = r"(?:\bfor\s+)?(?<![\w:/.-])(\d+(?:\.\d+)?)\s*(m|min|mins|minutes?|h|hr|hrs|hours?)\b"
+    for m in re.finditer(rx, text, re.I):
+        n = float(m.group(1))
+        mins = n * (60 if m.group(2).lower().startswith("h") else 1)
+        durs.append(mins)
+    text = re.sub(rx, " ", text, flags=re.I)
+    if len(durs) > 1:
+        bag.problem("More than one length")
+    dur = durs[0] if len(durs) == 1 else None
+    if dur is not None and (dur < 1 or dur != int(dur) or dur > 24 * 60):
+        bag.problem("Check the length")
+        dur = None
+
+    # ---- times: a range first, then single times
+    start_min = end_min = None
+    ranges = list(re.finditer(r"(?:\b(?:from|at)\s+)?(?<![\w:/.\u00a7-])(" + T_RE + r")-(" + T_RE + r")(?![\w:/-]|\.\d)", text, re.I))
+    if len(ranges) > 1:
+        bag.problem("More than one time range")
+    elif ranges:
+        a, b = t_parts(ranges[0].group(1)), t_parts(ranges[0].group(2))
+        start_min, end_min = _range(a, b, bag)
+    text = re.sub(r"(?:\b(?:from|at)\s+)?(?<![\w:/.\u00a7-])" + T_RE + "-" + T_RE + r"(?![\w:/-]|\.\d)", " ", text, flags=re.I)
+
+    singles = []
+    rx = (r"(?:\b(?:at|from|by)\s+)?(?<![\w:/.-])(?P<tok>\d{1,2}(?::\d{2})?\s*[ap]m\b|\d{1,2}:\d{2}\b|noon\b|midnight\b)")
+    for m in re.finditer(rx, text, re.I):
+        singles.append(t_parts(m.group("tok")))
+    text = re.sub(rx, " ", text, flags=re.I)
+    for m in re.finditer(r"\bat\s+(\d{1,2})(?![\w:/.-])", text, re.I):
+        singles.append((int(m.group(1)), 0, None))
+    text = re.sub(r"\bat\s+(\d{1,2})(?![\w:/.-])", " ", text, flags=re.I)
+
+    def _after_day(m):                      # a bare hour right after the day: "11/20 9"
+        singles.append((int(m.group(1)), 0, None))
+        return marks + " "
+    text = re.sub(marks + r"\s+(\d{1,2})(?![\w:/.-])", _after_day, text)
+
+    if ranges and singles:
+        bag.problem("A time and a range")
+    elif len(singles) > 1:
+        bag.problem("More than one time")
+    elif singles:
+        h, mi, suf = singles[0]
+        start_min = hour24(h, mi, suf, bag)
+    if start_min is None and end_min is None and not ranges and not singles:
+        bag.problem("What time?")
+    if ranges and dur is not None:
+        bag.problem("A time range and a length")
+
+    # ---- subject
+    sub = text.replace(marks, " ")
+    sub = re.sub(r"\s+", " ", sub).strip()
+    while True:
+        new = re.sub(r"^(?:on|at|from|for|to|until|till|by|@)\b[\s,;-]*|[\s,;-]*\b(?:on|at|from|for|to|until|till|by|@)$|^[\s,;:@-]+|[\s,;:@-]+$", "", sub, flags=re.I)
+        if new == sub:
+            break
+        sub = new
+    sub = re.sub(r"\s+", " ", sub)
+    out["subject"] = sub
+    if not sub:
+        bag.problem("What is it called?")
+
+    # ---- put it together
+    if date is not None and start_min is not None:
+        s0 = dt.datetime.combine(date, dt.time(start_min // 60, start_min % 60))
+        if end_min is not None:
+            e0 = dt.datetime.combine(date, dt.time(end_min // 60, end_min % 60))
+            if e0 <= s0:
+                bag.problem("The end is not after the start")
+                e0 = None
+        else:
+            minutes = dur if dur is not None else 60
+            e0 = add_elapsed(s0, minutes) if wall_state(s0) == "ok" else s0 + dt.timedelta(minutes=minutes)
+        for label, w in (("start", s0), ("end", e0)):
+            if w is None:
+                continue
+            st = wall_state(w)
+            if st == "gap":
+                bag.problem("%s does not exist on %s (clocks spring forward)" % (_clock(w), w.strftime("%b %-d")))
+            elif st == "fold":
+                bag.problem("%s happens twice on %s (clocks fall back)" % (_clock(w), w.strftime("%b %-d")))
+        if e0 is not None and not bag.problems and (e0 - s0) > dt.timedelta(hours=12) and dur is None \
+                and not re.search(r"[ap]m|noon|midnight|\d:\d\d", line, re.I):
+            bag.problem("Check the times (over 12 hours)")
+        if s0.replace(tzinfo=ET) < now and date == today:
+            bag.problem("%s has already passed today" % _clock(s0))
+        out["start"] = s0.strftime("%Y-%m-%dT%H:%M")
+        if e0 is not None:
+            out["end"] = e0.strftime("%Y-%m-%dT%H:%M")
+            if not bag.problems:
+                out["human"] = human(s0, e0, place, today)
+    return out
+
+
+def _timeish(s):
+    return bool(re.fullmatch(T_RE, s, re.I))
+
+
+def _range(a, b, bag):
+    (h1, m1, s1), (h2, m2, s2) = a, b
+    if s1 and not s2:
+        # "9am-10", "9am-1": end follows the usual bare-hour rule, never before the start
+        e = hour24(h2, m2, None, bag)
+        st = hour24(h1, m1, s1, bag)
+        if e is not None and st is not None and s1 == "pm" and e <= st and e + 720 < 1440 and h2 <= 12:
+            e += 720                                # 7pm-9 -> 9 pm
+        return st, e
+    if s2 and not s1:
+        e = hour24(h2, m2, s2, bag)
+        if e is None:
+            return None, None
+        cands = [hour24(h1, m1, x, bag) for x in (s2, "am" if s2 == "pm" else "pm") if 1 <= h1 <= 12]
+        for c in cands:
+            if c is not None and c < e:
+                return c, e
+        if not cands:
+            return hour24(h1, m1, None, bag), e
+        return cands[0], e
+    st = hour24(h1, m1, s1, bag)
+    e = hour24(h2, m2, s2, bag)
+    if st is None or e is None:
+        return st, e
+    if not s1 and not s2 and e <= st and h2 <= 11 and h2 != 0 and e + 720 < 1440:
+        e += 720                                   # 7-9 -> 7 pm to 9 pm
+    if not s1 and not s2 and e - st > 720:
+        bag.problem("Check the times (over 12 hours)")
+    return st, e
+
+
+def _clock(d):
+    h = d.hour % 12 or 12
+    return "%d:%02d %s" % (h, d.minute, "am" if d.hour < 12 else "pm")
+
+
+def human(s, e, place, today):
+    def day(d):
+        y = "" if d.year == today.year else " %d" % d.year
+        return "%s %s %d%s" % (DAYS[d.weekday()], d.strftime("%b"), d.day, y)
+    def hm(d):
+        return "%d:%02d" % (d.hour % 12 or 12, d.minute)
+    ap = lambda d: "am" if d.hour < 12 else "pm"
+    if s.date() == e.date():
+        t = ("%s to %s %s" % (hm(s), hm(e), ap(e))) if ap(s) == ap(e) else ("%s %s to %s %s" % (hm(s), ap(s), hm(e), ap(e)))
+        r = "%s, %s" % (day(s), t)
+    else:
+        r = "%s, %s %s to %s, %s %s" % (day(s), hm(s), ap(s), day(e), hm(e), ap(e))
+    return r + (", " + place if place else "")
+
+
+# ---- add -------------------------------------------------------------------
+
+def notify(summary, body="", urgent=False):
+    argv = ["notify-send", "-a", "quick-event"] + (["-u", "critical"] if urgent else []) + [summary, body]
+    try:
+        subprocess.run(argv, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        sys.stderr.write("%s: %s\n" % (summary, body))
+
+
+READBACK = re.compile(r"^\s+(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}) -> (\d{4}-\d{2}-\d{2}T\d{2}:\d{2})", re.M)
+
+
+def add(line, dry):
+    r = parse(line)
+    if r["problems"]:
+        msg = "; ".join(r["problems"])
+        notify("Event not added", "%s\n%s" % (line, msg), urgent=True)
+        print("not added: " + msg, file=sys.stderr)
+        return 2
+    spec = {"subject": r["subject"], "start": r["start"], "end": r["end"]}
+    if r["location"]:
+        spec["location"] = r["location"]
+    rundir = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+    d = os.path.join(rundir, "quick-event")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    path = os.path.join(d, "spec-%d-%s.json" % (os.getpid(), uuid.uuid4().hex[:8]))
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(spec, f, ensure_ascii=False)
+    try:
+        tool = os.environ.get("QUICK_EVENT_TOOL") or TOOL
+        argv = [tool, "event"] + (["--dry-run"] if dry else []) + [path]
+        try:
+            p = subprocess.run(argv, capture_output=True, text=True, timeout=90)
+        except (OSError, subprocess.SubprocessError) as e:
+            notify("Event not added", "%s\n%s" % (r["subject"], e), urgent=True)
+            print("tool failed: %s" % e, file=sys.stderr)
+            return 1
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    if p.returncode != 0:
+        msg = (p.stderr.strip() or p.stdout.strip() or "exit %d" % p.returncode).splitlines()
+        msg = " ".join(msg[-3:])[:300]
+        notify("Event not added", "%s\n%s" % (r["subject"], msg), urgent=True)
+        print("tool failed: " + msg, file=sys.stderr)
+        return 1
+    m = READBACK.search(p.stdout)
+    shown = r["human"]
+    warn = False
+    if m:
+        s2 = dt.datetime.fromisoformat(m.group(1))
+        e2 = dt.datetime.fromisoformat(m.group(2))
+        shown = human(s2, e2, r["location"], now_et().date())
+        warn = (m.group(1), m.group(2)) != (r["start"], r["end"])
+    head = ("Would add (dry run)" if dry else "Event added") if not warn else "Saved, but the read-back differs"
+    notify(head, "%s\n%s" % (r["subject"], shown), urgent=warn)
+    print("%s: %s | %s" % (head, r["subject"], shown))
+    if not dry:
+        try:
+            subprocess.run(["systemctl", "--user", "start", "--no-block", "pull-calendars.service"], timeout=10, check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return 0
+
+
+def main(argv):
+    if len(argv) >= 2 and argv[0] == "parse":
+        print(json.dumps(parse(" ".join(argv[1:])), ensure_ascii=False))
+        return 0
+    if argv and argv[0] == "add":
+        rest = argv[1:]
+        dry = "--dry-run" in rest
+        rest = [a for a in rest if a != "--dry-run"]
+        if not rest:
+            print(__doc__, file=sys.stderr)
+            return 2
+        return add(" ".join(rest), dry)
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

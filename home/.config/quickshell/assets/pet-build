@@ -1,0 +1,807 @@
+#!/usr/bin/env python3
+"""Draws the bar pet (a tiger cub, 16x16 pixel art) into assets/pet-ANIMAL-COAT.png, one sheet per coat.
+Seven animals: the cat (tiger cub), a dog, a frog, a bird, a turtle, a fox and a dragon; all have the same twelve frames.
+
+    assets/pet-build            # writes pet-cat-tiger.png, pet-dog-golden.png, ... next to this script
+    assets/pet-build PREVIEW [cat|dog|frog|bird|turtle|fox|dragon]    # also writes PREVIEW: that animal's coats, every frame
+
+One row of frames, each 16x16, facing right (PetSprite.qml mirrors it to face left):
+  0 stand   1 stand, eyes shut   2 walk a   3 walk b   4 sit   5 asleep a   6 asleep b
+  7 lying awake   8 washing   9 pounce   10 eating   11 standing, tail the other way
+(the dragon's 8 is breathing fire, 9 flying with its wings up, 11 flying with them down)
+Edit the grids below and run this again; Quickshell picks the new image up on reload.
+"""
+import json, os, sys
+from PIL import Image
+
+CLEAR = (0, 0, 0, 0)
+def rgb(h): return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), 255)
+# coat: o coat, s shaded coat, d stripes, w muzzle / belly / paws, k eyes, p nose
+# edge (optional): a one-pixel outline in that colour, for coats that would vanish
+# against the bar (white on the light bar, panther on the dark one, regalia on the purple
+# light-mode wallpaper behind the bar: a near-black edge there disappears on the dark one)
+COATS = {
+    "tiger":   dict(o="f56600", s="c95200", d="2b1a12", w="f3e6d0", k="16161a", p="e58a8a"),   # Clemson orange
+    "white":   dict(o="ece7e0", s="cbc4ba", d="3a3a42", w="ffffff", k="2f6f9f", p="e58a8a", edge="8c8782"),   # white tiger, blue eyes
+    "regalia": dict(o="7a4fb0", s="522d80", d="2e1750", w="f3e6d0", k="16161a", p="e58a8a", edge="1a0d2e"),   # Clemson purple
+    "tabby":   dict(o="9a948d", s="7b7670", d="4a4744", w="ece7e0", k="16161a", p="e58a8a"),   # grey tabby
+    "panther": dict(o="45454e", s="33333a", d="26262b", w="5a5a64", k="f5b800", p="8a6a6a", edge="8a8a94"),   # black, amber eyes
+}
+
+HEAD = [            # rows 2-7, the same in every standing frame; "k" eyes
+    "..........o...o.",
+    ".d........oo.oo.",
+    ".o.......ooooooo",
+    ".o.......okoooko",
+    ".oo......owwpwwo",
+    "..oo.....oowwwoo",
+]
+BODY = [
+    "..oodoodoodooo..",
+    "..oodoodoodoooo.",
+    "..sooooooooooos.",
+    "..swwwwwwwwwos..",
+]
+def standing(legs, blink=False):
+    head = [r.replace("k", "s") if blink and i == 3 else r for i, r in enumerate(HEAD)]     # shut eyes: a soft line
+    return ["................", "................"] + head + BODY + legs + ["................"]
+
+STAND = standing(["..oo.oo...oo.oo.", "..oo.oo...oo.oo.", "..ww.ww...ww.ww."])
+BLINK = standing(["..oo.oo...oo.oo.", "..oo.oo...oo.oo.", "..ww.ww...ww.ww."], blink=True)
+WALK_A = standing(["..oo..oo.oo..oo.", ".oo...oo.oo...oo", ".ww...ww.ww...ww"])
+WALK_B = standing(["...oooo....oooo.", "...oo.o....oo.o.", "...ww.w....ww.w."])
+SIT = [
+    "................",
+    "................",
+    "................",
+    "........o...o...",
+    "........oo.oo...",
+    ".......ooooooo..",
+    ".......okoooko..",
+    ".......owwpwwo..",
+    ".......oowwwoo..",
+    "......oooooooo..",
+    ".....oodoowwoo..",
+    "....ooodoowwwo..",
+    ".d..oooooowwwo..",
+    ".o.sooooooowoo..",
+    ".oosooooo.ww.ww.",
+    "................",
+]
+SLEEP_A = [
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "................",
+    "...........o..o.",
+    "....ooooooooooo.",
+    "..ooodoodooooooo",
+    ".oooooooooosooso",
+    ".osooooooowwpwwo",
+    ".dooooooooowwwo.",
+    "................",
+]
+SLEEP_B = SLEEP_A[:9] + [
+    "....ooooooo.o..o",
+    "..ooooooooooooo.",
+    ".ooodoodoooooooo",
+    ".oooooooooosooso",
+    ".osooooooowwpwwo",
+    ".dooooooooowwwo.",
+    "................",
+]
+# lying down but awake: the sleeping loaf with its eyes open
+LOAF = [r.replace("sooso", "kooko") for r in SLEEP_A]
+# washing: sitting, one front paw up at the muzzle
+GROOM = SIT[:8] + [
+    ".......oowwwww..",
+    "......oooooowo..",
+] + SIT[10:]
+POUNCE = [
+    "................",
+    "................",
+    "................",
+    "...........o..o.",
+    "...........oooo.",
+    "..........oooooo",
+    ".d........okooko",
+    ".oo..oooooowwpwo",
+    "..oooodoodooowwo",
+    "...ooodoodoooo..",
+    "..oswwwwwwwoooo.",
+    ".oo.........o.oo",
+    "ww...........w.w",
+    "................",
+    "................",
+    "................",
+]
+EAT = [
+    "................",
+    "................",
+    "................",
+    ".d..............",
+    ".o..............",
+    ".o..............",
+    ".oo.............",
+    "..oo......o...o.",
+    "..oodoodoodoo.oo",
+    "..oodoodoooooooo",
+    "..sooooooookoook",
+    "..swwwwwwwowwpww",
+    "..oo.oo...oowwwo",
+    "..oo.oo...oo.oo.",
+    "..ww.ww...ww.ww.",
+    "................",
+]
+# standing with the tail swung down and back (for a tail flick)
+TAIL = ["....", "d...", "o...", ".o..", "..oo"]
+STAND_B = STAND[:3] + [TAIL[i] + STAND[3 + i][4:] for i in range(5)] + STAND[8:]
+FRAMES = [STAND, BLINK, WALK_A, WALK_B, SIT, SLEEP_A, SLEEP_B, LOAF, GROOM, POUNCE, EAT, STAND_B]
+
+# ---------------- the dog: floppy dark ears, a longer muzzle, a short tail held up ----------------
+DOG_COATS = {
+    "golden":    dict(o="d9a441", s="b8862f", d="8b5a2b", w="f3e6d0", k="16161a", p="2b1a12"),
+    "chocolate": dict(o="8b5a2b", s="6f4520", d="4a2d14", w="e0c9a6", k="16161a", p="16161a"),
+    "husky":     dict(o="9aa0a8", s="7c828a", d="3a3a42", w="ffffff", k="2f6f9f", p="16161a"),
+}
+D_HEAD = [
+    "..........oooo..",
+    ".........oooooo.",
+    "..o......dokooo.",
+    "..o......ddooooo",
+    "..oo.....ddowwwp",
+    "...o......oowww.",
+]
+D_BODY = [
+    "...oooooooooo...",
+    "...ooddooooooo..",
+    "...sooooooooos..",
+    "...swwwwwwwwos..",
+]
+def d_standing(legs, blink=False):
+    head = [r.replace("k", "s") if blink else r for r in D_HEAD]
+    return ["................", "................"] + head + D_BODY + legs + ["................"]
+D_STAND = d_standing(["...oo.oo..oo.oo.", "...oo.oo..oo.oo.", "...ww.ww..ww.ww."])
+D_BLINK = d_standing(["...oo.oo..oo.oo.", "...oo.oo..oo.oo.", "...ww.ww..ww.ww."], blink=True)
+D_WALK_A = d_standing(["...oo..oo.oo..oo", "..oo...oo.oo..oo", "..ww...ww.ww..ww"])
+D_WALK_B = d_standing(["....oooo...oooo.", "....oo.o...oo.o.", "....ww.w...ww.w."])
+D_SIT = [
+    "................",
+    "................",
+    "................",
+    "........oooo....",
+    ".......oooooo...",
+    "......dokookod..",
+    "......doowwood..",
+    "......d.owpwo...",
+    ".......oowwoo...",
+    "......oooooooo..",
+    ".....oooowwooo..",
+    "....ooooowwwoo..",
+    ".o..ooooowwwoo..",
+    ".oosoooooowooo..",
+    "..ooooooo.ww.ww.",
+    "................",
+]
+D_SLEEP_A = ["................"] * 10 + [
+    "....oooooooooo..",
+    "..oooooooooodoo.",
+    ".ooooooooooddsoo",
+    ".osooooooooddwwp",
+    ".ooooooooooooww.",
+    "................",
+]
+D_SLEEP_B = ["................"] * 9 + [
+    "....oooooooooo..",
+    "..oooooooooooo..",
+    "..oooooooooodoo.",
+    ".ooooooooooddsoo",
+    ".osooooooooddwwp",
+    ".ooooooooooooww.",
+    "................",
+]
+D_LOAF = [r.replace("ddsoo", "ddkoo") for r in D_SLEEP_A]
+# begging: sitting, one front paw lifted
+D_GROOM = D_SIT[:9] + [
+    "......ooooooww..",
+    ".....oooowwoww..",
+] + D_SIT[11:]
+D_POUNCE = [
+    "................",
+    "................",
+    "................",
+    "...........ooo..",
+    "..........ooooo.",
+    "..........dkooo.",
+    ".o........ddowwp",
+    ".oo..ooooooowww.",
+    "..ooooooooooo...",
+    "...ooooooooooo..",
+    "..oswwwwwwwoooo.",
+    ".oo.........o.oo",
+    "ww...........w.w",
+    "................",
+    "................",
+    "................",
+]
+D_EAT = [
+    "................",
+    "................",
+    "................",
+    "................",
+    "..o.............",
+    "..o.............",
+    "..oo............",
+    "...o............",
+    "...oooooooooo...",
+    "...oooooooooooo.",
+    "...sooooooodkoo.",
+    "...swwwwwwwddooo",
+    "...oo.oo..oowwwp",
+    "...oo.oo..oo.ww.",
+    "...ww.ww..ww.ww.",
+    "................",
+]
+# standing with the tail the other way (for a wag)
+D_TAIL = [".o..", ".o..", "..o.", "...o"]
+D_STAND_B = D_STAND[:4] + [D_TAIL[i] + D_STAND[4 + i][4:] for i in range(4)] + D_STAND[8:]
+D_FRAMES = [D_STAND, D_BLINK, D_WALK_A, D_WALK_B, D_SIT, D_SLEEP_A, D_SLEEP_B, D_LOAF, D_GROOM, D_POUNCE, D_EAT, D_STAND_B]
+
+# ---------------- the frog: squat, a bulging eye, long folded hind legs ----------------
+# inks here: p is the ring of the eye, t the tongue
+FROG_COATS = {
+    "pond": dict(o="5fa83a", s="3f7d2c", d="2b5a1e", w="e8f0c8", k="16161a", p="f0c674", t="e58a8a"),   # green pond frog
+    "dart": dict(o="2f7fe0", s="1f5fb0", d="16161a", w="9cc4f5", k="16161a", p="f0c674", t="e58a8a"),   # blue poison-dart frog
+    "tree": dict(o="7ed957", s="4fae3a", d="2f8f2f", w="fff4c2", k="d13438", p="f56600", t="e58a8a"),   # red-eyed tree frog
+}
+BLANK = "................"
+F_SIT = [BLANK] * 5 + [
+    "...........oo...",
+    "..........okpo..",
+    ".....ooooooooooo",
+    "...oooodoooooowo",
+    "..ooodoooooowwww",
+    ".oooooodooowwww.",
+    ".osoooooooowww..",
+    ".ossoooosooww...",
+    "..sssoo.soo.oo..",
+    ".ssss.oo..ooo...",
+    BLANK,
+]
+F_BLINK = [r.replace("okpo", "osso") for r in F_SIT]
+# croaking: the throat puffed out
+F_CROAK = F_SIT[:10] + [
+    ".oooooodoowwwwww",
+    ".osooooooowwwww.",
+] + F_SIT[12:]
+# mid-leap: stretched out, hind legs trailing
+F_LEAP = [BLANK] * 4 + [
+    "............oo..",
+    "...........okpo.",
+    ".......ooooooooo",
+    ".....ooodooooowo",
+    "...oooodoooowww.",
+    "..oosooooowww...",
+    ".oss....oo......",
+    "ss.......oo.....",
+    "s...............",
+    BLANK, BLANK, BLANK,
+]
+F_SLEEP_A = [BLANK] * 10 + [
+    "...........ss...",
+    "....oooooooooooo",
+    "..ooodooooooowww",
+    ".osooodooooowwww",
+    ".ssss.oo..ooo...",
+    BLANK,
+]
+F_SLEEP_B = F_SLEEP_A[:11] + ["...ooooooooooooo"] + F_SLEEP_A[12:]
+F_FLAT = [r.replace("...........ss...", "...........kp...") for r in F_SLEEP_A]
+# mouth open, tongue showing (the long tongue itself is drawn by PetSprite.qml)
+F_EAT = F_SIT[:8] + ["...oooodooooottt"] + F_SIT[9:]
+#           stand  blink    walk a  walk b sit    asleep a   asleep b   lying   croak    leap    eat
+F_FRAMES = [F_SIT, F_BLINK, F_LEAP, F_SIT, F_SIT, F_SLEEP_A, F_SLEEP_B, F_FLAT, F_CROAK, F_LEAP, F_EAT, F_CROAK]
+
+# ---------------- the bird: round, a short beak, a cocked tail; it flies ----------------
+# inks here: p is the beak and the legs
+BIRD_COATS = {
+    "wren":     dict(o="a0703c", s="7a5230", d="4a3020", w="f3e6d0", k="16161a", p="e0a030"),   # Carolina wren, the state bird
+    "cardinal": dict(o="d13438", s="a82a2e", d="26262b", w="e86a6a", k="16161a", p="f56600"),
+    "bluebird": dict(o="4a8fe0", s="2f6fc0", d="1f4f90", w="f0a070", k="16161a", p="3a3a42"),
+}
+B_STAND = [BLANK] * 5 + [
+    ".........ooo....",
+    "........ooooo...",
+    "........owkoopp.",
+    ".......oooooo...",
+    "..d...oossowww..",
+    "..dd.ooosssoww..",
+    "...ddoosssooww..",
+    "....dooosoowww..",
+    ".....ooooowww...",
+    ".......p..p.....",
+    BLANK,
+]
+B_BLINK = [r.replace("owkoopp", "owsoopp") for r in B_STAND]
+# perched and fluffed up: no legs showing
+B_SIT = B_STAND[:13] + ["....oooooowwww..", ".....ooooowww...", BLANK]
+B_SLEEP_A = [BLANK] * 8 + [
+    "........ooo.....",
+    "..d...ooooooo...",
+    "..dd.ooossssoo..",
+    "...ddoossssoow..",
+    "....dooossooww..",
+    ".....oooooowww..",
+    "......oooowww...",
+    BLANK,
+]
+B_SLEEP_B = B_SLEEP_A[:8] + [".......oooo....."] + B_SLEEP_A[9:]
+# preening: head turned back into the wing
+B_PREEN = B_STAND[:5] + ["........ooo.....", ".......ooooo....", "......ppokwo...."] + B_STAND[8:]
+B_FLY_UP = [BLANK] * 4 + [
+    "......ss........",
+    ".....ssss.......",
+    ".....sssss.ooo..",
+    "......ssssoowkpp",
+    ".dd..ooosoooooo.",
+    "..ddooooooowww..",
+    "....ooooowwww...",
+] + [BLANK] * 5
+B_FLY_DOWN = [BLANK] * 6 + [
+    "...........ooo..",
+    "..........oowkpp",
+    ".dd..oooooooooo.",
+    "..ddoosssoowww..",
+    "....osssswwww...",
+    ".....ssss.......",
+    "......ss........",
+] + [BLANK] * 3
+B_PECK = [BLANK] * 8 + [
+    "..d.............",
+    "..dd...oooo.....",
+    "...ddooossooo...",
+    "....doosssoooo..",
+    ".....ooosoowoko.",
+    "......ooowwwopp.",
+    ".......p..p.....",
+    BLANK,
+]
+#           stand    blink    hop a    hop b  perched asleep a   asleep b   fluffed preen    wings up  peck    wings down
+B_FRAMES = [B_STAND, B_BLINK, B_STAND, B_SIT, B_SIT, B_SLEEP_A, B_SLEEP_B, B_SIT, B_PREEN, B_FLY_UP, B_PECK, B_FLY_DOWN]
+
+# ---------------- the turtle: a domed shell, a head on a short neck, stubby legs ----------------
+# inks here: o the shell, s its shade and rim, d the lines between its plates, p a mark on each
+# plate (the box turtle's yellow flecks), g the skin, h shaded skin, w the underside, k the eye
+TURTLE_COATS = {
+    "slider": dict(o="5f8f3a", s="3f6a28", d="2b4a1e", p="7fae4a", g="9ac46a", h="6f9a48", w="e8e0a8", k="16161a"),   # a pond slider, green
+    "box":  dict(o="8b5a2b", s="5e3a1a", d="3a2414", p="f0c674", g="a08458", h="76603c", w="f0c674", k="d13438"),   # an eastern box turtle: brown shell, yellow flecks, red eye
+    "sea":  dict(o="2f8f8a", s="1f6a68", d="16484a", p="5fbfb0", g="c8b48a", h="9a8a66", w="f3e6d0", k="16161a"),   # a green sea turtle, teal
+}
+# frames 0-3 share one shell; only the head, the legs and the tail change
+def t_frame(head, legs, tail=("", "")):
+    """head: rows 8-11 for cols 12-15; legs: rows 13-14; tail: rows 11-12, col 0"""
+    rows = [BLANK] * 6 + [
+        "....ooooo.......",
+        "..oodpppdoo.....",
+        ".oodpooopdoo....",
+        ".odddddddddo....",
+        ".odpodpodpdo....",
+        ".sssssssssss....",
+        "..wwwwwwwww.....",
+    ] + legs + [BLANK]
+    for i, h in enumerate(head):
+        rows[8 + i] = rows[8 + i][:12] + h
+    for i, t in enumerate(tail):
+        if t: rows[11 + i] = t + rows[11 + i][1:]
+    return rows
+T_HEAD = [".gg.", "ggkg", "gggg", "gg.."]
+T_LEGS = ["..gg.....gg.....", "..hh.....hh....."]
+T_TAIL = ("", "g")
+T_STAND = t_frame(T_HEAD, T_LEGS, T_TAIL)
+T_BLINK = t_frame([".gg.", "gghg", "gggg", "gg.."], T_LEGS, T_TAIL)
+T_WALK_A = t_frame(T_HEAD, [".gg.......gg....", ".hh.......hh...."], T_TAIL)
+T_WALK_B = t_frame(T_HEAD, ["...gg...gg......", "...hh...hh......"], T_TAIL)
+# tail the other way: up and out (a slow flick)
+T_STAND_B = t_frame(T_HEAD, T_LEGS, ("g", ""))
+# stretch: the neck out long and up
+T_STRETCH = t_frame([".g..", "gg..", "g...", "...."], T_LEGS, T_TAIL)
+T_STRETCH[5] = T_STRETCH[5][:13] + "gg."
+T_STRETCH[6] = T_STRETCH[6][:12] + ".gkg"
+T_STRETCH[7] = T_STRETCH[7][:12] + ".gg."
+T_SIT = [BLANK] * 7 + [
+    "....ooooo.......",
+    "..oodpppdoo.....",
+    ".oodpooopdoo.gg.",
+    ".odddddddddoggkg",
+    ".odpodpodpdogggg",
+    "gsssssssssssgg..",
+    "hgwwwwwwwwwgh...",
+    "................",
+    BLANK,
+]
+# asleep: down on the ground, chin on the floor, eyes shut; breathing in, the dome rises a row
+T_SLEEP_A = [BLANK] * 8 + [
+    "....ooooo.......",
+    "..oodpppdoo.....",
+    ".oodpooopdoo....",
+    ".odddddddddo....",
+    ".odpodpodpdo.gg.",
+    "gsssssssssssgghg",
+    "hgwwwwwwwwwggg..",
+    BLANK,
+]
+T_SLEEP_B = [BLANK] * 7 + T_SLEEP_A[8:11] + T_SLEEP_A[10:]
+T_LIE = [r.replace("gghg", "ggkg") for r in T_SLEEP_A]
+# into its shell: nothing out but the dark openings where the head and legs went
+T_HIDE = [BLANK] * 8 + [
+    "....ooooo.......",
+    "..oodpppdoo.....",
+    ".oodpooopdoo....",
+    ".odddddddddo....",
+    ".odpodpodpdo....",
+    ".sssssssssss....",
+    ".dwwwwwwwwwd....",
+    BLANK,
+]
+# eating: neck down, mouth to the ground
+T_EAT = t_frame(["....", "....", "g...", "gg.."], ["..gg.....gg.gkgg", "..hh.....hh..ggg"], T_TAIL)
+T_EAT[12] = T_EAT[12][:12] + ".gg."
+#           stand    blink    walk a    walk b    sit    asleep a   asleep b   lying  stretch    in shell eat    tail
+T_FRAMES = [T_STAND, T_BLINK, T_WALK_A, T_WALK_B, T_SIT, T_SLEEP_A, T_SLEEP_B, T_LIE, T_STRETCH, T_HIDE, T_EAT, T_STAND_B]
+
+# ---------------- the fox: tall pointed ears, a long thin muzzle, dark stockings, a big brush of a tail ----------------
+# inks here: d the ear backs and stockings, w the cheeks, chest and the tip of the tail, p the nose
+FOX_COATS = {
+    "red":    dict(o="e0662a", s="b84e1c", d="2b1a12", w="f3e6d0", k="16161a", p="16161a"),
+    "arctic": dict(o="ece7e0", s="cbc4ba", d="9a948d", w="ffffff", k="16161a", p="3a3a42", edge="8c8782"),
+    "silver": dict(o="4a4a54", s="38383f", d="1e1e22", w="c8c8d0", k="f5b800", p="16161a", edge="8a8a94"),
+}
+X_HEAD = [          # rows 2-7
+    "..........d..d..",
+    "..........oo.oo.",
+    ".........ooooo..",
+    ".........oooko..",
+    ".........wwoooop",
+    "..........wwww..",
+]
+X_BODY = [          # rows 8-11, the tail sweeping back and down from the rump
+    ".ss.ooooooooww..",
+    "sooooooooooooww.",
+    "ooo.sooooooooo..",
+    "ww...swwwwwwos..",
+]
+def x_standing(legs, blink=False, body=X_BODY):
+    head = [r.replace("k", "o") if blink else r for r in X_HEAD]
+    return [BLANK, BLANK] + head + body + legs + [BLANK]
+X_LEGS = ["....oo.o..oo.o..", "....dd.d..dd.d..", "....dd.d..dd.d.."]
+X_STAND = x_standing(X_LEGS)
+X_BLINK = x_standing(X_LEGS, blink=True)
+X_WALK_A = x_standing(["....oo..o.oo..o.", "...dd...dd.d...d", "...dd...dd.d...d"])
+X_WALK_B = x_standing([".....ooo...ooo..", ".....d.d...d.d..", ".....d.d...d.d.."])
+# the brush swung up behind it (a swish)
+X_STAND_B = x_standing(X_LEGS, body=["ws..ooooooooww..", "oooooooooooooww.", "....sooooooooo..", ".....swwwwwwos.."])
+X_STAND_B[7] = "w" + X_STAND_B[7][1:]            # the white tip of the brush, a row higher
+X_SIT = [
+    BLANK,
+    BLANK,
+    BLANK,
+    ".........d..d...",
+    ".........oo.oo..",
+    "........ooooo...",
+    "........oooko...",
+    "........wwoooop.",
+    ".........wwww...",
+    "......oooowww...",
+    ".....ooooowww...",
+    "....oooooowww...",
+    "....sooooowoo...",
+    "wooooooooo.d.d..",
+    ".wwoooooo..d.d..",
+    BLANK,
+]
+# curled up asleep: a round mound, one ear up, the brush wrapped along the front, its white tip over the nose
+X_SLEEP_A = [BLANK] * 9 + [
+    "......ooooo.....",
+    "....ooooooooo.d.",
+    "..ooooooooooooo.",
+    ".ooooooooooosoo.",
+    ".ossssssssssswww",
+    "..ssssssssssww..",
+    BLANK,
+]
+# breathing in: the back rises a row
+X_SLEEP_B = [BLANK] * 8 + ["......ooooo.....", "....ooooooo.....", "...oooooooooo.d."] + X_SLEEP_A[11:]
+# lying awake: the same, head up off the brush and looking
+X_LIE = [BLANK] * 8 + [
+    "............d.d.",
+    "......ooooo.oo.o",
+    "....oooooooooko.",
+    "..oooooooowwooop",
+    ".oooooooooowww..",
+    ".ossssssssssswww",
+    "..ssssssssssww..",
+    BLANK,
+]
+def x_head_down(dy, body, legs):
+    """the standing head lowered by dy rows, over the body"""
+    rows = [BLANK, BLANK, BLANK, BLANK, BLANK, BLANK, BLANK, BLANK] + body + legs + [BLANK]
+    for i, h in enumerate(X_HEAD):
+        y = 2 + i + dy
+        rows[y] = "".join(c if c != "." else rows[y][x] for x, c in enumerate(h))
+    return rows
+# sniffing: nose down along the ground (alternates with eating's head-to-the-floor for a snuffle)
+X_TAIL_UP = ["ss..ooooooooo...", "ooooooooooooo...", "w...sooooooooo..", ".....swwwwwwos.."]
+X_SNIFF = x_head_down(4, X_TAIL_UP, X_LEGS)
+X_EAT = x_head_down(6, X_TAIL_UP, X_LEGS)
+# the mousing pounce: high in the air, nose down, forepaws tucked to land on it, the brush up behind
+X_POUNCE = [
+    "ww..............",
+    "wwo.............",
+    ".ooo............",
+    ".oooo.......d.d.",
+    "..soooo.....oooo",
+    "..dsooooooooooo.",
+    ".dd..soooooooko.",
+    "......swwwwwooo.",
+    "........dd.wwoo.",
+    ".........dd..wo.",
+    "..............p.",
+    BLANK, BLANK, BLANK, BLANK, BLANK,
+]
+#           stand    blink    walk a    walk b    sit    asleep a   asleep b   lying  sniff    pounce    eat    swish
+X_FRAMES = [X_STAND, X_BLINK, X_WALK_A, X_WALK_B, X_SIT, X_SLEEP_A, X_SLEEP_B, X_LIE, X_SNIFF, X_POUNCE, X_EAT, X_STAND_B]
+
+# ---------------- the dragon: a big head with two swept-back horns, a folded wing, a thick tail with a spade ----------------
+# inks here: g the wing and the spade of the tail, h the wing's shade, n the horns, w the belly, chest and jaw
+# (kept inside a rim of the body colour, so they hold on the light bar), k the eye, m the inside of the open mouth
+# Both Clemson coats carry a near-black edge: ember's purple wings, horns and spade, and all of regal, would
+# melt into the purple light-mode wallpaper behind the bar (on the dark bar the edge goes unseen).
+DRAGON_COATS = {
+    "ember": dict(o="f56600", s="c95200", w="f3e6d0", g="7a4fb0", h="522d80", n="7a4fb0", k="16161a", m="6a1a1a", edge="1a0d2e"),   # Clemson orange, purple wings and horns
+    "jade":  dict(o="4fae5a", s="34844a", w="f0e08a", g="2a9a8c", h="1d6f68", n="d8b040", k="16161a", m="6a1a1a"),   # green, teal wings, gold horns
+    "regal": dict(o="7a4fb0", s="522d80", w="f3e6d0", g="f56600", h="c95200", n="f56600", k="16161a", m="6a1a1a", edge="1a0d2e"),   # Clemson purple, orange wings and horns
+}
+W_HEAD = [          # rows 1-8: horns, the head, the jaw and the chin
+    ".........n..n...",
+    "..........n..n..",
+    ".........oooooo.",
+    "........ooooooo.",
+    "........ooookoos",
+    "........oooooooo",
+    "........owwwwws.",
+    ".........owwws..",
+]
+W_BODY = [          # rows 6-12: the tail up behind with its spade, the wing folded on the back
+    ".g....g.........",
+    "ggg..ghg........",
+    ".oo.ghhgoowwws..",
+    ".oooghghooowwws.",
+    "..ooooooooowwws.",
+    "..sooooowwwwwws.",
+    "...ossssssssss..",
+]
+def w_standing(legs, blink=False, head=W_HEAD, body=W_BODY):
+    """the head (from row 1) drawn over the body (rows 6-12) and the legs (rows 13-14)"""
+    rows = [BLANK] * 6 + body + legs + [BLANK]
+    for i, h in enumerate(head):
+        rows[1 + i] = "".join(c if c != "." else rows[1 + i][x] for x, c in enumerate(h))
+    if blink:
+        rows = [r.replace("k", "s") for r in rows]
+    return rows
+W_LEGS = ["...oo.o...oo.o..", "...ss.s...ss.s.."]
+W_STAND = w_standing(W_LEGS)
+W_BLINK = w_standing(W_LEGS, blink=True)
+W_WALK_A = w_standing(["..oo..o..oo...o.", ".ss....s.ss....s"])
+W_WALK_B = w_standing(["....ooo....ooo..", "....s.s....s.s.."])
+# sitting up: the tail along the floor behind, its spade standing up
+W_SIT = w_standing([], body=[
+    "......g.........",
+    ".....ghg........",
+    "....ghhgoowwws..",
+    "....hghgoowwwws.",
+    "....oooooowwwws.",
+    ".g..ooosoowwwws.",
+    "ggg.oooosowwws..",
+    ".o..ooooos.oo.o.",
+    ".oooossss..ss.s.",
+])
+# curled up asleep: a low mound, the wing folded on top, the head down on the floor, the spade of the tail up behind
+W_SLEEP_A = [BLANK] * 9 + [
+    "..........n..n..",
+    ".g...g.....n..n.",
+    "ggg.ghg..sooooo.",
+    ".oooghhgosoossoo",
+    ".ooohghgosoooooo",
+    ".ssssssssssssss.",
+    BLANK,
+]
+# breathing in: the back and the wing rise a row
+W_SLEEP_B = [BLANK] * 9 + [
+    ".....g....n..n..",
+    ".g..ghg....n..n.",
+    "ggg.ghhgosooooo.",
+    ".ooohghgosoossoo",
+    ".oooooooosoooooo",
+    ".ssssssssssssss.",
+    BLANK,
+]
+# lying awake: the same mound, the head up and looking
+W_LIE = [BLANK] * 7 + [
+    "..........n..n..",
+    "...........n..n.",
+    "..........ooooo.",
+    ".g...g...ooookoo",
+    "ggg.ghg..ooooooo",
+    ".oooghhgoowwwws.",
+    ".ooohghgoooowwws",
+    ".ssssssssssssss.",
+    BLANK,
+]
+# breathing fire: crouched, the head pushed forward, the jaws open on the right; PetSprite.qml draws the
+# flame from the mouth, (13, 8), so the three columns in front of it stay empty
+W_FIRE = [BLANK] * 3 + [
+    ".......n..n.....",
+    ".g......n..n....",
+    "ggg..g.oooooo...",
+    ".oo.ghgooookoo..",
+    ".ooohghoooooos..",
+    "..oooooooommm...",
+    "..ooooooooooo...",
+    "..oooooowwwws...",
+    "..sooowwwwwws...",
+    "...ssssssssss...",
+    "...oo.o...oo.o..",
+    "..ss..s....ss.s.",
+    BLANK,
+]
+# flying, wings up (also the leap, and dangling when picked up): legs tucked, the tail streaming out behind
+W_FLY_UP = [
+    "..g.............",
+    "..gg............",
+    "..ghg.....n..n..",
+    "..ghhg.....n..n.",
+    "..hghhg...ooooo.",
+    "...ghhhg.ooookoo",
+    "....hghgoooooooo",
+    ".g.ooooooowwwws.",
+    "ggooooooooowwws.",
+    ".g.sooooowwwws..",
+    "....sssssssss...",
+    ".....oo....oo...",
+    BLANK, BLANK, BLANK, BLANK,
+]
+# flying, wings down: the same body, the wing swept down and back below it
+W_FLY_DOWN = [BLANK, BLANK] + [
+    "..........n..n..",
+    "...........n..n.",
+    "..........ooooo.",
+    ".........ooookoo",
+    "........oooooooo",
+    ".g.ooooooowwwws.",
+    "ggoooggggoowwws.",
+    ".g.sghhhgowwws..",
+    "...ghhhhgssss...",
+    "..ghhhg....oo...",
+    ".ghgh...........",
+    ".g..............",
+    BLANK, BLANK,
+]
+# eating: the standing head lowered six rows, chin on the floor, over a body with no chest showing
+W_EAT = w_standing(W_LEGS, head=[BLANK] * 6 + W_HEAD, body=[
+    ".g....g.........",
+    "ggg..ghg........",
+    ".oo.ghhgoo......",
+    ".oooghghooo.....",
+    "..oooooooo......",
+    "..soowwwwww.....",
+    "...ossssssss....",
+])
+#           stand    blink    walk a    walk b    sit    asleep a   asleep b   lying  fire    wings up  eat    wings down
+W_FRAMES = [W_STAND, W_BLINK, W_WALK_A, W_WALK_B, W_SIT, W_SLEEP_A, W_SLEEP_B, W_LIE, W_FIRE, W_FLY_UP, W_EAT, W_FLY_DOWN]
+
+ANIMALS = {"cat": (FRAMES, COATS), "dog": (D_FRAMES, DOG_COATS), "frog": (F_FRAMES, FROG_COATS), "bird": (B_FRAMES, BIRD_COATS),
+           "turtle": (T_FRAMES, TURTLE_COATS), "fox": (X_FRAMES, FOX_COATS), "dragon": (W_FRAMES, DRAGON_COATS)}
+
+here = os.path.dirname(os.path.abspath(__file__))
+for animal, (frames, coats) in ANIMALS.items():
+    assert len(frames) == 12, animal
+    for name, coat in coats.items():
+        ink = {".": CLEAR, **{k: rgb(v) for k, v in coat.items() if k != "edge"}}
+        sheet = Image.new("RGBA", (16 * len(frames), 16))
+        for f, grid in enumerate(frames):
+            assert len(grid) == 16, (animal, f, len(grid))
+            for y, row in enumerate(grid):
+                assert len(row) == 16, (animal, f, y, row)
+                for x, ch in enumerate(row):
+                    sheet.putpixel((f * 16 + x, y), ink[ch])
+            if "edge" in coat:          # empty pixels that touch the body, within this frame only
+                for y in range(16):
+                    for x in range(16):
+                        if grid[y][x] == "." and any(0 <= x + dx < 16 and 0 <= y + dy < 16 and grid[y + dy][x + dx] != "."
+                                                     for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))):
+                            sheet.putpixel((f * 16 + x, y), rgb(coat["edge"]))
+        sheet.save(os.path.join(here, "pet-%s-%s.png" % (animal, name)))
+# ---------------- hats ----------------
+# Small things worn on the head (PetSprite.qml puts them there). Three rows at most: the
+# bar is only two screen pixels taller than the animal. Each is drawn facing right.
+HAT_INK = {".": CLEAR, "r": rgb("d13438"), "w": rgb("ffffff"), "k": rgb("6a6a76"), "v": rgb("7a4fb0"),
+           "o": rgb("f56600"), "y": rgb("f0c674")}
+HATS = {
+    "santa": ["....rrw", "..rrrr.", "wwwwww."],          # December
+    "witch": ["...v...", "..vov..", "vvvvvvv"],          # the week of Halloween
+    "party": ["..y..", ".vov.", "vovov"],                # New Year's Day
+    "cap":   [".vvv..", "vvvvoo"],                       # Clemson game days: purple cap, orange peak
+    "grad":  ["kkkkkkk", "..kkk.y", "......y"],          # a mortarboard, for when you want one
+}
+# earned over time (PetArc.qml): a flower after a week together, a bow after ten focus timers, a crown after a month
+HAT_INK["p"] = rgb("f08cb4")
+HATS.update(flower=[".p.", "pyp", ".p."], bow=["r...r", "rrwrr", "r...r"], crown=["y.y.y", "yyryy"])
+# purple on the purple light-mode wallpaper: a near-black edge, unseen on the dark one
+HAT_EDGE = {"witch": "1a0d2e"}
+for name, grid in HATS.items():
+    hat = Image.new("RGBA", (len(grid[0]), len(grid)))
+    for y, row in enumerate(grid):
+        assert len(row) == len(grid[0]), (name, row)
+        for x, ch in enumerate(row):
+            hat.putpixel((x, y), HAT_INK[ch])
+    if name in HAT_EDGE:        # empty cells touching the hat, above its bottom row (that row sits on the head)
+        for y in range(len(grid) - 1):
+            for x, ch in enumerate(grid[y]):
+                if ch == "." and any(0 <= x + dx < len(grid[0]) and 0 <= y + dy < len(grid) and grid[y + dy][x + dx] != "."
+                                     for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))):
+                    hat.putpixel((x, y), rgb(HAT_EDGE[name]))
+    hat.save(os.path.join(here, "hat-%s.png" % name))
+
+# Where the top of the head is in each frame: the highest row with anything in it (looking
+# only from column 6 rightwards, so a raised tail does not count) and the middle of what is
+# on that row. A few frames need saying by hand.
+BY_HAND = {("bird", 9): (12.5, 6), ("bird", 10): (13, 11), ("cat", 6): (12.5, 10), ("dog", 5): (11, 11), ("dog", 6): (11, 11), ("dog", 7): (11, 11), ("dog", 10): (12, 9)}
+# the turtle's head is beside its shell, not on top of it (the rule finds the shell); pulled
+# in (frame 9) the hat stays on the middle of the shell. The fox curled up and nose down.
+BY_HAND.update({("turtle", f): (14, 8) for f in (0, 1, 2, 3, 11)})
+BY_HAND.update({("turtle", 4): (14, 9), ("turtle", 5): (14, 12), ("turtle", 6): (14, 12), ("turtle", 7): (14, 12),
+                ("turtle", 8): (14, 5), ("turtle", 9): (6.5, 8), ("turtle", 10): (14, 12),
+                ("fox", 5): (13.5, 10), ("fox", 6): (13.5, 10), ("fox", 10): (12, 8)})
+# the dragon's hat sits on the top of its head between the horns, not on their tips (the rule
+# finds those, and the wing's tip when the head is down at the floor)
+BY_HAND.update({("dragon", f): (12, 3) for f in (0, 1, 2, 3, 4)})
+BY_HAND.update({("dragon", 5): (12.5, 11), ("dragon", 6): (12.5, 11), ("dragon", 7): (12.5, 9), ("dragon", 8): (10, 5),
+                ("dragon", 9): (12.5, 4), ("dragon", 10): (12, 9), ("dragon", 11): (12.5, 4)})
+def head_top(grid):
+    for y, row in enumerate(grid):
+        xs = [x for x, ch in enumerate(row) if ch != "." and x >= 6]
+        if xs:
+            return (round(sum(xs) / len(xs) + 0.5, 1), y)
+    return (12, 2)
+anchors = {a: [list(BY_HAND.get((a, f), head_top(g))) for f, g in enumerate(frames)] for a, (frames, _) in ANIMALS.items()}
+# Where the middle of the back is in each frame (PetPlay.qml seats a riding bird there): the
+# highest point of the four columns from eight to five behind the middle of the head.
+def back_top(grid, head):
+    cols = [x for x in range(int(round(head[0])) - 8, int(round(head[0])) - 4) if 0 <= x < 16] or [6]
+    tops = [next((y for y, row in enumerate(grid) if row[x] != "."), 15) for x in cols]
+    return [sum(cols) / len(cols) + 0.5, min(tops)]
+# The flying dragon's raised wing is not its back: the rider sits on the body below it.
+BACK_BY_HAND = {("dragon", 9): [6.0, 7]}
+backs = {a: [BACK_BY_HAND.get((a, f)) or back_top(g, anchors[a][f]) for f, g in enumerate(frames)] for a, (frames, _) in ANIMALS.items()}
+with open(os.path.join(here, "pet-anchors.js"), "w") as out:
+    out.write("// Written by assets/pet-build: for each animal, the top of the head in every frame\n"
+              "// ([x, y] in sprite pixels; x is the middle of the head), where a hat goes.\n.pragma library\n")
+    out.write("var heads = " + json.dumps(anchors) + "\n")
+    out.write("var hats = " + json.dumps({n: [len(g[0]), len(g)] for n, g in HATS.items()}) + "    // [width, height]\n")
+    out.write("var backs = " + json.dumps(backs) + "    // [x, y]: the middle of the back, where a rider sits\n")
+
+if len(sys.argv) > 1:           # PREVIEW [ANIMAL]: every frame of each coat, enlarged, dark bar colour then light
+    which = sys.argv[2] if len(sys.argv) > 2 else "cat"
+    frames, coats = ANIMALS[which]
+    w = 16 * len(frames) * 6
+    big = Image.new("RGBA", (w, len(coats) * 96), (22, 22, 26, 255))
+    big.paste((246, 243, 238, 255), (w * 8 // 11, 0, w, big.height))
+    for row, name in enumerate(coats):
+        s = Image.open(os.path.join(here, "pet-%s-%s.png" % (which, name)))
+        big.alpha_composite(s.resize((w, 96), Image.NEAREST), (0, row * 96))
+    big.save(sys.argv[1])

@@ -1,0 +1,20 @@
+#!/bin/sh
+# Set a reminder with the bar pet (Quickshell PetRemind.qml). Run from its menu (Reminders).
+#   pet-remind WHEN     ask for the note, then set it (WHEN: 10m, 30m, 1h, 14:45, 2:30pm ...)
+#   pet-remind          ask for the time first, then the note
+# Cancelling either box sets nothing. If the time is not understood it asks again, saying why.
+qs="$HOME/.nix-profile/bin/qs"
+pick="$HOME/.local/bin/qs-pick"
+when="$1"
+ask="Remind me when? (14:45, 2:30pm, 20m)"
+if [ -z "$when" ]; then
+    when=$("$pick" --input --placeholder "$ask") || exit 0
+fi
+note=$("$pick" --input --placeholder "Remind you of what?") || exit 0
+while :; do
+    r=$("$qs" ipc call pet remind "$when" "$note" 2>/dev/null) || exit 1
+    case "$r" in
+        error:*) when=$("$pick" --input --placeholder "${r#error: }") || exit 0 ;;
+        *) exit 0 ;;
+    esac
+done

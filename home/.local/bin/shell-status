@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""Small status sources for the Quickshell bar and control panel (Sys.qml).
+Each prints one JSON object {"text","tooltip","class"}; empty text hides the pill.
+
+  shell-status clock       the Org clock Emacs publishes to dconf (tsr/update-gnome-clock-status)
+  shell-status mail        unread count in the two INBOXes (mu), no senders or subjects
+  shell-status tailscale   class on|off, text = exit node name when one is in use
+  shell-status night       hyprsunset: class on|off, text = colour temperature in K
+"""
+import json, os, subprocess, sys
+
+def out(text="", tooltip="", cls=""):
+    print(json.dumps({"text": text, "tooltip": tooltip, "class": cls}, ensure_ascii=False))
+
+def run(argv, env=None, timeout=6):
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+def esc(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;")
+
+def clock():
+    key = "/org/gnome/shell/extensions/simple-message/message"
+    # Emacs may have been started under COSMIC (its own dconf profile) or under Hyprland
+    envs = [None, dict(os.environ, DCONF_PROFILE="/usr/share/dconf/profile/cosmic")]
+    for env in envs:
+        v = run(["dconf", "read", key], env=env).strip("'\"").strip()
+        if v and v != "No active clock":
+            short = v if len(v) <= 48 else v[:47] + "…"
+            return out(" " + short, "<b>Clocked in</b>: " + esc(v) + "\nClick: go to Emacs", "on")
+    out()
+
+def mail():
+    boxes = [("Clemson", "/work/INBOX"), ("Personal", "/personal/INBOX")]
+    mu = os.path.expanduser("~/.local/bin/mu")
+    counts = []
+    for name, maildir in boxes:
+        o = run([mu, "find", f'flag:unread AND NOT flag:trashed AND maildir:"{maildir}"', "--fields", "l"], timeout=8)
+        counts.append((name, len([l for l in o.splitlines() if l.strip()])))
+    total = sum(n for _, n in counts)
+    if total == 0:
+        return out()
+    tip = "<b>Unread mail</b>: " + ", ".join(f"{name} {n}" for name, n in counts if n) + "\nClick: go to Emacs"
+    out(" " + str(total), tip, "on")
+
+def tailscale():
+    try:
+        d = json.loads(run(["tailscale", "status", "--json"]) or "{}")
+    except ValueError:
+        d = {}
+    on = d.get("BackendState") == "Running"
+    node = ""
+    ex = d.get("ExitNodeStatus") or {}
+    if on and ex.get("ID"):
+        for p in (d.get("Peer") or {}).values():
+            if p.get("ID") == ex["ID"]:
+                node = p.get("HostName", "") or "exit node"
+        node = node or "exit node"
+    tip = "<b>Tailscale</b>: " + ("off" if not on else "connected" + (", all traffic through " + esc(node) if node else ""))
+    out(node, tip, "on" if on else "off")
+
+def night():
+    v = run(["hyprctl", "hyprsunset", "temperature"])
+    try:
+        k = int(float(v))
+    except ValueError:
+        return out("", "", "off")
+    out(str(k), "", "on" if k < 5900 else "off")
+
+{"clock": clock, "mail": mail, "tailscale": tailscale, "night": night}.get(sys.argv[1] if len(sys.argv) > 1 else "", lambda: sys.exit(__doc__))()

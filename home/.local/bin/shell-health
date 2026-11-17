@@ -1,0 +1,764 @@
+#!/usr/bin/env python3
+"""shell-health: is every background job on this laptop still working?
+
+  shell-health [--json]     {"worst": "ok|stale|failed", "jobs": [...]}   (default)
+  shell-health --text       a readable table
+  shell-health --only ID    just that job (ids: see --text)
+  shell-health --refresh    also ask updates-check to look again now (otherwise its cache is used)
+
+Each job: {id, name, state, since, why, unit, log, run}
+  state  ok | stale | failed | off      off = the unit does not exist here; left out of "worst"
+  since  ISO time of the last success ("" when unknown)
+  why    one short plain sentence
+  log    shell command that shows the job's log;  run  shell command that runs it now ("")
+
+"stale" means a timer job whose last success is older than about three times its period
+(a floor for the fast ones; weekly jobs are stale after two periods and a day).  A job that
+reports its own failures is failed from the same count its own watcher uses.  Offline, the
+network jobs get a grace period before they count (why says "offline").
+
+Notices.  Besides jobs there is a second kind of row, {state: "notice", kind: "notice"}, for things
+worth knowing that are not failures: pending updates, firmware, a restart, low disk space.  They
+never affect "worst".  Extra keys: group (updates|firmware|reboot|disk), count, detail, cmd (what
+the person would run; never run from here), actionable (true for security updates, more than
+`updatesNag` packages, lists older than `staleListDays`, a pending restart, low disk), say (true
+for the two the island may announce: low disk and restart needed).  The top level also has
+"attention" (how many are actionable) and "hidden" ([{id, name}] of what the person stopped watching).
+Updates come from updates-check --cached (never waits; it refreshes its own cache in the
+background at most every 6 hours).  Disk rows use os.statvfs on the real mounted filesystems
+(by fstype: no tmpfs, squashfs, FUSE, network or container mounts).
+
+Settings: ~/.config/shell/health.json (all keys optional)
+  {"updatesNag": 50, "staleListDays": 14, "diskPercent": 10, "diskGB": 5, "espMB": 20,
+   "hidden": ["calibre-backup"], "notices": {"updates": true, "firmware": true, "disk": true, "reboot": true}}
+A job or notice id in "hidden" is left out of jobs and worst altogether.
+
+Read-only: it reads systemd's state, the streak files the sync scripts leave under
+$XDG_STATE_HOME, backup folders, gsettings and findmnt.  It never lists or reads inside the
+Box mount.  Its only write is $XDG_STATE_HOME/shell-health/seen.json (when each job was last
+seen working, and since when the network has been down).  Every subprocess has a timeout;
+the whole run is bounded by about 3 seconds.
+
+Test hooks (environment): SHELL_HEALTH_NOW (epoch), SHELL_HEALTH_ROUTE (stand-in for
+/proc/net/route), SHELL_HEALTH_NETDIR (stand-in for /proc/net), HOME, XDG_STATE_HOME,
+XDG_RUNTIME_DIR, XDG_CURRENT_DESKTOP, PATH, SHELL_HEALTH_CONFIG (stand-in for health.json),
+SHELL_HEALTH_DISKS (a JSON file {mountpoint: {fstype, total, free}} in place of /proc/self/mountinfo
+and statvfs), SHELL_HEALTH_UPDATES (the updates-check program; "none" for no notices).
+"""
+import concurrent.futures as cf
+import datetime
+import json
+import os
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+STATE = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state")
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+NOW = float(os.environ.get("SHELL_HEALTH_NOW") or time.time())
+GRACE = 30 * 60               # offline this long before a network job counts as bad
+MIN, H, D = 60, 3600, 86400
+SYSCTL = ["systemctl", "--user"]
+
+
+# ---------------------------------------------------------------- small helpers
+def run(argv, env=None, timeout=1.8):
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
+        return p.returncode, p.stdout
+    except (OSError, subprocess.SubprocessError):
+        return 255, ""
+
+
+def read(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return default
+
+
+def mtime(path):
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return 0.0
+
+
+def iso(ts):
+    if not ts:
+        return ""
+    return datetime.datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")
+
+
+def ago(sec):
+    sec = max(0, int(sec))
+    if sec < 90:
+        return "just now"
+    if sec < 90 * MIN:
+        return "%d min ago" % round(sec / MIN)
+    if sec < 36 * H:
+        return "%d h ago" % round(sec / H)
+    return "%d days ago" % round(sec / D)
+
+
+def span(sec):
+    return ago(sec).replace(" ago", "").replace("just now", "a moment")
+
+
+def ts_of(v):
+    """systemctl --timestamp=unix gives @1794403638; empty when never."""
+    v = (v or "").strip()
+    if v.startswith("@"):
+        try:
+            return float(v[1:])
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def usec_of(v):
+    """LastTriggerUSec in unix form is also @epoch (seconds)."""
+    return ts_of(v)
+
+
+def count(path):
+    try:
+        return int((read(path).strip() or "0").split()[0])
+    except ValueError:
+        return 0
+
+
+# ---------------------------------------------------------------- data gathering
+def systemd_show(units):
+    props = "Id,LoadState,ActiveState,SubState,Result,ExecMainStatus,UnitFileState,NRestarts,ActiveEnterTimestamp,LastTriggerUSec,ExecMainExitTimestamp"
+    rc, out = run(SYSCTL + ["--timestamp=unix", "show", "-p", props] + units)
+    info = {}
+    for block in out.split("\n\n"):
+        d = {}
+        for line in block.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                d[k] = v
+        if d.get("Id"):
+            info[d["Id"]] = d
+    return info
+
+
+def failed_units():
+    rc, out = run(SYSCTL + ["list-units", "--failed", "--plain", "--no-legend", "--no-pager"])
+    return [l.split()[0] for l in out.splitlines() if l.split()]
+
+
+def gsettings(profile):
+    env = dict(os.environ)
+    env.pop("DCONF_PROFILE", None)
+    if profile:
+        env["DCONF_PROFILE"] = profile
+    got = {}
+    for key in ("last-backup", "periodic", "periodic-period"):
+        rc, out = run(["gsettings", "get", "org.gnome.DejaDup", key], env=env)
+        got[key] = out.strip().strip("'") if rc == 0 else None
+    return got
+
+
+def mounted(path):
+    rc, out = run(["findmnt", "-n", "-o", "TARGET,FSTYPE", "-M", path], timeout=1.5)
+    return rc == 0 and path in out
+
+
+def listening(port):
+    d = os.environ.get("SHELL_HEALTH_NETDIR") or "/proc/net"
+    want = ":%04X" % port
+    for name in ("tcp", "tcp6"):
+        for line in read(os.path.join(d, name)).splitlines()[1:]:
+            f = line.split()
+            if len(f) > 3 and f[1].endswith(want) and f[3] == "0A":
+                return True
+    return False
+
+
+def online():
+    route = os.environ.get("SHELL_HEALTH_ROUTE") or "/proc/net/route"
+    for line in read(route).splitlines()[1:]:
+        f = line.split("\t") if "\t" in line else line.split()
+        if len(f) > 3 and f[1] == "00000000" and int(f[3], 16) & 1:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------- job table
+BIN = HOME + "/.local/bin/"
+MAIL_SCRIPTS = HOME + "/.emacs.d/scripts/"
+
+
+def jrn(unit, n=80):
+    return "journalctl --user -u %s -n %d --no-pager" % (unit, n)
+
+
+def start(unit):
+    return "systemctl --user start %s" % unit
+
+
+def restart(unit):
+    return "systemctl --user restart %s" % unit
+
+
+TIMERS = [
+    # id, name, timer, service, period, floor, state dir, bad_at, stale_at (streak), net, extra log
+    dict(id="pull-mail", name="Mail sync", timer="pull-mail.timer", service="pull-mail.service",
+         period=2 * MIN, floor=15 * MIN, streak="pull-mail", bad_at=2, net=True),
+    dict(id="pull-calendars", name="Calendar sync", timer="pull-calendars.timer", service="pull-calendars.service",
+         period=10 * MIN, floor=30 * MIN, streak="pull-calendars", bad_at=6, warn_at=3, net=True),
+    dict(id="push-roam", name="Notes push to sasquatch", timer="push-roam.timer", service="push-roam.service",
+         period=10 * MIN, floor=30 * MIN, streak="push-roam", bad_at=2, net=True),
+    dict(id="calibre-backup", name="Calibre database backup", timer="calibre-db-backup.timer",
+         service="calibre-db-backup.service", period=7 * D, net=False,
+         artifact=("glob", HOME + "/.local/share/calibre-db-backups", "metadata-", ".db"),
+         log="tail -n 30 " + HOME + "/.local/share/calibre-db-backups/backup.log"),
+    dict(id="matrix-backup", name="Matrix and Teams backup", timer="matrix-backup.timer",
+         service="matrix-backup.service", period=7 * D, net=False,
+         artifact=("dirs", HOME + "/backups/matrix", "", "")),
+]
+
+REASONS = {
+    "davmail-down": "DavMail is not running (nothing on port 1143)",
+    "microsoft-down": "Microsoft 365 itself is failing",
+}
+
+
+def mk(job, state, why, since=0.0, unit="", log="", run_cmd=""):
+    return dict(id=job[0], name=job[1], state=state, since=iso(since), why=why, unit=unit,
+                log=log, run=run_cmd, _net=job[2], _since=since)
+
+
+def judge_timer(t, info):
+    ti, si = info.get(t["timer"], {}), info.get(t["service"], {})
+    ident = (t["id"], t["name"], t["net"])
+    log = t.get("log") or jrn(t["service"])
+    runc = start(t["service"])
+    unit = t["timer"]
+    if ti.get("LoadState", "not-found") == "not-found" or si.get("LoadState", "not-found") == "not-found":
+        return mk(ident, "off", "not installed", unit=unit)
+    if ti.get("ActiveState") != "active":
+        if ti.get("UnitFileState") in ("disabled", "masked", "static", ""):
+            return mk(ident, "off", "timer is switched off", unit=unit)
+        return mk(ident, "failed", "its timer is not running", unit=unit, log=log, run_cmd=runc)
+
+    # last success and the streak
+    sdir = os.path.join(STATE, t["streak"]) if t.get("streak") else ""
+    failures = count(sdir + "/failures") if sdir else 0
+    reason = REASONS.get(read(sdir + "/reason").strip(), "") if sdir else ""
+    last_run = mtime(sdir + "/failures") if sdir else 0.0
+    since = 0.0
+    if failures == 0 and sdir:
+        since = last_run
+    elif t.get("artifact"):
+        since = artifact_time(t["artifact"])
+    if not since:
+        since = max(ts_of(si.get("ExecMainExitTimestamp")), 0.0) or usec_of(ti.get("LastTriggerUSec"))
+    if t.get("artifact") and since == 0.0:
+        since = artifact_time(t["artifact"])
+
+    result = si.get("Result", "success")
+    active = si.get("ActiveState")
+    if active == "failed" or (result not in ("success", "") and active not in ("active", "activating")):
+        why = "the last run failed (exit %s)" % si.get("ExecMainStatus", "?")
+        if failures:
+            why = "%d runs in a row have failed" % failures
+        return mk(ident, "failed", (reason + "; " if reason else "") + why, since, unit, log, runc)
+    if failures >= t.get("bad_at", 99):
+        return mk(ident, "failed", "%d runs in a row have failed%s" % (failures, "; " + reason if reason else ""),
+                  since, unit, log, runc)
+    if failures >= t.get("warn_at", 99):
+        return mk(ident, "stale", "%d runs in a row have failed%s" % (failures, "; " + reason if reason else ""),
+                  since, unit, log, runc)
+    if failures and reason:
+        return mk(ident, "stale", "last run failed; " + reason, since, unit, log, runc)
+
+    period = t["period"]
+    limit = max(3 * period, t.get("floor", 0)) if period < D else 2 * period + D
+    if not since:
+        return mk(ident, "stale", "no completed run on record", 0.0, unit, log, runc)
+    age = NOW - since
+    if age > limit:
+        return mk(ident, "stale", "last worked %s, runs every %s" % (ago(age), span(period)), since, unit, log, runc)
+    return mk(ident, "ok", ("ran " + ago(age)) if period < D else ("backed up " + ago(age)), since, unit, log, runc)
+
+
+def artifact_time(spec):
+    kind, d, pre, suf = spec
+    best = 0.0
+    try:
+        for n in os.listdir(d):
+            if kind == "glob" and not (n.startswith(pre) and n.endswith(suf)):
+                continue
+            if kind == "dirs" and not (len(n) == 10 and n[4] == "-" and n[7] == "-"):
+                continue
+            best = max(best, mtime(os.path.join(d, n)))
+    except OSError:
+        pass
+    return best
+
+
+def judge_service(ident, name, unit, info, net=False, log=None, run_cmd=None, extra=None, desktop_only=False):
+    i = info.get(unit, {})
+    ident = (ident, name, net)
+    log = log or jrn(unit)
+    run_cmd = run_cmd or restart(unit)
+    if i.get("LoadState", "not-found") == "not-found":
+        return mk(ident, "off", "not installed", unit=unit)
+    act = i.get("ActiveState")
+    since = ts_of(i.get("ActiveEnterTimestamp"))
+    if act == "failed":
+        st = i.get("ExecMainStatus", "?")
+        why = "stopped with an error (exit %s)" % st
+        if st == "78":
+            why = "needs a full resync (run it by hand: onedrive --resync)"
+        return mk(ident, "failed", why, since, unit, log, run_cmd)
+    if act in ("inactive", "deactivating"):
+        if i.get("UnitFileState") in ("disabled", "masked"):
+            return mk(ident, "off", "switched off", unit=unit)
+        if desktop_only and os.environ.get("XDG_CURRENT_DESKTOP", "") != "Hyprland":
+            return mk(ident, "off", "only runs under Hyprland", unit=unit)
+        return mk(ident, "failed", "not running", since, unit, log, run_cmd)
+    if act == "activating":
+        n = int(i.get("NRestarts") or 0)
+        return mk(ident, "stale" if n < 3 else "failed", "starting or restarting (%d restarts)" % n, since, unit, log, run_cmd)
+    n = int(i.get("NRestarts") or 0)
+    if extra:
+        r = extra(since)
+        if r:
+            state, why = r
+            return mk(ident, state, why, since, unit, log, run_cmd)
+    why = "running since " + ago(NOW - since).replace(" ago", "") if since else "running"
+    if n:
+        why += ", restarted %d times" % n
+    return mk(ident, "stale" if n >= 5 else "ok", why, since or NOW, unit, log, run_cmd)
+
+
+def judge_onedrive(info):
+    j = judge_service("onedrive", "OneDrive sync", "onedrive.service", info, net=True)
+    rt, rs = info.get("onedrive-restart.timer", {}), info.get("onedrive-restart.service", {})
+    if j["state"] == "ok" and rt.get("LoadState") == "loaded":
+        if rs.get("ActiveState") == "failed" or rs.get("Result") not in (None, "", "success"):
+            j.update(state="failed", why="its twice-daily restart failed", log=jrn("onedrive-restart.service"),
+                     run=restart("onedrive.service"))
+        elif rt.get("ActiveState") != "active":
+            j.update(state="stale", why="its restart timer is not running")
+    return j
+
+
+def judge_rclone(info):
+    def mount_ok(since):
+        if not mounted(os.path.join(RUNTIME, "Box")):
+            if NOW - since < 60:
+                return ("stale", "starting; the mount is not up yet")
+            return ("failed", "running but the Box mount is gone")
+        return None
+    j = judge_service("rclone-box", "Box mount", "rclone-box.service", info, net=True, extra=mount_ok)
+    if j["state"] == "ok":
+        j["why"] = "mounted, up since " + ago(NOW - ts_of(info["rclone-box.service"].get("ActiveEnterTimestamp"))).replace(" ago", "")
+    return j
+
+
+def judge_davmail(info):
+    def port(since):
+        if not listening(1143):
+            if NOW - since < 90:
+                return ("stale", "starting; nothing on port 1143 yet")
+            return ("failed", "running but nothing answers on port 1143")
+        return None
+    return judge_service("davmail", "DavMail", "davmail.service", info, net=True, extra=port)
+
+
+def judge_matrix():
+    """The local Matrix stack (~/Docker/matrix): Synapse and its bridges, by container health."""
+    ident = ("matrix", "Matrix server and bridges", False)
+    names = ["synapse", "mautrix-teams", "mautrix-gmessages"]
+    log = "cd ~/Docker/matrix && docker compose logs --tail 80"
+    runc = "cd ~/Docker/matrix && docker compose up -d"
+    rc, out = run(["docker", "inspect", "-f", "{{.Name}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} {{.State.StartedAt}}"] + names)
+    rows = [l.split() for l in out.splitlines() if l.strip()]
+    if not rows:
+        return mk(ident, "off", "not set up, or Docker is not running", unit="")
+    seen = {r[0].lstrip("/"): r for r in rows if len(r) >= 3}
+    bad, starting = [], []
+    for n in names:
+        r = seen.get(n)
+        if r is None:
+            if n == "synapse":
+                bad.append(n + " missing")
+            continue                      # a bridge that was never set up is not a failure
+        if r[1] != "running" or r[2] == "unhealthy":
+            bad.append("%s %s" % (n, r[1] if r[1] != "running" else "unhealthy"))
+        elif r[2] == "starting":
+            starting.append(n)
+    if bad:
+        return mk(ident, "failed", ", ".join(bad), 0.0, "", log, runc)
+    if starting:
+        return mk(ident, "stale", "starting: " + ", ".join(starting), 0.0, "", log, runc)
+    return mk(ident, "ok", "%d containers healthy" % len(seen), NOW, "", log, runc)
+
+
+def judge_dejadup(profiles):
+    ident = ("dejadup", "Backup (Deja Dup)", False)
+    log = "tail -n 40 " + HOME + "/.cache/deja-dup/duplicity.log"
+    seen = [p for p in profiles if p["last-backup"] is not None]
+    if not seen:
+        return mk(ident, "off", "Deja Dup is not installed", unit="")
+    if all(p["periodic"] == "false" for p in seen):
+        return mk(ident, "off", "automatic backups are switched off", unit="", log=log)
+    best = 0.0
+    for p in seen:
+        v = p["last-backup"]
+        if v:
+            try:
+                best = max(best, datetime.datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp())
+            except ValueError:
+                pass
+    period = 7 * D
+    for p in seen:
+        try:
+            period = max(1, int(p["periodic-period"])) * D
+            break
+        except (TypeError, ValueError):
+            pass
+    runc = "deja-dup --backup"
+    if not best:
+        return mk(ident, "stale", "no finished backup on record", 0.0, "", log, runc)
+    age = NOW - best
+    limit = 2 * period + D if period >= D else 3 * period
+    if age > limit:
+        return mk(ident, "stale", "last backup %s, set to run every %d days" % (ago(age), period // D), best, "", log, runc)
+    return mk(ident, "ok", "last backup " + ago(age), best, "", log, runc)
+
+
+def judge_microsoft():
+    ident = ("microsoft", "Microsoft 365 link", True)
+    path = os.path.join(STATE, "microsoft/health.json")
+    log = MAIL_SCRIPTS + "ms-health status"
+    runc = MAIL_SCRIPTS + "ms-health check"
+    try:
+        d = json.loads(read(path) or "{}")
+    except ValueError:
+        d = {}
+    if not d:
+        return mk(ident, "off", "no health record yet", unit="")
+    st, detail = d.get("state", ""), d.get("detail", "")
+    checked, since = float(d.get("checked") or 0), float(d.get("since") or 0)
+    if st == "ok":
+        return mk(ident, "ok", "answered " + ago(NOW - checked), checked, "", log, runc)
+    if st == "offline":
+        return mk(ident, "ok", "offline (Microsoft unreachable from here)", since, "", log, runc)
+    if st == "auth":
+        return mk(ident, "failed", "sign-in needed: run exchange-rules.py login", since, "", log, runc)
+    return mk(ident, "failed", "Microsoft 365 is failing" + (": " + detail if detail else ""), since, "", log, runc)
+
+
+KNOWN = {t["service"] for t in TIMERS} | {t["timer"] for t in TIMERS} | {
+    "davmail.service", "onedrive.service", "onedrive-restart.service", "onedrive-restart.timer",
+    "rclone-box.service", "qs-socket-watch.service"}
+
+
+# ---------------------------------------------------------------- run
+def collect():
+    units = []
+    for t in TIMERS:
+        units += [t["timer"], t["service"]]
+    units += ["davmail.service", "onedrive.service", "onedrive-restart.timer", "onedrive-restart.service",
+              "rclone-box.service", "qs-socket-watch.service"]
+    with cf.ThreadPoolExecutor(max_workers=6) as ex:
+        f_show = ex.submit(systemd_show, units)
+        f_failed = ex.submit(failed_units)
+        f_def = ex.submit(gsettings, "")
+        f_cos = ex.submit(gsettings, "/usr/share/dconf/profile/cosmic")
+        try:
+            info = f_show.result(timeout=2.6)
+        except Exception:
+            info = {}
+        try:
+            failed = f_failed.result(timeout=2.0)
+        except Exception:
+            failed = []
+        profiles = []
+        for f in (f_def, f_cos):
+            try:
+                profiles.append(f.result(timeout=2.0))
+            except Exception:
+                profiles.append({"last-backup": None, "periodic": None, "periodic-period": None})
+    jobs = [judge_timer(t, info) for t in TIMERS]
+    jobs.append(judge_davmail(info))
+    jobs.append(judge_onedrive(info))
+    jobs.append(judge_rclone(info))
+    jobs.append(judge_dejadup(profiles))
+    jobs.append(judge_microsoft())
+    jobs.append(judge_matrix())
+    jobs.append(judge_service("qs-socket-watch", "Shell restart watchdog", "qs-socket-watch.service", info, desktop_only=True))
+    for u in failed:
+        if u in KNOWN:
+            continue
+        jobs.append(mk(("unit:" + u, u, False), "failed", "unit failed", unit=u, log=jrn(u),
+                       run_cmd="systemctl --user reset-failed %s; systemctl --user restart %s" % (u, u)))
+    return jobs
+
+
+def seen_path():
+    return os.path.join(STATE, "shell-health/seen.json")
+
+
+def apply_memory_and_offline(jobs, only_write=True):
+    try:
+        seen = json.loads(read(seen_path()) or "{}")
+    except ValueError:
+        seen = {}
+    on = online()
+    if on:
+        seen.pop("offline_since", None)
+    elif not seen.get("offline_since"):
+        seen["offline_since"] = NOW
+    off_for = NOW - seen["offline_since"] if not on else 0
+    for j in jobs:
+        s = seen.setdefault("jobs", {}).setdefault(j["id"], {})
+        if j["state"] == "ok" and j["_since"]:
+            s["ok"] = max(s.get("ok", 0), j["_since"])
+        elif j["state"] == "ok":
+            s["ok"] = NOW
+        if not j["since"] and s.get("ok") and j["state"] in ("stale", "failed"):
+            j["since"] = iso(s["ok"])
+        if not on and j["_net"]:
+            if j["state"] in ("stale", "failed"):
+                if off_for < GRACE:
+                    j["state"] = "ok"
+                    j["why"] = "offline for %s; waiting before flagging (%s)" % (span(off_for), j["why"])
+                else:
+                    j["why"] = "offline for %s; %s" % (span(off_for), j["why"])
+            elif j["state"] == "ok" and "offline" not in j["why"]:
+                j["why"] += " (offline now)"
+    return seen
+
+
+def save_seen(seen):
+    try:
+        os.makedirs(os.path.dirname(seen_path()), exist_ok=True)
+        tmp = seen_path() + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(seen, f)
+        os.replace(tmp, seen_path())
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- notices and settings
+CFG_DEFAULT = dict(updatesNag=50, staleListDays=14, diskPercent=10, diskGB=5, espMB=20, hidden=[],
+                   notices=dict(updates=True, firmware=True, disk=True, reboot=True))
+
+
+def load_config():
+    cfg = json.loads(json.dumps(CFG_DEFAULT))
+    path = os.environ.get("SHELL_HEALTH_CONFIG") or os.path.join(HOME, ".config/shell/health.json")
+    try:
+        d = json.loads(read(path) or "{}")
+    except ValueError:
+        d = {}
+    if not isinstance(d, dict):
+        return cfg
+    for k in ("updatesNag", "staleListDays", "diskPercent", "diskGB", "espMB"):
+        if isinstance(d.get(k), (int, float)) and not isinstance(d.get(k), bool) and d[k] >= 0:
+            cfg[k] = d[k]
+    if isinstance(d.get("hidden"), list):
+        cfg["hidden"] = [str(x) for x in d["hidden"]]
+    if isinstance(d.get("notices"), dict):
+        for k in cfg["notices"]:
+            if isinstance(d["notices"].get(k), bool):
+                cfg["notices"][k] = d["notices"][k]
+    return cfg
+
+
+DISK_FSTYPES = {"ext2", "ext3", "ext4", "xfs", "btrfs", "f2fs", "vfat", "exfat", "ntfs", "ntfs3", "zfs", "jfs", "reiserfs"}
+DISK_PREFIXES = ("/mnt/", "/media/", "/run/media/")
+DISK_FIXED = {"/", "/home", "/boot", "/boot/efi"}
+ESP = ("/boot/efi", "/boot")
+
+
+def unescape(p):
+    out, i = [], 0
+    while i < len(p):
+        if p[i] == "\\" and i + 3 < len(p) and p[i + 1:i + 4].isdigit():
+            out.append(chr(int(p[i + 1:i + 4], 8)))
+            i += 4
+        else:
+            out.append(p[i])
+            i += 1
+    return "".join(out)
+
+
+def mounts():
+    """[(mountpoint, fstype, total, free)] for the filesystems worth a disk warning."""
+    table = os.environ.get("SHELL_HEALTH_DISKS")
+    found = []
+    if table:
+        try:
+            d = json.loads(read(table) or "{}")
+        except ValueError:
+            d = {}
+        for mp, v in d.items():
+            found.append((mp, v.get("fstype", ""), v.get("dev", mp), v.get("total", 0), v.get("free", 0)))
+    else:
+        for line in read("/proc/self/mountinfo").splitlines():
+            f = line.split()
+            if len(f) < 10 or "-" not in f:
+                continue
+            k = f.index("-")
+            mp, fstype, dev = unescape(f[4]), f[k + 1], f[2]
+            if fstype not in DISK_FSTYPES:
+                continue
+            if not (mp in DISK_FIXED or mp.startswith(DISK_PREFIXES)):
+                continue
+            try:
+                st = os.statvfs(mp)
+            except OSError:
+                continue
+            found.append((mp, fstype, dev, st.f_blocks * st.f_frsize, st.f_bavail * st.f_frsize))
+    out, devs = [], set()
+    for mp, fstype, dev, total, free in found:
+        if fstype not in DISK_FSTYPES or not (mp in DISK_FIXED or mp.startswith(DISK_PREFIXES)):
+            continue
+        if dev in devs or total <= 0:
+            continue
+        devs.add(dev)
+        out.append((mp, fstype, total, free))
+    return out
+
+
+def gb(b):
+    return "%.1f GB" % (b / 1e9) if b >= 1e9 else "%d MB" % round(b / 1e6)
+
+
+def disk_notices(cfg):
+    rows = []
+    for mp, fstype, total, free in mounts():
+        pct = 100.0 * free / total
+        if mp in ESP:
+            low = free < cfg["espMB"] * 1e6
+        else:
+            low = pct < cfg["diskPercent"] or free < cfg["diskGB"] * 1e9
+        if not low:
+            continue
+        why = "%s free of %s (%d%%)" % (gb(free), gb(total), round(pct))
+        rows.append(notice("disk:" + mp, "Low disk space: " + mp, why, "disk", cmd="df -h %s; du -xh --max-depth=2 %s 2>/dev/null | sort -h | tail -15" % (mp, mp),
+                           count=1, actionable=True, say=True))
+    return rows
+
+
+def notice(id_, name, why, group, cmd="", count=0, actionable=False, say=False):
+    return dict(id=id_, name=name, state="notice", since="", why=why, unit="", log="", run="", kind="notice",
+                group=group, count=count, detail=why, cmd=cmd, actionable=actionable, say=say)
+
+
+def updates_program():
+    p = os.environ.get("SHELL_HEALTH_UPDATES")
+    if p == "none":
+        return None
+    if p:
+        return p
+    for c in (os.path.join(os.path.dirname(os.path.abspath(__file__)), "updates-check"), BIN + "updates-check"):
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def update_notices(cfg, refresh):
+    prog = updates_program()
+    if not prog:
+        return []
+    rc, out = run([sys.executable, "-I", prog, "--refresh" if refresh else "--cached"], timeout=25 if refresh else 2.0)
+    try:
+        rows = json.loads(out).get("rows", [])
+    except (ValueError, AttributeError):
+        return []
+    res = []
+    for r in rows:
+        i, n = r.get("id"), int(r.get("count") or 0)
+        if i == "apt":
+            nag = cfg["updatesNag"]
+            lists = r.get("listsAgeDays")
+            act = bool(r.get("security")) or n > nag or (lists is not None and lists >= cfg["staleListDays"])
+            if n or act:
+                res.append(notice("apt", "Package updates", r.get("detail", ""), "updates", r.get("cmd", ""), n, act))
+        elif i == "flatpak" and n:
+            res.append(notice("flatpak", "Flatpak updates", r.get("detail", ""), "updates", r.get("cmd", ""), n))
+        elif i == "firmware" and n:
+            res.append(notice("firmware", "Firmware updates", r.get("detail", ""), "firmware", r.get("cmd", ""), n))
+        elif i == "reboot":
+            res.append(notice("reboot", "Restart needed", r.get("detail", ""), "reboot", r.get("cmd", ""), 1, True, True))
+    return res
+
+
+def notices_for(cfg, refresh=False):
+    rows = []
+    if cfg["notices"]["disk"]:
+        rows += disk_notices(cfg)
+    ups = update_notices(cfg, refresh) if any(cfg["notices"][k] for k in ("updates", "firmware", "reboot")) else []
+    rows += [r for r in ups if cfg["notices"].get(r["group"], True)]
+    rows.sort(key=lambda r: (not r["actionable"],))
+    return rows
+
+
+def worst_of(jobs):
+    rank = {"ok": 0, "stale": 1, "failed": 2}
+    w = "ok"
+    for j in jobs:
+        if j["state"] in rank and rank[j["state"]] > rank[w]:
+            w = j["state"]
+    return w
+
+
+def main(argv):
+    mode, only, refresh = "json", None, False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--json":
+            mode = "json"
+        elif a == "--text":
+            mode = "text"
+        elif a == "--refresh":
+            refresh = True
+        elif a == "--only" and i + 1 < len(argv):
+            only = argv[i + 1]
+            i += 1
+        else:
+            print("usage: shell-health [--json|--text] [--only ID] [--refresh]", file=sys.stderr)
+            return 2
+        i += 1
+    cfg = load_config()
+    jobs = collect()
+    seen = apply_memory_and_offline(jobs)
+    save_seen(seen)
+    order = {"failed": 0, "stale": 1, "ok": 2, "off": 3}
+    jobs.sort(key=lambda j: order[j["state"]])
+    notes = notices_for(cfg, refresh)
+    everything = [{k: v for k, v in j.items() if not k.startswith("_")} for j in jobs] + notes
+    hidden = [{"id": j["id"], "name": j["name"]} for j in everything if j["id"] in cfg["hidden"]]
+    out = [j for j in everything if j["id"] not in cfg["hidden"]]
+    if only:
+        out = [j for j in out if j["id"] == only]
+    worst = worst_of([j for j in out if j["state"] != "notice"])
+    attention = sum(1 for j in out if j["state"] == "notice" and j["actionable"])
+    if mode == "json":
+        print(json.dumps({"worst": worst, "attention": attention, "hidden": hidden, "jobs": out}, ensure_ascii=False))
+        return 0
+    print("worst: %s" % worst)
+    for j in out:
+        if j["state"] == "notice":
+            print("%-7s %-16s %-26s %s%s" % ("NOTICE", j["id"], j["name"], j["why"], "  [worth a look]" if j["actionable"] else ""))
+            continue
+        last = ago(NOW - datetime.datetime.fromisoformat(j["since"]).timestamp()) if j["since"] else "-"
+        print("%-7s %-16s %-26s %s  [last ok: %s]" % (j["state"].upper(), j["id"], j["name"], j["why"], last))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

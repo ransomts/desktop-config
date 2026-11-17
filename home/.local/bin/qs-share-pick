@@ -1,0 +1,152 @@
+#!/bin/sh
+# Screen-share picker for xdg-desktop-portal-hyprland, drawn by Quickshell (SharePick.qml).
+# Set in ~/.config/hypr/xdph.conf:  screencopy { custom_picker_binary = ~/.local/bin/qs-share-pick }
+# If Quickshell does not answer within 2 s, the stock hyprland-share-picker runs instead,
+# with the same arguments and environment.
+#
+#   qs-share-pick [--allow-token]     as xdph runs it
+#   qs-share-pick --parse [--allow-token]   print the parsed lists as JSON (tests)
+#
+# The protocol, read from xdg-desktop-portal-hyprland v1.5.0 (installed: 1.5.0-1ppa1):
+# src/shared/ScreencopyShared.cpp (buildWindowList, buildOutputList, buildWorkspaceList,
+# parsePickerSelection, promptForScreencopySelection) and hyprland-share-picker/{main,PickerData,
+# Picker}.cpp. `strings` of /usr/libexec/xdg-desktop-portal-hyprland and /usr/bin/hyprland-share-picker
+# show the same markers ([HC>] [HT>] [HE>] [HA>] [HN>] [SELECTION] screen: window: region: --allow-token).
+#
+# Arguments: "--allow-token" only when xdph's screencopy:allow_token_by_default is set; it is
+#   the default state of the "allow restore" checkbox.
+# Environment in:
+#   XDPH_WINDOW_SHARING_LIST     records <handle>[HC>]<class>[HT>]<title>[HE>]<address>[HA>]
+#       handle  = low 32 bits of the foreign-toplevel handle's resource pointer, decimal; it is
+#                 what the reply names. It is NOT a Hyprland address.
+#       address = the Hyprland window address (hyprland-toplevel-mapping), as a DECIMAL uint64,
+#                 0 if unknown. In hex it is HyprlandToplevel.address / `hyprctl clients` "0x...".
+#       class, title: ' " $ ` are replaced by spaces, as is any "]" right after ">".
+#   XDPH_OUTPUT_SHARING_LIST     records <name length>:<name>:<x>:<y>:<w>:<h>;  (logical px)
+#   XDPH_WORKSPACE_SHARING_LIST_V3  <tracker id>[HN>]<len>:<name>[HM>]<n>:<len>:<output><len>:<output>...[HE>]
+#   XDPH_WORKSPACE_SHARING_LIST_V2  <len>:<name>:<tracker id>;     (lengths in bytes)
+#   XDPH_WORKSPACE_SHARING_LIST     <name>[HN>]                     (legacy)
+#   (and WAYLAND_DISPLAY, HYPRLAND_INSTANCE_SIGNATURE, XCURSOR_SIZE, QT_QPA_PLATFORM=wayland)
+# Reply on stdout, one line; xdph looks for "[SELECTION]" anywhere and reads to the line end:
+#   [SELECTION]<flags>/screen:<output name>
+#   [SELECTION]<flags>/window:<handle>
+#   [SELECTION]<flags>/region:<output>@<x>,<y>,<w>,<h>   (logical px, relative to that output; w,h > 0)
+#   [SELECTION]<flags>/workspace-id:<tracker id>         (or legacy workspace:<name>)
+#   flags: "r" = allow a restore token, empty otherwise (other letters are logged and ignored).
+# Cancel: the stock picker prints nothing and exits 0; xdph treats any output without
+#   "[SELECTION]" as a cancel. (Its own failures print [XDPH_PICKER_ERROR] on stderr, exit 1.)
+#
+# Here: the lists are parsed to JSON in a temp file, then `qs ipc call sharepick open LIST FIFO`
+# (the shape of qs-pick); SharePick.qml writes the reply line, or "cancel", to the fifo.
+stock="${XDPH_STOCK_PICKER:-/usr/bin/hyprland-share-picker}"
+PATH="$PATH:$HOME/.nix-profile/bin"
+qs=$(command -v qs)
+
+parseonly=0; allow=false
+for a in "$@"; do
+    case "$a" in
+        --parse) parseonly=1 ;;
+        --allow-token) allow=true ;;
+    esac
+done
+
+parse() {
+    python3 -I - "$allow" <<'EOF'
+import json, os, sys
+
+def take(s, sep):
+    i = s.find(sep)
+    return (None, s) if i < 0 else (s[:i], s[i + len(sep):])
+
+def windows(s):
+    out = []
+    while s:
+        parts = []
+        for sep in ("[HC>]", "[HT>]", "[HE>]", "[HA>]"):
+            v, s = take(s, sep)
+            if v is None:
+                break
+            parts.append(v)
+        if len(parts) < 4:
+            break
+        h, c, t, a = parts
+        if not h.isdigit():
+            continue
+        addr = int(a) if a.isdigit() else 0
+        out.append({"id": int(h), "cls": c, "title": t, "address": "0x%x" % addr if addr else ""})
+    return out
+
+def lenpref(s):
+    n, s = take(s, ":")
+    if n is None or not n.isdigit() or int(n) > len(s.encode()):
+        return None, s
+    b = s.encode(); n = int(n)
+    return b[:n].decode(errors="replace"), b[n:].decode(errors="replace")
+
+def outputs(s):
+    out = []
+    while s:
+        name, s = lenpref(s)
+        if name is None or not s.startswith(":"):
+            break
+        s = s[1:]
+        x, s = take(s, ":"); y, s = take(s, ":"); w, s = take(s, ":"); h, s = take(s, ";")
+        if None in (x, y, w, h):
+            break
+        try:
+            x, y, w, h = int(x), int(y), int(w), int(h)
+        except ValueError:
+            continue
+        if w > 0 and h > 0:
+            out.append({"name": name, "x": x, "y": y, "w": w, "h": h})
+    return out
+
+def workspaces(s):
+    out = []
+    while s:
+        i, s = take(s, "[HN>]")
+        if not i or not i.isdigit() or int(i) == 0:
+            break
+        name, s = lenpref(s)
+        if name is None or not s.startswith("[HM>]"):
+            break
+        s = s[5:]
+        n, s = take(s, ":")
+        if n is None or not n.isdigit():
+            break
+        outs = []
+        for _ in range(int(n)):
+            o, s = lenpref(s)
+            if o is None:
+                return out
+            outs.append(o)
+        if not s.startswith("[HE>]"):
+            break
+        s = s[5:]
+        out.append({"id": int(i), "name": name, "outputs": outs})
+    return out
+
+e = os.environ
+json.dump({
+    "allowToken": sys.argv[1] == "true",
+    "outputs": outputs(e.get("XDPH_OUTPUT_SHARING_LIST", "")),
+    "windows": windows(e.get("XDPH_WINDOW_SHARING_LIST", "")),
+    "workspaces": workspaces(e.get("XDPH_WORKSPACE_SHARING_LIST_V3", "")),
+}, sys.stdout, ensure_ascii=False)
+print()
+EOF
+}
+
+if [ "$parseonly" = 1 ]; then parse; exit; fi
+
+dir=$(mktemp -d) || exec "$stock" "$@"
+if [ -n "$qs" ] && parse > "$dir/list.json" && mkfifo "$dir/out" &&
+   timeout 2 "$qs" ipc call sharepick open "$dir/list.json" "$dir/out" >/dev/null 2>&1; then
+    # SharePick.qml writes one line: the selection, or "cancel"
+    r=$(timeout 900 head -n 1 "$dir/out")
+    rm -rf "$dir"
+    case "$r" in "[SELECTION]"*) printf '%s\n' "$r" ;; esac
+    exit 0
+fi
+rm -rf "$dir"
+exec "$stock" "$@"

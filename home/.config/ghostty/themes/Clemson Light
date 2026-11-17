@@ -1,0 +1,27 @@
+# Tomorrow's ANSI colours (next to Emacs' doom-tomorrow-day) on the desktop's
+# off-white, with a Regalia-purple cursor and the orange selection.
+palette = 0=#26262b
+palette = 1=#c82829
+palette = 2=#718c00
+palette = 3=#b58900
+palette = 4=#4271ae
+palette = 5=#8959a8
+palette = 6=#3e999f
+palette = 7=#bfbfbf
+palette = 8=#8c8782
+palette = 9=#c82829
+palette = 10=#718c00
+palette = 11=#b58900
+palette = 12=#4271ae
+palette = 13=#8959a8
+palette = 14=#3e999f
+palette = 15=#ffffff
+# 208: the desktop's Clemson orange, for the prompt, fzf and other tools that use palette indices
+palette = 208=#f56600
+background = #f6f3ee
+foreground = #26262b
+cursor-color = #522d80
+cursor-text = #f6f3ee
+selection-background = #f56600
+selection-foreground = #16161a
+split-divider-color = #522d80

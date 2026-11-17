@@ -1,0 +1,99 @@
+#!/bin/sh
+# Wi-Fi picker in fuzzel, for the waybar network pill (Hyprland).
+# Lists nearby networks (strongest AP per SSID) with signal and lock icons,
+# plus Wi-Fi on/off, rescan, disconnect and the full connection editor.
+# Saved networks connect through their existing profile; new WPA-PSK networks
+# ask for the password in fuzzel; 802.1X (eduroam) without a profile opens the
+# connection editor, since that needs more than a password.
+#
+#   wifi-menu           # open the menu (clicking again while open closes it)
+
+PLACEHOLDER="Wi-Fi: type to filter"
+
+notify() { notify-send -a "Wi-Fi" -i network-wireless "$@"; }
+
+dev=$(nmcli -t -f DEVICE,TYPE dev | awk -F: '$2=="wifi"{print $1; exit}')
+[ -n "$dev" ] || { notify "No Wi-Fi device found"; exit 1; }
+
+# SSID of the active Wi-Fi connection, if any
+active_con=$(nmcli -g GENERAL.CONNECTION dev show "$dev" 2>/dev/null)
+active_ssid=""
+[ -n "$active_con" ] && active_ssid=$(nmcli -g 802-11-wireless.ssid con show "$active_con" 2>/dev/null)
+
+US=$(printf '\037')
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+: > "$tmp/labels"; : > "$tmp/actions"
+item() { printf '%s\n' "$1" >> "$tmp/labels"; printf '%s\n' "$2" >> "$tmp/actions"; }
+
+if [ "$(nmcli radio wifi)" != enabled ]; then
+    item "󰖩  Turn Wi-Fi on" "radio-on"
+else
+    [ -n "$active_ssid" ] && item "󰖪  Disconnect $active_ssid" "disconnect"
+    # IN-USE:SIGNAL:SECURITY:SSID -- SSID last, so only it can hold escaped colons
+    nmcli -t -f IN-USE,SIGNAL,SECURITY,SSID dev wifi list --rescan no 2>/dev/null |
+    awk -F: '
+        { ssid=$0; sub(/^[^:]*:[^:]*:[^:]*:/, "", ssid); gsub(/\\:/, ":", ssid); gsub(/\\\\/, "\\", ssid)
+          if (ssid == "" || (ssid in seen)) next
+          seen[ssid]=1; print $2 "\037" $3 "\037" ssid }' |
+    sort -t "$US" -k1,1nr |
+    # \037 (unit separator), not tab: read collapses runs of whitespace
+    # separators, which drops the empty SECURITY field of open networks.
+    while IFS="$US" read -r sig sec ssid; do
+        if   [ "$sig" -ge 80 ]; then bars="󰤨"
+        elif [ "$sig" -ge 60 ]; then bars="󰤥"
+        elif [ "$sig" -ge 40 ]; then bars="󰤢"
+        elif [ "$sig" -ge 20 ]; then bars="󰤟"
+        else bars="󰤯"; fi
+        if [ -n "$sec" ]; then lock="󰌾"; else lock=" "; fi
+        mark=""; [ "$ssid" = "$active_ssid" ] && mark="  ✓ connected"
+        item "$bars $lock  $ssid$mark" "connect	$sec	$ssid"
+    done
+    item "󰑓  Rescan" "rescan"
+    item "󰖪  Turn Wi-Fi off" "radio-off"
+fi
+item "󰒓  Edit connections…" "editor"
+
+# Labels and actions are parallel files; --index says which line was picked.
+n=$(wc -l < "$tmp/labels"); [ "$n" -gt 14 ] && n=14
+i=$("$HOME/.local/bin/qs-pick" --index --prompt "󰖩  " --placeholder "$PLACEHOLDER" < "$tmp/labels" 2>/dev/null) || exit 0
+[ -n "$i" ] && [ "$i" -ge 0 ] 2>/dev/null || exit 0
+action=$(sed -n "$((i + 1))p" "$tmp/actions")
+
+case "$action" in
+    radio-on)   nmcli radio wifi on  && notify "Wi-Fi on" ;;
+    radio-off)  nmcli radio wifi off && notify "Wi-Fi off" ;;
+    disconnect) nmcli dev disconnect "$dev" >/dev/null && notify "Disconnected from $active_ssid" ;;
+    editor)     exec nm-connection-editor ;;
+    rescan)     nmcli dev wifi rescan 2>/dev/null; sleep 2; exec "$0" ;;
+    connect*)
+        sec=$(printf '%s' "$action" | cut -f2)
+        ssid=$(printf '%s' "$action" | cut -f3-)
+        [ "$ssid" = "$active_ssid" ] && exit 0
+        # Reuse a saved profile for this SSID if there is one
+        profile=$(nmcli -t -f NAME,TYPE con show | awk -F: '$NF=="802-11-wireless"{sub(/:802-11-wireless$/, ""); print}' |
+            while IFS= read -r name; do
+                [ "$(nmcli -g 802-11-wireless.ssid con show "$name" 2>/dev/null)" = "$ssid" ] && { printf '%s' "$name"; break; }
+            done)
+        if [ -n "$profile" ]; then
+            notify "Connecting to $ssid…"
+            if out=$(nmcli con up id "$profile" 2>&1); then notify "Connected to $ssid"
+            else notify -u critical "Couldn't connect to $ssid" "$(printf '%s' "$out" | tail -1)"; fi
+        elif printf '%s' "$sec" | grep -q '802.1X'; then
+            notify "$ssid needs a username and certificate settings" "Opening the connection editor"
+            exec nm-connection-editor
+        elif [ -n "$sec" ]; then
+            pw=$("$HOME/.local/bin/qs-pick" --password --placeholder "Password for $ssid" 2>/dev/null) || exit 0
+            [ -n "$pw" ] || exit 0
+            notify "Connecting to $ssid…"
+            if out=$(nmcli dev wifi connect "$ssid" password "$pw" ifname "$dev" 2>&1); then notify "Connected to $ssid"
+            else
+                # don't leave a broken profile behind
+                nmcli con delete id "$ssid" >/dev/null 2>&1
+                notify -u critical "Couldn't connect to $ssid" "$(printf '%s' "$out" | tail -1)"
+            fi
+        else
+            notify "Connecting to $ssid…"
+            if out=$(nmcli dev wifi connect "$ssid" ifname "$dev" 2>&1); then notify "Connected to $ssid (open network)"
+            else notify -u critical "Couldn't connect to $ssid" "$(printf '%s' "$out" | tail -1)"; fi
+        fi ;;
+esac

@@ -1,0 +1,8 @@
+/* Clemson orange as the accent in GTK apps (adw-gtk3 and libadwaita read these
+   names). gtk.css is a link to this file or accent-light.css, set by
+   hypr-theme-apply on every dark/light switch (Hyprland sessions only). */
+@define-color accent_color #f56600;
+@define-color accent_bg_color #f56600;
+@define-color accent_fg_color #16161a;
+@define-color theme_selected_bg_color #f56600;
+@define-color theme_selected_fg_color #16161a;

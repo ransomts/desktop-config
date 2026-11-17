@@ -1,0 +1,77 @@
+#!/bin/sh
+# Screenshots for Hyprland: saved to ~/Pictures/Screenshots and copied to the clipboard.
+#   screenshot edit      # freeze the screens, drag a box, annotate (Quickshell Shot.qml)   Print
+#                        #   falls back to `region` when Quickshell does not answer
+#   screenshot region    # drag a box (Esc cancels)        Shift+Super+Print
+#   screenshot window    # the focused window              Shift+Print
+#   screenshot screen    # the monitor under focus         Ctrl+Print
+#   screenshot menu      # menu of the above               Super+Print
+#   screenshot done FILE         # used by Shot.qml: move FILE into the folder, copy, shutter, notify
+#   screenshot done --copy FILE  # used by Shot.qml: copy FILE to the clipboard, shutter, remove it
+DIR="${XDG_PICTURES_DIR:-$HOME/Pictures}/Screenshots"
+mkdir -p "$DIR"
+FILE="$DIR/$(date +%Y-%m-%d_%H-%M-%S).png"
+qs="$HOME/.nix-profile/bin/qs"
+
+shutter() { "$qs" ipc call sound play camera-shutter >/dev/null 2>&1; }
+
+mode="$1"
+if [ "$mode" = menu ] || [ -z "$mode" ]; then
+    choice=$(printf '%s\n' "󰏫  Edit…" "󰩭  Region" "󰖯  Window" "󰍹  Screen" |
+        "$HOME/.local/bin/qs-pick" --prompt "󰄀  " --placeholder "Screenshot") || exit 0
+    case "$choice" in *Edit…) mode=edit ;; *Region) mode=region ;; *Window) mode=window ;; *Screen) mode=screen ;; *) exit 0 ;; esac
+    sleep 0.4   # let the list disappear before capturing
+fi
+
+case "$mode" in
+    qr) exec "$HOME/.local/bin/qr" read ;;       # read a QR code off the screen (copies it)
+    edit)
+        # Quickshell captures and does the rest (it calls `screenshot done` back)
+        [ -x "$qs" ] && timeout 3 "$qs" ipc call shot edit >/dev/null 2>&1 && exit 0
+        mode=region ;;
+    done)
+        shift
+        copyonly=0
+        [ "$1" = --copy ] && { copyonly=1; shift; }
+        src="$1"
+        if [ -z "$src" ] || [ ! -s "$src" ]; then
+            notify-send -a Screenshot -u critical "Screenshot failed"; exit 1
+        fi
+        if [ "$copyonly" = 1 ]; then
+            wl-copy --type image/png < "$src"
+            rm -f "$src"
+            shutter
+            notify-send -a Screenshot -h boolean:suppress-sound:true "Screenshot copied" "On the clipboard, not saved"
+            exit 0
+        fi
+        case "$src" in
+            "$DIR"/*) FILE="$src" ;;
+            *) mv "$src" "$FILE" || { notify-send -a Screenshot -u critical "Screenshot failed"; exit 1; } ;;
+        esac
+        wl-copy --type image/png < "$FILE"
+        shutter
+        notify-send -a Screenshot -h boolean:suppress-sound:true -i "$FILE" "Screenshot saved" "$(basename "$FILE") — also on the clipboard"
+        exit 0 ;;
+esac
+
+case "$mode" in
+    region)
+        geom=$(slurp -d -b '#16161a66' -c '#f56600ff' -w 2) || exit 0
+        grim -g "$geom" "$FILE" ;;
+    window)
+        geom=$(hyprctl activewindow -j | python3 -c '
+import json, sys
+w = json.load(sys.stdin)
+if not w: sys.exit(1)
+(x, y), (wd, ht) = w["at"], w["size"]
+print(f"{x},{y} {wd}x{ht}")') || { notify-send -a Screenshot "No focused window"; exit 1; }
+        grim -g "$geom" "$FILE" ;;
+    screen)
+        mon=$(hyprctl monitors -j | python3 -c 'import json,sys; print(next(m["name"] for m in json.load(sys.stdin) if m["focused"]))')
+        grim -o "$mon" "$FILE" ;;
+    *) echo "usage: screenshot edit|region|window|screen|menu   (done [--copy] FILE: used by Quickshell)" >&2; exit 2 ;;
+esac || { notify-send -a Screenshot -u critical "Screenshot failed"; exit 1; }
+
+wl-copy --type image/png < "$FILE"
+shutter
+notify-send -a Screenshot -h boolean:suppress-sound:true -i "$FILE" "Screenshot saved" "$(basename "$FILE") — also on the clipboard"

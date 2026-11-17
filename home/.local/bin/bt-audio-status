@@ -1,0 +1,31 @@
+#!/bin/sh
+# Click actions for the bar's Bluetooth headphones pill (MOMENTUM 4, Pixel Buds Pro 2, ...).
+# The pill itself (device, battery) is drawn by Quickshell from BlueZ: Sys.qml.
+#   bt-audio-status bounce   # reconnect the connected headphones (bt-bounce)
+#   bt-audio-status mode     # Pixel Buds: flip call (HFP) <-> music (A2DP)
+
+audio_devices() {  # MAC<TAB>name for each connected device whose icon is audio-*
+    bluetoothctl devices Connected 2>/dev/null | while read -r _ mac name; do
+        bluetoothctl info "$mac" 2>/dev/null | grep -q 'Icon: audio-' && printf '%s\t%s\n' "$mac" "$name"
+    done
+}
+
+case "$1" in
+    bounce)
+        mac=$(audio_devices | head -1 | cut -f1)
+        [ -n "$mac" ] && exec "$HOME/.local/bin/bt-bounce" "$mac"
+        exec "$HOME/.local/bin/bt-bounce" ;;   # nothing connected: try the default (MOMENTUM 4)
+    mode)
+        card=bluez_card.04_C8_B0_2F_A1_AF
+        if pactl list short cards | grep -q "$card"; then
+            if pactl list cards | grep -A40 "Name: $card" | grep -q 'Active Profile: headset-head-unit'; then
+                "$HOME/.local/bin/buds-music" && notify-send -a Bluetooth "Pixel Buds: music mode"
+            else
+                "$HOME/.local/bin/buds-call" && notify-send -a Bluetooth "Pixel Buds: call mode (mic on)"
+            fi
+        else
+            notify-send -a Bluetooth "Pixel Buds aren't connected"
+        fi ;;
+    *)
+        echo "usage: bt-audio-status bounce|mode" >&2; exit 2 ;;
+esac

@@ -1,0 +1,20 @@
+# drift: the terminal screensaver (starts after DRIFT_TIMEOUT idle seconds, see ~/.config/zsh/.zshrc).
+# Everything not set here keeps drift's defaults; `drift config` prints the effective values.
+
+[engine]
+# The `drift` wrapper in .zshrc passes -t clemson-dark or -t clemson-light to match the
+# desktop's dark/light mode each time the screensaver starts; this is only the fallback.
+theme = "clemson-dark"
+fps   = 15        # the default 30 is more than these slow scenes need, in every idle terminal
+
+# The desktop's palette: Clemson orange, Regalia purple, a lighter purple and amber.
+# palette = the colours, dim = their faded versions (towards the terminal background).
+[theme.clemson-dark]
+bright  = "#e6e1dc"
+palette = ["#f56600", "#9a6fd0", "#b294bb", "#f5a623"]
+dim     = ["#4d2000", "#2e2145", "#3a2f3d", "#4d3409"]
+
+[theme.clemson-light]
+bright  = "#26262b"
+palette = ["#d95a00", "#522d80", "#8959a8", "#a86200"]
+dim     = ["#e3a57a", "#a892c8", "#bfa6d0", "#d3b56a"]   # mid-tones: paler ones vanished on the off-white

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Ask for a new name for the bar pet (Quickshell Pet.qml) and set it. Run from its menu.
+name=$("$HOME/.local/bin/qs-pick" --input --placeholder "Name the pet") || exit 0
+[ -n "$name" ] && "$HOME/.nix-profile/bin/qs" ipc call pet name "$name" >/dev/null

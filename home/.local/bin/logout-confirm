@@ -1,0 +1,24 @@
+#!/bin/sh
+# Super+Shift+E: log out of Hyprland, but only on a second press within 4 seconds. The first
+# press just says so, so a stray chord (it sits one key from Super+E, Files) costs nothing.
+#   logout-confirm
+# LOGOUT_CMD replaces the real log-out (for testing).
+stamp="${XDG_RUNTIME_DIR:-/tmp}/logout-confirm.stamp"
+now=$(date +%s)
+last=$(cat "$stamp" 2>/dev/null || echo 0)
+case "$last" in ''|*[!0-9]*) last=0 ;; esac
+
+if [ $((now - last)) -le 4 ]; then
+    rm -f "$stamp"
+    if [ -n "$LOGOUT_CMD" ]; then
+        sh -c "$LOGOUT_CMD"
+    else
+        "$HOME/.local/bin/session-save" --if-enabled
+        exec uwsm stop
+    fi
+else
+    echo "$now" > "$stamp"
+    notify-send -u critical -t 4000 -h string:x-canonical-private-synchronous:logout-confirm \
+        "Log out?" "Press Super+Shift+E again to log out." 2>/dev/null \
+        || hyprctl notify 1 4000 0 "Log out? Press Super+Shift+E again" >/dev/null
+fi

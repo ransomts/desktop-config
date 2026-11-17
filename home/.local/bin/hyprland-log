@@ -1,0 +1,31 @@
+#!/bin/sh
+# Hyprland writes its log to $XDG_RUNTIME_DIR/hypr/<instance>/hyprland.log, which is gone
+# after a reboot and far too chatty for the journal (about 5 MB a day of DEBUG lines).
+#
+#   hyprland-log follow   send only its WARN / ERR / CRIT lines to the user journal:
+#                             journalctl --user -t hyprland
+#   hyprland-log save     keep a compressed copy of every instance's whole log in
+#                         ~/.local/state/hyprland-logs (newest 6 kept)
+# hyprland-log.service runs `save` then `follow` at login, and `save` again when the session
+# ends, so the log of a session that crashed is still there after the next login.
+dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/hypr"
+keep="${XDG_STATE_HOME:-$HOME/.local/state}/hyprland-logs"
+case "$1" in
+save)
+    mkdir -p "$keep"
+    for f in "$dir"/*/hyprland.log; do
+        [ -s "$f" ] || continue
+        sig=$(basename "$(dirname "$f")")
+        gzip -c "$f" > "$keep/.tmp.$$" && mv -f "$keep/.tmp.$$" "$keep/hyprland-${sig#*_}.log.gz"
+    done
+    /bin/ls -t "$keep"/hyprland-*.log.gz 2>/dev/null | tail -n +7 | while read -r old; do rm -f "$old"; done
+    ;;
+follow)
+    log="$dir/$HYPRLAND_INSTANCE_SIGNATURE/hyprland.log"
+    [ -n "$HYPRLAND_INSTANCE_SIGNATURE" ] && [ -f "$log" ] || { echo "no Hyprland log at $log" >&2; exit 1; }
+    tail -n 0 -F "$log" 2>/dev/null |
+        sed -u -n -e 's/^CRIT/<2>&/p' -e 's/^ERR/<3>&/p' -e 's/^WARN/<4>&/p' |
+        systemd-cat -t hyprland
+    ;;
+*) echo "usage: hyprland-log follow|save" >&2; exit 2 ;;
+esac

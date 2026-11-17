@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Record one message the shell showed: a notification (Notif.qml) or an island message (Island.qml).
+
+    shell-log notification|island TITLE [BODY] [key=value ...]
+
+Each message goes to two places:
+  - the user journal, identifier = the kind, so
+        journalctl --user -t notification -t island
+        journalctl --user -t notification MSG_APP=Element --since yesterday
+    Fields: MSG_TITLE, MSG_BODY, and one MSG_<KEY> per key=value (app, outcome, urgency, transient; source for the island).
+    The journal trims its oldest entries when it reaches its size cap, so it is the place to
+    search, not the archive.
+  - ~/.local/state/shell-messages.jsonl, one JSON object per line, never trimmed: the archive.
+
+Never fails loudly: a message that cannot be recorded must not disturb the shell.
+"""
+import json
+import os
+import socket
+import struct
+import sys
+import time
+
+KINDS = ("notification", "island")
+PRIORITY = {"critical": "4", "normal": "5", "low": "6"}     # warning, notice, info
+
+
+def journal_send(fields):
+    out = b""
+    for key, value in fields.items():
+        k, v = key.encode(), str(value).encode("utf-8", "replace")
+        if b"\n" in v:
+            out += k + b"\n" + struct.pack("<Q", len(v)) + v + b"\n"
+        else:
+            out += k + b"=" + v + b"\n"
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+        s.sendto(out, "/run/systemd/journal/socket")
+
+
+def main(argv):
+    if len(argv) < 3 or argv[1] not in KINDS:
+        print(__doc__.strip().splitlines()[2].strip(), file=sys.stderr)
+        return 2
+    kind, title = argv[1], argv[2]
+    rest = argv[3:]
+    body = ""
+    if rest and not (rest[0].split("=", 1)[0].isidentifier() and "=" in rest[0]):
+        body, rest = rest[0], rest[1:]
+    extra = {}
+    for kv in rest:
+        k, _, v = kv.partition("=")
+        if k.isidentifier():
+            extra[k.lower()] = v
+
+    app = extra.get("app", "")
+    line = " ".join(((("[" + app + "] ") if app else "") + title + (": " + body if body else "")).split())
+    fields = {
+        "MESSAGE": line or "(empty)",
+        "SYSLOG_IDENTIFIER": kind,
+        "PRIORITY": PRIORITY.get(extra.get("urgency", ""), "6" if kind == "island" else "5"),
+        "MSG_TITLE": title,
+        "MSG_BODY": body,
+    }
+    for k, v in extra.items():
+        fields["MSG_" + k.upper()] = v
+    try:
+        journal_send(fields)
+    except OSError:
+        pass
+
+    state = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    entry = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "kind": kind, "title": title, "body": body}
+    entry.update({k: v for k, v in extra.items() if k not in entry})
+    try:
+        fd = os.open(os.path.join(state, "shell-messages.jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

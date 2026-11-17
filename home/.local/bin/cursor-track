@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""Stream the Hyprland pointer position for the lecture spotlight (LectureSpot.qml).
+
+Prints "<x> <y>" (layout pixels) once at start and then whenever the pointer moves,
+sampling about 30 times a second while it moves and 8 times a second while it rests.
+Nothing is written anywhere. Exits when its reader goes away: stdout closed, stdin
+closed (Quickshell's pipe), or the parent process gone.
+    cursor-track            the stream
+    cursor-track --once     one line and exit
+"""
+import os, select, socket, stat, sys, time
+
+SOCK = "%s/hypr/%s/.socket.sock" % (os.environ.get("XDG_RUNTIME_DIR", ""), os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", ""))
+
+def pos():
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(0.5)
+    try:
+        s.connect(SOCK)
+        s.send(b"cursorpos")
+        x, y = s.recv(64).decode().split(",")
+    finally:
+        s.close()
+    return int(x), int(y)
+
+def main():
+    if "--once" in sys.argv:
+        print("%d %d" % pos(), flush=True)
+        return
+    parent = os.getppid()
+    watch_stdin = stat.S_ISFIFO(os.fstat(0).st_mode)     # a pipe: its closing means stop
+    last = None
+    still = 0
+    while True:
+        if os.getppid() != parent:
+            return
+        try:
+            p = pos()
+        except (OSError, ValueError):
+            if not os.path.exists(SOCK):
+                return
+            p = last
+        if p is not None and p != last:
+            print("%d %d" % p, flush=True)
+            last = p
+            still = 0
+        else:
+            still += 1
+        wait = 1 / 30 if still < 30 else 1 / 8
+        if watch_stdin:
+            r, _, _ = select.select([0], [], [], wait)
+            if r and not os.read(0, 4096):
+                return
+        else:
+            time.sleep(wait)
+
+try:
+    main()
+except (KeyboardInterrupt, BrokenPipeError):
+    pass

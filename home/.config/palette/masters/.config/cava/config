@@ -1,0 +1,8 @@
+
+# Desktop palette: bars run from Regalia purple at the bottom to Clemson orange at the top.
+[color]
+gradient = 1
+gradient_count = 3
+gradient_color_1 = '#522d80'
+gradient_color_2 = '#a03a8a'
+gradient_color_3 = '#f56600'

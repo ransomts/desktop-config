@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""Make the one-page Hyprland keybinding cheat sheet (PDF) from the live bindings.
+
+  keybind-sheet [OUT.pdf]      default: ~/Scratch/hyprland-keybindings.pdf
+
+Keys and their descriptions come from `hyprctl binds -j`, so the sheet says what the
+keys do right now. The grouping below is curated; any binding it does not mention is
+listed under "Other", so nothing new goes missing. A few rows that are not key bindings
+(mouse actions on the bar, pointer tricks) are written out here. Rendered by headless
+Chrome from a generated HTML page.
+"""
+import datetime, html, json, os, shutil, subprocess, sys, tempfile
+
+MODS = {64: "Super", 65: "Super Shift", 68: "Super Ctrl", 72: "Super Alt", 0: "", 1: "Shift", 4: "Ctrl", 8: "Alt"}
+KEYNAMES = {"Return": "Enter", "period": ".", "slash": "/", "bracketleft": "[", "bracketright": "]",
+            "left": "←", "right": "→", "up": "↑", "down": "↓", "mouse_down": "scroll", "mouse_up": "scroll",
+            "mouse:272": "left-drag", "mouse:273": "right-drag", "Print": "PrtSc", "Space": "Space", "Tab": "Tab"}
+
+# (title, rows). A row is (keys, text) where text None means "use the live description of
+# the first listed binding". keys are "Mods|key" strings; several mean "these share a row".
+SECTIONS = [
+    ("Apps", [
+        (["Super|Return"], None), (["Super|T"], None), (["Super|B"], None), (["Super|E"], None), (["Super|D"], None),
+    ]),
+    ("Recording and calls", [
+        (["Super|R"], None), (["Super Shift|R"], None), (["Super Ctrl|R"], None), (["Super Shift|W"], None),
+        (["Super Shift|A"], None), (["Super Ctrl|space"], "Push to talk (hold)"),
+    ]),
+    ("Shell", [
+        (["Super|comma"], None),
+    ]),
+    ("Lecture tools", [
+        (["Super|Z"], None), (["Super Shift|D"], None), (["Super Shift|L"], None), (["Super Shift|K"], None),
+        (["Super|equal"], None), (["Super|minus"], None), (["Super|backslash"], None),
+    ]),
+    ("Windows", [
+        (["Super|Q"], None), (["Super|M"], None), (["Super|F"], None), (["Super Shift|V"], None),
+        (["Super Shift|P"], None),
+        (["Super|left", "Super|up", "Super|down", "Super|right"], "Focus the window in that direction"),
+        (["Super Shift|left", "Super Shift|up", "Super Shift|down", "Super Shift|right"], "Move window (crosses monitors at the edge)"),
+        (["Super Ctrl|left", "Super Ctrl|up", "Super Ctrl|down", "Super Ctrl|right"], "Resize window"),
+        (["Super|mouse:272"], "Move window; an orange outline shows where it will land"),
+        (["Super|mouse:273"], "Resize window"),
+        (["Alt|Tab"], None),
+    ]),
+    ("Layouts", [
+        (["Super|A"], "Pick this desktop's layout (remembered)"),
+        (["Super|J"], "Dwindle: flip a split side-by-side / stacked"),
+        (["Super Shift|Return"], "Make this the main window"),
+        (["Super Shift|M"], "Focus the main window"),
+        (["Super|K", "Super|H"], "Focus next / previous window"),
+        (["Super|Y"], "Move window down the stack (with Shift: up)"),
+        (["Super Shift|I", "Super Shift|U"], "One more / one fewer main window"),
+        (["Super|X"], "Move the main area: left, top, right, bottom, centre"),
+    ]),
+    ("Desktops", [
+        (["Super|1", "Super|2", "Super|3", "Super|4", "Super|5", "Super|6", "Super|7", "Super|8", "Super|9", "Super|0"], "Go to desktop 1–10 (all screens together)"),
+        (["Super Shift|1", "Super Shift|2", "Super Shift|3", "Super Shift|4", "Super Shift|5", "Super Shift|6", "Super Shift|7", "Super Shift|8", "Super Shift|9", "Super Shift|0"], "Send window to desktop 1–10"),
+        (["Super|mouse_down", "Super|mouse_up"], "Next / previous desktop"),
+        (["Super|Tab"], None), (["Super|S"], None), (["Super Shift|S"], None),
+    ]),
+    ("Tab groups", [
+        (["Super|G"], "Make / dissolve a tab group"),
+        (["Super Alt|left", "Super Alt|up", "Super Alt|down", "Super Alt|right"], "Join the group in that direction"),
+        (["Super Alt|G"], "Take window out of its group"),
+        (["Super|bracketleft", "Super|bracketright"], "Previous / next tab"),
+    ]),
+    ("Capture and pickers", [
+        (["|Print"], "Screenshot: pick a region, then mark it up"), (["Super Shift|Print"], "Screenshot: region, no editor"), (["Shift|Print"], "Screenshot: focused window"),
+        (["Ctrl|Print"], "Screenshot: whole screen"), (["Super|Print"], None),
+        (["Super|R"], None), (["Super Shift|R"], None), (["Super|O"], None),
+        (["Super|V"], None), (["Super|period"], None), (["Super Shift|C"], None),
+    ]),
+    ("Shell and session", [
+        (["Super|C"], "Control panel"), (["Super|N"], "Recent notifications"),
+        (["Super|W"], "Wallpaper: scene, effects, mode, frame rate"),
+        (["Super|P"], None), (["Super Shift|T"], None), (["Super|Space"], None),
+        (["Super|L"], None), (["Super Shift|E"], None), (["Super|slash"], None),
+    ]),
+]
+# Bindings that are real but do not need a row of their own.
+HIDE_PREFIX = ("XF86", "switch:")
+EXTRA = [
+    ("Laptop keys", [
+        ("Volume, mute, mic", "Change level; a pop-up shows it"),
+        ("Brightness", "Screen brightness"),
+        ("Media keys", "Play/pause, next, previous"),
+        ("Fn F5", "Displays menu (same as Super P)"),
+        ("Lid", "Closed while docked: laptop screen off"),
+    ]),
+    ("Mouse", [
+        ("Shake the pointer", "It grows so you can find it"),
+        ("Music pill", "Click: play/pause · right: player · middle: previous · scroll: volume · hover: slide title"),
+        ("Clock", "Click: calendar · right: control panel"),
+        ("Sound pill", "Click: output · right: mute · middle: mixer · scroll: volume"),
+        ("Desktop numbers", "Click: go · scroll: next/previous"),
+        ("Gap between windows", "Drag to resize the windows either side"),
+    ]),
+]
+
+
+def keycaps(mods, keys):
+    """HTML for one row's keys: shared modifiers, then the keys."""
+    caps = [f"<kbd>{html.escape(m)}</kbd>" for m in mods.split()] if mods else []
+    names = [KEYNAMES.get(k, k if len(k) > 1 else k.upper()) for k in keys]
+    if len(names) == 10 and names[0] == "1": names = ["1–0"]
+    if set(names) == {"←", "↑", "↓", "→"}: names = ["←↑↓→"]
+    if names == ["scroll", "scroll"]: names = ["scroll"]
+    return "".join(caps) + "".join(f"<kbd>{html.escape(n)}</kbd>" for n in names)
+
+
+def main():
+    out = os.path.expanduser(sys.argv[1] if len(sys.argv) > 1 else "~/Scratch/hyprland-keybindings.pdf")
+    binds = json.loads(subprocess.check_output(["hyprctl", "binds", "-j"]))
+    live = {f"{MODS.get(b['modmask'], str(b['modmask']))}|{b['key']}": (b.get("description") or "") for b in binds}
+    used, blocks = set(), []
+    for title, rows in SECTIONS:
+        lines = []
+        for keys, text in rows:
+            present = [k for k in keys if k in live]
+            if not present: continue                        # that key is no longer bound: leave the row out
+            used.update(present)
+            if keys == ["Super|Y"]: used.add("Super Shift|Y")
+            mods = present[0].split("|")[0]
+            same = all(k.split("|")[0] == mods for k in present)
+            caps = keycaps(mods, [k.split("|")[1] for k in present]) if same else \
+                " / ".join(keycaps(k.split("|")[0], [k.split("|")[1]]) for k in present)
+            lines.append((caps, text or live[present[0]]))
+        blocks.append((title, lines))
+    other = [(keycaps(*k.split("|")[:1], [k.split("|")[1]]), d) for k, d in live.items()
+             if k not in used and not k.split("|")[1].startswith(HIDE_PREFIX) and d]
+    if other: blocks.append(("Other", other))
+    for title, rows in EXTRA:
+        blocks.append((title, [(f"<span class=what>{html.escape(a)}</span>", b) for a, b in rows]))
+
+    body = "".join(
+        f"<section><h2>{html.escape(t)}</h2>" + "".join(
+            f"<div class=row><div class=keys>{c}</div><div class=does>{html.escape(d)}</div></div>" for c, d in rows)
+        + "</section>" for t, rows in blocks)
+    page = f"""<!doctype html><html><head><meta charset="utf-8"><title>Hyprland keybindings</title><style>
+@page {{ size: letter landscape; margin: 9mm 10mm; }}
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; font: 8.2pt/1.28 "Fira Sans", "Inter", "Noto Sans", sans-serif; color: #26262b; }}
+header {{ display: flex; justify-content: space-between; align-items: baseline; border-bottom: 2px solid #f56600; padding-bottom: 3px; margin-bottom: 7px; }}
+h1 {{ font-size: 15pt; margin: 0; color: #522d80; }}
+header span {{ color: #6f6a64; font-size: 7.6pt; }}
+main {{ column-count: 4; column-gap: 6mm; column-fill: auto; height: 183mm; }}
+section {{ break-inside: avoid; margin: 0 0 7px; }}
+h2 {{ font-size: 9.2pt; margin: 0 0 2px; color: #f56600; text-transform: uppercase; letter-spacing: .05em; }}
+.row {{ display: flex; gap: 6px; padding: 1.1px 0; border-bottom: 1px solid #ece7df; }}
+.keys {{ flex: 0 0 29mm; }}
+.does {{ flex: 1; }}
+kbd {{ white-space: nowrap; font: 600 7.3pt "FiraCode Nerd Font", "Fira Code", monospace; background: #f1ecf6; border: 1px solid #cfc4df; border-radius: 3px; padding: 0 3px; margin-right: 2px; color: #3a2060; }}
+.what {{ font-weight: 600; color: #3a2060; white-space: normal; }}
+</style></head><body>
+<header><h1>Hyprland keybindings</h1><span>Super = the Windows key · made from the live bindings by keybind-sheet · {datetime.date.today():%B %-d, %Y}</span></header>
+<main>{body}</main></body></html>"""
+
+    chrome = next((c for c in ("google-chrome", "chromium", "chromium-browser") if shutil.which(c)), None)
+    if not chrome: sys.exit("keybind-sheet: no Chrome or Chromium found to make the PDF")
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "keys.html")
+        open(src, "w").write(page)
+        subprocess.run([chrome, "--headless=new", "--disable-gpu", "--no-pdf-header-footer", f"--user-data-dir={tmp}/profile",
+                        f"--print-to-pdf={out}", "file://" + src], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90)
+    print(out, f"({len(live)} bindings, {len(other)} under Other)")
+
+
+if __name__ == "__main__":
+    main()

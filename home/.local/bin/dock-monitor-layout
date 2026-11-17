@@ -1,0 +1,108 @@
+#!/bin/bash
+# Apply the usual desk layout whenever the dock's monitors are hotplugged.
+
+# model | mode (W H refresh) | transform | x | y
+LAYOUT=(
+    "DELL P2425HE|1920 1080 60.000|normal|0|840"
+    "DELL P2214H|1920 1080 60.000|rotate90|1920|0"
+    "S34J55x|3440 1440 59.973|normal|3000|480"
+    "0x683D|1920 1080 60.049|normal|6440|840"
+)
+
+# Print "connector|model|enabled|transform|x|y" for each output.
+outputs() {
+    cosmic-randr list --kdl 2>/dev/null | awk '
+        /^output / { gsub(/"/, "", $2); conn = $2; en = ($3 ~ /true/) ? "yes" : "no" }
+        /description/ { match($0, /model="[^"]*"/); model = substr($0, RSTART + 7, RLENGTH - 8) }
+        /^  position/ { x = $2; y = $3 }
+        /^  transform/ { gsub(/"/, "", $2); tr = $2 }
+        /^}/ { print conn "|" model "|" en "|" tr "|" x "|" y }'
+}
+
+# Print "connector|model" for each external monitor the kernel has connected,
+# with the model read straight from its EDID.
+kernel_outputs() {
+    local s d model
+    for s in /sys/class/drm/card*-DP-*/status; do
+        [[ $(< "$s") == connected ]] || continue
+        d=${s%/status}
+        model=$(edid-decode "$d/edid" 2>/dev/null \
+            | sed -n "s/.*Display Product Name: '\(.*\)'.*/\1/p" | head -1)
+        echo "${d#*/card*-}|$model"
+    done
+}
+
+declare -A reprobes   # software re-plugs tried per connector since last success
+MAX_REPROBES=2
+
+# Called when COSMIC doesn't show the whole desk set. If the kernel does see
+# every desk monitor, COSMIC has mis-registered one, so re-plug it.
+fix_misregistered() {
+    local current=$1 kernel want model conn
+    kernel=$(kernel_outputs)
+    for want in "${LAYOUT[@]:0:3}"; do
+        grep -q "|${want%%|*}\$" <<< "$kernel" || return 0   # not at the desk
+    done
+    for want in "${LAYOUT[@]:0:3}"; do
+        model=${want%%|*}
+        conn=$(awk -F'|' -v m="$model" '$2 == m { print $1; exit }' <<< "$kernel")
+        grep -q "^$conn|$model|" <<< "$current" && continue
+        if (( ${reprobes[$conn]:-0} >= MAX_REPROBES )); then
+            logger -t dock-monitor-layout "COSMIC still has $model ($conn) wrong after $MAX_REPROBES re-plugs; power-cycle it by hand"
+            notify-send -a Monitors "$model isn't set up right" \
+                "COSMIC mis-registered it ($conn). Turn the monitor off and on." 2>/dev/null
+            continue
+        fi
+        (( reprobes[$conn]++ ))
+        logger -t dock-monitor-layout "kernel sees $model on $conn but COSMIC lists: $(cut -d'|' -f1,2 <<< "$current" | paste -sd' '); re-plugging $conn (try ${reprobes[$conn]}/$MAX_REPROBES)"
+        sudo -n /usr/local/sbin/drm-reprobe "$conn" \
+            || logger -t dock-monitor-layout "could not re-plug $conn"
+    done
+}
+
+apply_layout() {
+    local current want conn changed=0
+    # Monitors register with the compositor a moment after the kernel sees
+    # them, so wait up to ~15 s for the whole desk set to show up.
+    for _ in {1..15}; do
+        current=$(outputs)
+        local missing=0
+        for want in "${LAYOUT[@]:0:3}"; do
+            grep -q "|${want%%|*}|" <<< "$current" || missing=1
+        done
+        (( missing )) || break
+        sleep 1
+    done
+    if (( missing )); then
+        # Not at the desk, or COSMIC mis-registered a monitor. A re-plug fires
+        # hotplug events, which bring us back here.
+        fix_misregistered "$current"
+        return 0
+    fi
+    reprobes=()
+
+    for want in "${LAYOUT[@]}"; do
+        IFS='|' read -r model mode tr x y <<< "$want"
+        conn=$(awk -F'|' -v m="$model" '$2 == m { print $1; exit }' <<< "$current")
+        [[ -n $conn ]] || continue
+        grep -qx "$conn|$model|yes|$tr|$x|$y" <<< "$current" && continue
+        read -r w h hz <<< "$mode"
+        logger -t dock-monitor-layout "setting $model ($conn) to ${w}x${h} $tr at $x,$y"
+        cosmic-randr mode "$conn" "$w" "$h" --refresh "$hz" --transform "$tr" \
+            --pos-x "$x" --pos-y "$y" \
+            || logger -t dock-monitor-layout "failed to configure $conn"
+        changed=1
+    done
+    # COSMIC can shift a neighbour while others are still moving; one more pass
+    # settles it.
+    (( changed )) && sleep 1 && [[ $1 != again ]] && apply_layout again
+    return 0
+}
+
+apply_layout
+udevadm monitor --udev --subsystem-match=drm | while read -r line; do
+    [[ $line == UDEV* ]] || continue
+    # A dock attach fires a burst of events; wait for it to go quiet.
+    while read -r -t 3 _; do :; done
+    apply_layout
+done

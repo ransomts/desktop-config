@@ -1,0 +1,174 @@
+#!/usr/bin/python3 -I
+"""mousestats: what the mouse is used for under Hyprland, to find what to move to keys.
+
+For each click and wheel turn on a pointer (trackball, touchpad) it notes what was
+under the pointer (a panel such as qs-bar, a window by class, or the bare desktop)
+and what Hyprland did within 0.4 s after (focus moved, desktop changed, a window
+opened, closed, moved, went fullscreen, a special workspace toggled), and counts
+"DEVICE BUTTON on TARGET -> EFFECT" in ~/.local/state/keystats/mouse.json, saved every
+minute and on exit.  DEVICE is touchpad, trackball or mouse, so docked (trackball)
+and undocked (touchpad) use stay apart.  Counts only, no positions or timestamps.
+
+Pointers come and go with the dock; the device list is checked every few seconds
+and rescanned when it changes, so a trackball attached later is picked up.
+
+Touchpad tap-to-click happens in libinput, above evdev, so a short touch (one
+finger: left, two: right) stands in for a tap.  Two-finger scrolling isn't seen.
+Runs as mousestats.service; access to the pointers comes from a udev rule
+(uaccess on mice and touchpads, /etc/udev/rules.d/70-pointer-stats.rules).
+"""
+import collections, json, os, select, signal, socket, subprocess, sys, time
+import evdev
+from evdev import ecodes
+
+STATE = os.path.expanduser("~/.local/state/keystats/mouse.json")
+WINDOW = 0.4
+BUTTONS = {ecodes.BTN_LEFT: "left", ecodes.BTN_RIGHT: "right", ecodes.BTN_MIDDLE: "middle",
+           ecodes.BTN_SIDE: "back", ecodes.BTN_EXTRA: "forward"}
+EFFECTS = {"activewindowv2": "focus", "workspacev2": "desktop", "openwindow": "open",
+           "closewindow": "close", "movewindowv2": "move-to-desktop", "fullscreen": "fullscreen",
+           "activespecialv2": "special", "changefloatingmode": "float", "focusedmonv2": "monitor"}
+
+def load():
+    try:
+        with open(STATE) as f: d = json.load(f)
+    except (OSError, ValueError): d = {}
+    return collections.Counter(d.get("actions", {})), collections.Counter(d.get("targets", {})), d.get("since")
+actions, targets, since = load()
+since = since or time.strftime("%Y-%m-%d %H:%M")
+
+def save():
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"since": since, "saved": time.strftime("%Y-%m-%d %H:%M"),
+                   "actions": dict(actions), "targets": dict(targets)}, f, indent=0, sort_keys=True)
+    os.replace(tmp, STATE)
+
+def hypr(*args):
+    try: return json.loads(subprocess.run(["hyprctl", "-j", *args], capture_output=True, text=True, timeout=2).stdout)
+    except Exception: return None
+
+def under_pointer():
+    """What is under the pointer; "unknown" if Hyprland's JSON isn't as expected."""
+    try: return _under_pointer()
+    except (KeyError, TypeError, ValueError, AttributeError): return "unknown"
+
+def _under_pointer():
+    """What is under the pointer: "panel:NAMESPACE", "window:CLASS" or "desktop"."""
+    pos = hypr("cursorpos")
+    if not pos: return "unknown"
+    x, y = pos["x"], pos["y"]
+    inside = lambda ax, ay, w, h: ax <= x < ax + w and ay <= y < ay + h
+    layers = hypr("layers") or {}
+    for mon in layers.values():
+        for level in ("3", "2"):                      # overlay, then top: bars and popups
+            for l in mon["levels"].get(level, []):
+                if inside(l["x"], l["y"], l["w"], l["h"]):
+                    return "panel:" + l["namespace"]
+    monitors = hypr("monitors") or []
+    # Matched by workspace name: Hyprland 0.57 leaves "id" out of special
+    # workspaces (and an empty name means no special workspace is open).
+    shown = ({(m.get("activeWorkspace") or {}).get("name") for m in monitors}
+             | {(m.get("specialWorkspace") or {}).get("name") for m in monitors}) - {None, ""}
+    best = None
+    for c in hypr("clients") or []:
+        if (c.get("workspace") or {}).get("name") in shown and c["mapped"] and not c["hidden"] and inside(*c["at"], *c["size"]):
+            # Floating windows sit above tiled ones; among the same kind, the
+            # most recently focused is on top.
+            key = (c["floating"], -c["focusHistoryID"])
+            if best is None or key > best[0]: best = (key, c["class"] or "?")
+    return "window:" + best[1] if best else "desktop"
+
+def stop(*_): save(); sys.exit(0)
+signal.signal(signal.SIGTERM, stop); signal.signal(signal.SIGINT, stop)
+
+def hypr_events():
+    path = f"{os.environ['XDG_RUNTIME_DIR']}/hypr/{os.environ['HYPRLAND_INSTANCE_SIGNATURE']}/.socket2.sock"
+    s = socket.socket(socket.AF_UNIX); s.connect(path); s.setblocking(False)
+    return s
+
+def pointers():
+    found = []
+    for path in evdev.list_devices():
+        try: d = evdev.InputDevice(path)
+        except OSError: continue
+        caps = d.capabilities()
+        keys = set(caps.get(ecodes.EV_KEY, []))
+        if keys & set(BUTTONS) or ecodes.BTN_TOUCH in keys:
+            if "Moonlander" not in d.name and "keyboard" not in d.name.lower():
+                d.kind = ("touchpad" if ecodes.BTN_TOUCH in keys
+                          else "trackball" if "TB" in d.name.split() or "trackball" in d.name.lower()
+                          else "mouse")
+                found.append(d); continue
+        d.close()
+    return found
+
+pending = []          # (deadline, label, target, effects set)
+touch = {}            # device fd -> (start time, fingers)
+buf = b""
+last_save = time.monotonic()
+while True:
+    try:
+        hs = hypr_events()
+    except (OSError, KeyError):
+        time.sleep(5); continue
+    devs = pointers()
+    if not devs:
+        # No readable pointer yet (before the udev rule, or the trackball's
+        # dongle not plugged in): look again shortly.
+        hs.close(); time.sleep(5); continue
+    fds = {d.fd: d for d in devs}
+    known, last_check = set(evdev.list_devices()), time.monotonic()
+    try:
+        while True:
+            if time.monotonic() - last_check >= 5:
+                last_check = time.monotonic()
+                if set(evdev.list_devices()) != known:
+                    raise OSError("input devices changed")
+            timeout = max(0.05, min([p[0] for p in pending], default=time.monotonic() + 5) - time.monotonic())
+            r, _, _ = select.select([hs, *fds], [], [], timeout)
+            now = time.monotonic()
+            for fd in r:
+                if fd is hs:
+                    data = hs.recv(65536)
+                    if not data: raise OSError("hyprland socket closed")
+                    buf += data
+                    *lines, buf = buf.split(b"\n")
+                    for line in lines:
+                        ev = line.split(b">>", 1)[0].decode(errors="replace")
+                        if ev in EFFECTS:
+                            for p in pending: p[3].add(EFFECTS[ev])
+                    continue
+                dev = fds[fd]
+                for e in dev.read():
+                    label = None
+                    if e.type == ecodes.EV_KEY and e.code in BUTTONS and e.value == 1:
+                        label = BUTTONS[e.code]
+                    elif e.type == ecodes.EV_KEY and e.code == ecodes.BTN_TOUCH:
+                        if e.value == 1:
+                            touch[fd] = (now, 1)
+                        elif fd in touch:
+                            start, fingers = touch.pop(fd)
+                            if now - start < 0.18: label = "tap" if fingers == 1 else "tap2"
+                    elif e.type == ecodes.EV_KEY and e.code == ecodes.BTN_TOOL_DOUBLETAP and e.value == 1 and fd in touch:
+                        touch[fd] = (touch[fd][0], 2)
+                    elif e.type == ecodes.EV_REL and e.code == ecodes.REL_WHEEL:
+                        label = "wheel-up" if e.value > 0 else "wheel-down"
+                    if label:
+                        label = f"{dev.kind} {label}"
+                        target = under_pointer()
+                        targets[f"{label} on {target}"] += 1
+                        pending.append((time.monotonic() + WINDOW, label, target, set()))
+            done = [p for p in pending if p[0] <= time.monotonic()]
+            for p in done:
+                pending.remove(p)
+                actions[f"{p[1]} on {p[2]} -> {'+'.join(sorted(p[3])) or 'nothing'}"] += 1
+            if time.monotonic() - last_save >= 60:
+                save(); last_save = time.monotonic()
+    except OSError:
+        for d in devs:
+            try: d.close()
+            except OSError: pass
+        try: hs.close()
+        except OSError: pass
+        save(); time.sleep(3)

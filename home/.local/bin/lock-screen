@@ -1,0 +1,40 @@
+#!/bin/sh
+# Lock the session with the Quickshell lock screen (~/.config/quickshell/lockscreen.qml).
+# Run by hypridle (lock_cmd) on `loginctl lock-session`, so Super+L, idle and suspend
+# all come through here. If the Quickshell lock cannot start, crashes, or gives up after
+# three failed password checks, hyprlock takes over, so the session is never left
+# unlocked or stuck.
+qs="$HOME/.nix-profile/bin/qs"
+gl="$HOME/.nix-profile/bin/nixGLIntel"
+result="${XDG_RUNTIME_DIR:-/tmp}/lock-screen.result"
+
+exec 9>"${XDG_RUNTIME_DIR:-/tmp}/lock-screen.pid"
+flock -n 9 || exit 0                    # already locking
+# Already locked (by this, or by hyprlock): nothing to do. Ask Hyprland rather than look for a
+# hyprlock process: hyprlock sometimes lingers after unlocking, and a leftover one must not
+# stop the next lock (seen 2026-11-11).
+case "$(hyprctl locked 2>/dev/null)" in true*) exit 0 ;; esac
+pkill -x hyprlock 2>/dev/null           # a leftover from an earlier unlock
+# the lecture key display never runs over a lock screen
+[ -x "$qs" ] && timeout 2 "$qs" ipc call lecture keysoff >/dev/null 2>&1
+
+# Lock, unlock and hand-over are recorded in the user journal, with whatever the lock screen
+# prints:  journalctl --user -t lock-screen   (wrong passwords are logged by PAM itself:
+# journalctl -g 'pam_unix\(hyprlock:auth\)')
+note() { logger -t lock-screen ${2:+-p "$2"} -- "$1" 2>/dev/null; }
+began=$(date +%s)
+rm -f "$result"
+if [ -x "$qs" ] && [ -f "$HOME/.config/quickshell/lockscreen.qml" ]; then
+    note "locked"
+    if [ -x "$gl" ]; then systemd-cat -t lock-screen "$gl" "$qs" -p "$HOME/.config/quickshell/lockscreen.qml" --no-color >/dev/null 2>&1
+    else QT_QUICK_BACKEND=software systemd-cat -t lock-screen "$qs" -p "$HOME/.config/quickshell/lockscreen.qml" --no-color >/dev/null 2>&1; fi
+fi
+how=$(cat "$result" 2>/dev/null)
+if [ "$how" = unlocked ]; then
+    note "unlocked after $(( $(date +%s) - began )) s"
+    # unlocked: the bar pet says hello (the main shell; harmless if it is not running)
+    timeout 2 "$qs" ipc call pet greet >/dev/null 2>&1
+    exit 0
+fi
+note "Quickshell lock ended with '${how:-no result}'; handing over to hyprlock" user.warning
+exec hyprlock

@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Run power savings while on battery and undo them on AC. User service on-battery.service;
+# watches UPower's OnBattery over D-Bus.
+#   containers  ON_BATTERY_CONTAINERS (default "lidarr nzbget"): stopped on battery, started on AC
+#   backlight   ON_BATTERY_BRIGHTNESS (default 8 of 19): dims to at most this on battery;
+#               on AC puts back the level it had at unplug, unless you changed it meanwhile
+# The Quickshell wallpaper already holds still on battery (WallState.qml), so not done here.
+set -u
+containers=${ON_BATTERY_CONTAINERS-lidarr nzbget}
+dim=${ON_BATTERY_BRIGHTNESS:-8}
+dev=${ON_BATTERY_BACKLIGHT:-acpi_video0}
+state=${XDG_STATE_HOME:-$HOME/.local/state}/on-battery
+mkdir -p "$state"
+last=""
+
+bright() { brightnessctl -m -d "$dev" g; }
+
+to_battery() {
+    [ -n "$containers" ] && { echo "stopping $containers"; docker stop $containers >/dev/null; }
+    local now; now=$(bright)
+    if [ "$now" -gt "$dim" ]; then
+        echo "$now" > "$state/brightness"; echo "$dim" > "$state/dimmed-to"
+        brightnessctl -q -d "$dev" s "$dim"; echo "backlight $now -> $dim"
+    else
+        rm -f "$state/brightness" "$state/dimmed-to"
+    fi
+}
+
+to_ac() {
+    [ -n "$containers" ] && { echo "starting $containers"; docker start $containers >/dev/null; }
+    if [ -f "$state/brightness" ]; then
+        local was to now; was=$(cat "$state/brightness"); to=$(cat "$state/dimmed-to"); now=$(bright)
+        if [ "$now" = "$to" ]; then brightnessctl -q -d "$dev" s "$was"; echo "backlight $now -> $was"
+        else echo "backlight changed by hand ($now), leaving it"; fi
+        rm -f "$state/brightness" "$state/dimmed-to"
+    fi
+}
+
+apply() {
+    local r s
+    r=$(gdbus call --system --dest org.freedesktop.UPower --object-path /org/freedesktop/UPower \
+        --method org.freedesktop.DBus.Properties.Get org.freedesktop.UPower OnBattery 2>/dev/null)
+    case $r in *true*) s=battery ;; *false*) s=ac ;; *) echo "UPower unreadable: $r" >&2; return ;; esac
+    [ "$s" = "$last" ] && return
+    last=$s
+    echo "now on $s"
+    if [ "$s" = battery ]; then to_battery; else to_ac; fi
+}
+
+apply
+gdbus monitor --system --dest org.freedesktop.UPower --object-path /org/freedesktop/UPower |
+while read -r line; do case $line in *OnBattery*) apply ;; esac; done

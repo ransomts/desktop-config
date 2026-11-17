@@ -1,0 +1,9 @@
+# Hyprland sessions only (uwsm sources this at login and hands it to systemd,
+# which is where `uwsm app` launches get their environment).
+# Qt apps take Fusion, the Clemson colours (~/.config/qt{5,6}ct/colors/Clemson.conf,
+# flipped dark/light by hypr-theme-apply), Papirus icons and portal file dialogs from
+# qt5ct (Qt 5: VLC, Nextcloud) and qt6ct (Qt 6: qBittorrent). The name is qt5ct on
+# purpose: qt6ct's plugin answers to both names, while Qt 5 apps given "qt6ct" find no
+# plugin and fall back to plain light Fusion. Quickshell (Nix Qt) has no such plugin and ignores it.
+# Back to the old behaviour: export QT_QPA_PLATFORMTHEME=gtk3
+export QT_QPA_PLATFORMTHEME=qt5ct

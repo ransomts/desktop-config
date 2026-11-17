@@ -1,0 +1,237 @@
+#!/usr/bin/python3 -I
+"""lecture-keys: what is being pressed, for the on-screen key display (LectureKeys.qml).
+
+Reads the keyboards' input events (evdev, the access keystats uses) and prints one line
+per key press to stdout:   MODS<TAB>KEY
+  MODS  the modifiers held, "+"-joined in the order Ctrl Alt AltGr Super Shift ("" if none)
+  KEY   the character typed ("a", "A", "?"), or a name ("Enter", "Tab", "Esc", "Backspace",
+        "Space", "Up", "F5", "PgDn", ...). A modifier pressed and released alone prints
+        itself as KEY ("\tSuper"). Shift is folded into the character when it is the only
+        modifier ("\tA", not "Shift\ta"); with Ctrl, Alt or Super it stays ("Super+Shift\tD").
+  "#nokbd" alone on a line: no keyboard could be opened (permissions); then it exits.
+
+Privacy: nothing is written to any file and nothing is logged; it exits after 2 hours,
+when stdin closes (Quickshell's pipe), when stdout closes, or when its parent goes away.
+It never grabs a device, so typing still goes where it always goes.
+
+Layouts: what a key code means depends on the layout. The laptop keyboard types Dvorak
+through xkb (Hyprland may switch it to US with Super+Space); the Moonlander sends US codes
+and does Dvorak in its firmware. --layout auto (the default) follows each keyboard's
+active layout in Hyprland; force one with --layout NAME=us|dvorak (NAME: part of the
+device name, e.g. Moonlander or "AT Translated") or --layout us|dvorak for every keyboard.
+    lecture-keys [--layout auto|us|dvorak|NAME=us|NAME=dvorak]... [--max-seconds N]
+    lecture-keys --list     the keyboards it would read, and their layouts (no key data)
+"""
+import json, os, select, signal, socket, stat, subprocess, sys, time
+import evdev
+from evdev import ecodes
+
+MAX_SECONDS = 2 * 3600
+MODS = {ecodes.KEY_LEFTCTRL: "Ctrl", ecodes.KEY_RIGHTCTRL: "Ctrl", ecodes.KEY_CAPSLOCK: "Ctrl",   # caps:ctrl_modifier
+        ecodes.KEY_LEFTSHIFT: "Shift", ecodes.KEY_RIGHTSHIFT: "Shift",
+        ecodes.KEY_LEFTALT: "Alt", ecodes.KEY_RIGHTALT: "AltGr",
+        ecodes.KEY_LEFTMETA: "Super", ecodes.KEY_RIGHTMETA: "Super"}
+ORDER = ["Ctrl", "Alt", "AltGr", "Super", "Shift"]
+
+# character keys: code name -> (plain, shifted) on US, and what xkb's US Dvorak puts there
+US = {"GRAVE": "`~", "1": "1!", "2": "2@", "3": "3#", "4": "4$", "5": "5%", "6": "6^", "7": "7&", "8": "8*",
+      "9": "9(", "0": "0)", "MINUS": "-_", "EQUAL": "=+", "LEFTBRACE": "[{", "RIGHTBRACE": "]}",
+      "BACKSLASH": "\\|", "SEMICOLON": ";:", "APOSTROPHE": "'\"", "COMMA": ",<", "DOT": ".>", "SLASH": "/?"}
+for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+    US[c] = c.lower() + c
+DVORAK = dict(US)
+DVORAK.update({"MINUS": "[{", "EQUAL": "]}", "Q": "'\"", "W": ",<", "E": ".>", "R": "pP", "T": "yY", "Y": "fF",
+               "U": "gG", "I": "cC", "O": "rR", "P": "lL", "LEFTBRACE": "/?", "RIGHTBRACE": "=+",
+               "A": "aA", "S": "oO", "D": "eE", "F": "uU", "G": "iI", "H": "dD", "J": "hH", "K": "tT",
+               "L": "nN", "SEMICOLON": "sS", "APOSTROPHE": "-_", "Z": ";:", "X": "qQ", "C": "jJ",
+               "V": "kK", "B": "xX", "N": "bB", "M": "mM", "COMMA": "wW", "DOT": "vV", "SLASH": "zZ"})
+KEYPAD = {"KP0": "0", "KP1": "1", "KP2": "2", "KP3": "3", "KP4": "4", "KP5": "5", "KP6": "6", "KP7": "7",
+          "KP8": "8", "KP9": "9", "KPDOT": ".", "KPPLUS": "+", "KPMINUS": "-", "KPASTERISK": "*", "KPSLASH": "/"}
+NAMES = {"ENTER": "Enter", "KPENTER": "Enter", "TAB": "Tab", "ESC": "Esc", "BACKSPACE": "Backspace",
+         "SPACE": "Space", "DELETE": "Del", "INSERT": "Ins", "HOME": "Home", "END": "End",
+         "PAGEUP": "PgUp", "PAGEDOWN": "PgDn", "UP": "Up", "DOWN": "Down", "LEFT": "Left", "RIGHT": "Right",
+         "SYSRQ": "Print", "PRINT": "Print", "COMPOSE": "Menu", "MUTE": "Mute",
+         "VOLUMEUP": "Vol+", "VOLUMEDOWN": "Vol-", "BRIGHTNESSUP": "Bright+", "BRIGHTNESSDOWN": "Bright-",
+         "PLAYPAUSE": "Play", "NEXTSONG": "Next", "PREVIOUSSONG": "Prev"}
+
+def code_name(code):
+    n = ecodes.KEY.get(code) or ecodes.BTN.get(code) or ""
+    n = n[0] if isinstance(n, list) else n
+    return n[4:] if n.startswith("KEY_") else n
+
+def key_text(code, layout, shift):
+    """(text, shift_used): the character typed, or the key's name."""
+    n = code_name(code)
+    table = DVORAK if layout == "dvorak" else US
+    if n in table:
+        return table[n][1 if shift else 0], True
+    if n in KEYPAD:
+        return KEYPAD[n], False
+    if n in NAMES:
+        return NAMES[n], False
+    if n.startswith("F") and n[1:].isdigit():
+        return n, False
+    return (n.title() if n else str(code)), False
+
+def line_for(code, held, layout):
+    """The output line for a key press with the modifiers in `held`."""
+    others = [m for m in ORDER if m in held and m != "Shift"]
+    shift = "Shift" in held
+    text, is_char = key_text(code, layout, shift and not others)
+    if is_char and not others:
+        return "\t" + text                          # plain typing; Shift is in the character
+    if is_char and others and text.isalpha():
+        text = text.upper()                         # chords read as Ctrl + C, not Ctrl + c
+    mods = others + (["Shift"] if shift else [])
+    return "+".join(m for m in ORDER if m in mods) + "\t" + text
+
+# ---- keyboards and their layouts ----
+def hypr_name(name):
+    return name.lower().replace(" ", "-")
+
+def hypr_layouts():
+    """Hyprland keyboard name -> "us" | "dvorak" from its active keymap ({} outside Hyprland)."""
+    try:
+        out = subprocess.run(["hyprctl", "-j", "devices"], capture_output=True, text=True, timeout=2).stdout
+        return {k["name"]: ("dvorak" if "dvorak" in k.get("active_keymap", "").lower() else "us")
+                for k in json.loads(out).get("keyboards", [])}
+    except Exception:
+        return {}
+
+def keyboards():
+    found = []
+    for path in evdev.list_devices():
+        try:
+            d = evdev.InputDevice(path)
+        except OSError:
+            continue
+        keys = d.capabilities().get(ecodes.EV_KEY, [])
+        if ecodes.KEY_A in keys and ecodes.KEY_Z in keys and ecodes.KEY_SPACE in keys:
+            found.append(d)
+        else:
+            d.close()
+    return found
+
+class Layouts:
+    def __init__(self, args):
+        self.default = "auto"
+        self.forced = []                            # (substring, layout)
+        for a in args:
+            if "=" in a:
+                n, l = a.split("=", 1); self.forced.append((n.lower(), l))
+            else:
+                self.default = a
+        self.live = hypr_layouts() if self.default == "auto" or not self.forced else {}
+
+    def of(self, dev):
+        for n, l in self.forced:
+            if n in dev.name.lower():
+                return l
+        if self.default != "auto":
+            return self.default
+        hn = hypr_name(dev.name)
+        if hn in self.live:
+            return self.live[hn]
+        return "us" if "moonlander" in dev.name.lower() else "dvorak"
+
+    def event(self, line):
+        """Hyprland's activelayout>>KEYBOARD,LAYOUT NAME: follow Super+Space."""
+        kb, _, name = line.partition(",")
+        self.live[kb] = "dvorak" if "dvorak" in name.lower() else "us"
+
+def hypr_events():
+    sig, run = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"), os.environ.get("XDG_RUNTIME_DIR")
+    if not (sig and run):
+        return None
+    try:
+        s = socket.socket(socket.AF_UNIX); s.connect(f"{run}/hypr/{sig}/.socket2.sock"); s.setblocking(False)
+        return s
+    except OSError:
+        return None
+
+def emit(text):
+    sys.stdout.write(text + "\n")
+    sys.stdout.flush()
+
+def main(argv):
+    lay_args, max_s, i = [], MAX_SECONDS, 0
+    while i < len(argv):
+        if argv[i] == "--layout" and i + 1 < len(argv):
+            lay_args.append(argv[i + 1]); i += 2
+        elif argv[i] == "--max-seconds" and i + 1 < len(argv):
+            max_s = min(MAX_SECONDS, float(argv[i + 1])); i += 2
+        elif argv[i] == "--list":
+            lay = Layouts(lay_args)
+            for d in keyboards():
+                print(f"{d.path}\t{d.name}\t{lay.of(d)}")
+            return 0
+        else:
+            print(__doc__, file=sys.stderr); return 2
+    lay = Layouts(lay_args)
+    devs = keyboards()
+    if not devs:
+        emit("#nokbd"); return 1
+    fds = {d.fd: d for d in devs}
+    layouts = {d.fd: lay.of(d) for d in devs}
+    hs = hypr_events() if lay.default == "auto" else None
+    hbuf = b""
+    watch_stdin = stat.S_ISFIFO(os.fstat(0).st_mode)
+    parent, end = os.getppid(), time.monotonic() + max_s
+    held = {}                                       # per device: modifiers held
+    alone = {}                                      # per device: a modifier pressed with nothing else since
+    while time.monotonic() < end and os.getppid() == parent:
+        watch = list(fds) + ([hs] if hs else []) + ([0] if watch_stdin else [])
+        r, _, _ = select.select(watch, [], [], 1.0)
+        for fd in r:
+            if fd == 0:
+                if not os.read(0, 4096):
+                    return 0                        # Quickshell closed the pipe
+                continue
+            if fd is hs:
+                try:
+                    data = hs.recv(65536)
+                except BlockingIOError:
+                    continue
+                if not data:
+                    hs.close(); hs = None; continue
+                hbuf += data
+                *lines, hbuf = hbuf.split(b"\n")
+                for l in lines:
+                    if l.startswith(b"activelayout>>"):
+                        lay.event(l[14:].decode(errors="replace"))
+                        layouts = {f: lay.of(d) for f, d in fds.items()}
+                continue
+            dev = fds[fd]
+            try:
+                events = list(dev.read())
+            except OSError:                         # unplugged: carry on with the others
+                del fds[fd]
+                if not fds:
+                    return 0
+                continue
+            h = held.setdefault(fd, set())
+            for ev in events:
+                if ev.type != ecodes.EV_KEY:
+                    continue
+                if ev.code in MODS:
+                    m = MODS[ev.code]
+                    if ev.value == 1:
+                        h.add(m); alone[fd] = m
+                    elif ev.value == 0:
+                        h.discard(m)
+                        if alone.get(fd) == m and m != "Shift":
+                            emit("\t" + m)
+                        alone[fd] = None
+                    continue
+                if ev.value != 1 or (ev.code in ecodes.BTN and ev.code not in ecodes.KEY):
+                    continue                        # releases, autorepeat, mouse buttons (Moonlander mouse keys)
+                alone[fd] = None
+                emit(line_for(ev.code, h, layouts[fd]))
+    return 0
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except (KeyboardInterrupt, BrokenPipeError):
+        sys.exit(0)

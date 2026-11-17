@@ -1,0 +1,28 @@
+#!/bin/sh
+# wifi-qr: write a join-this-network QR (WIFI: URI) for the active Wi-Fi
+# connection to $XDG_RUNTIME_DIR (tmpfs, so the password never hits disk) and
+# print the PNG path, then the password on a second line. Used by the Quickshell Wi-Fi popup. Exit 1 if not on Wi-Fi.
+set -eu
+con=$(nmcli -t -f NAME,TYPE connection show --active | awk -F: '$2 ~ /wireless/ {print $1; exit}')
+[ -n "$con" ] || exit 1
+ssid=$(nmcli -s -g 802-11-wireless.ssid connection show "$con")
+km=$(nmcli -s -g 802-11-wireless-security.key-mgmt connection show "$con" 2>/dev/null || true)
+psk=$(nmcli -s -g 802-11-wireless-security.psk connection show "$con" 2>/dev/null || true)
+esc() { printf '%s' "$1" | sed 's/[\\;,:"]/\\&/g'; }
+case "$km" in
+  sae) t=SAE ;;
+  wpa-psk) t=WPA ;;
+  "" | none) t=nopass ;;
+  *) t=WPA ;;
+esac
+out="${XDG_RUNTIME_DIR:-/tmp}/wifi-qr.png"
+if [ "$t" = nopass ]; then
+  uri="WIFI:T:nopass;S:$(esc "$ssid");;"
+else
+  uri="WIFI:T:$t;S:$(esc "$ssid");P:$(esc "$psk");;"
+fi
+umask 077
+qrencode -s 8 -m 2 -o "$out" "$uri"
+echo "$out"
+# second line: the password (empty for open networks), shown under the QR
+printf '%s\n' "$psk"

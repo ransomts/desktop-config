@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Where will a dragged tiled window land? Watches Hyprland and reports the drop zone.
+
+Prints "Z <x> <y> <w> <h>" (layout pixels) whenever the zone changes while a tiled
+window is being dragged with the mouse, and "E" when the drag ends. Quickshell's
+DropPreview.qml runs this and draws the outline. Idle unless a drag is in progress.
+
+How Hyprland's dwindle layout places a dropped window (measured 2026-11-11, with
+dwindle:precise_mouse_move off): it splits the tiled window under the pointer, side by
+side if that window is wider than tall and stacked otherwise, and the dropped window
+takes the half the pointer is in. On an empty desktop it takes the whole screen.
+A drag shows up as the window turning floating (event changefloatingmode>>ADDR,1) and
+riding centred on the pointer; the drop turns it tiled again (...,0).
+"""
+import json, os, socket, sys, time
+
+BASE = "%s/hypr/%s/" % (os.environ["XDG_RUNTIME_DIR"], os.environ["HYPRLAND_INSTANCE_SIGNATURE"])
+GAP = 12          # space Hyprland leaves between two tiled windows (2 x gaps_in + 2 x border)
+EDGE = 10         # from a screen's usable edge to a window (gaps_out + border)
+
+
+def ask(cmd):
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(1)
+    s.connect(BASE + ".socket.sock")
+    s.send(cmd.encode())
+    buf = b""
+    while True:
+        d = s.recv(65536)
+        if not d:
+            break
+        buf += d
+    s.close()
+    return buf.decode(errors="replace")
+
+
+def span(m):
+    """A monitor's size in layout pixels (a rotated screen is listed unrotated)."""
+    w, h = m["width"] / m["scale"], m["height"] / m["scale"]
+    return (h, w) if m["transform"] % 2 else (w, h)
+
+
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "hypr-layouts")
+SLOT_DEFAULT = {1: "main", 2: "top", 3: "centre"}     # as in ~/.config/hypr/layouts.lua
+ORIENT = {"main": "left", "top": "top", "centre": "center"}
+
+
+def orientation(ws):
+    """Where the main window sits on this desktop, from the layout menu's saved choices."""
+    key = SLOT_DEFAULT.get(ws % 10, "main")
+    try:
+        for line in open(STATE):
+            a, _, k = line.strip().partition(" ")
+            if a == str(ws):
+                key = k
+    except OSError:
+        pass
+    return ORIENT.get(key, "left")
+
+
+def master_zone(cx, cy, tiled, t, area, orient):
+    """Main-and-stack (master:drop_at_cursor on). Dropped on the main window, the dragged
+    window becomes the main one. Dropped on a stack window, it joins the stack at that
+    place: before it, or after it when the pointer is past its middle. The centred
+    arrangement deals stack windows alternately left and right, so the slot is worked out
+    from the new order. (From reading Hyprland's behaviour, checked against recorded drags
+    for left and top; the centred case is the least certain.)"""
+    ax, ay, aw, ah = area
+    box = lambda c: (c["at"][0], c["at"][1], c["size"][0], c["size"][1])
+    main = max(tiled, key=lambda c: c["size"][0] * c["size"][1])
+    stack = [c for c in tiled if c is not main]
+    if t is main or not stack:
+        return box(main)
+    if orient in ("left", "top"):
+        ax_i = 0 if orient == "top" else 1                       # the axis the stack runs along
+        order = sorted(stack, key=lambda c: c["at"][ax_i])
+        j = order.index(t)
+        p = j + (1 if (cx, cy)[ax_i] > t["at"][ax_i] + t["size"][ax_i] / 2 else 0)
+        start = order[0]["at"][ax_i]
+        end = order[-1]["at"][ax_i] + order[-1]["size"][ax_i]
+        step = (end - start + GAP) / (len(order) + 1)
+        x, y, w, h = box(t)
+        return (start + p * step, y, step - GAP, h) if orient == "top" else (x, start + p * step, w, step - GAP)
+    # centred
+    left = sorted((c for c in stack if c["at"][0] < main["at"][0]), key=lambda c: c["at"][1])
+    right = sorted((c for c in stack if c["at"][0] > main["at"][0]), key=lambda c: c["at"][1])
+    order = []
+    for i in range(max(len(left), len(right))):
+        order += left[i:i + 1] + right[i:i + 1]
+    p = order.index(t)
+    n = len(order) + 1
+    on_left = p % 2 == 0
+    count = (n + 1) // 2 if on_left else n // 2
+    if left and right:
+        col = left[0] if on_left else right[0]
+        x, w = col["at"][0], col["size"][0]
+    else:                                                        # one stack window so far: not centred yet
+        w = aw * 0.225 - GAP / 2
+        x = ax if on_left else ax + aw - w
+    step = (ah + GAP) / count
+    return (x, ay + (p // 2) * step, w, step - GAP)
+
+
+def zone(addr):
+    """The drop zone for window `addr` right now, or None if it is not being dragged."""
+    cx, cy = (int(v) for v in ask("cursorpos").split(","))
+    clients = json.loads(ask("j/clients"))
+    me = next((c for c in clients if c["address"] == addr), None)
+    if not me or not me["floating"]:
+        return None
+    mx, my = me["at"][0] + me["size"][0] / 2, me["at"][1] + me["size"][1] / 2
+    if abs(mx - cx) > 40 or abs(my - cy) > 40:
+        return None                                   # floating, but not riding the pointer
+    mons = json.loads(ask("j/monitors"))
+    mon = next((m for m in mons if m["x"] <= cx < m["x"] + span(m)[0] and m["y"] <= cy < m["y"] + span(m)[1]), None)
+    if not mon:
+        return None
+    ws = mon["activeWorkspace"]["id"]
+    layout = next((w.get("tiledLayout") for w in json.loads(ask("j/workspaces")) if w["id"] == ws), "dwindle")
+    if layout not in ("dwindle", "master"):
+        return None                                   # the custom layouts and scrolling get no preview yet
+    tiled = [c for c in clients if c["address"] != addr and c["workspace"]["id"] == ws
+             and not c["floating"] and c["mapped"] and not c["hidden"]]
+    if any(c.get("fullscreen") for c in tiled):
+        return None
+    if not tiled:                                     # empty desktop: the whole usable screen
+        w, h = span(mon)
+        l, t, r, b = mon["reserved"]
+        return (mon["x"] + l + EDGE, mon["y"] + t + EDGE, w - l - r - 2 * EDGE, h - t - b - 2 * EDGE)
+
+    def dist(c):
+        x, y = c["at"]
+        w, h = c["size"]
+        return max(x - cx, 0, cx - (x + w)) + max(y - cy, 0, cy - (y + h))
+
+    t = min(tiled, key=dist)
+    if layout == "master":
+        w, h = span(mon)
+        l, tp, r, b = mon["reserved"]
+        area = (mon["x"] + l + EDGE, mon["y"] + tp + EDGE, w - l - r - 2 * EDGE, h - tp - b - 2 * EDGE)
+        return master_zone(cx, cy, tiled, t, area, orientation(ws))
+    x, y = t["at"]
+    w, h = t["size"]
+    if len(t.get("grouped") or []) > 1:
+        return (x, y, w, h)                           # a tab group: the window joins the group
+    if w > h:
+        half = (w - GAP) // 2
+        return (x, y, half, h) if cx < x + w / 2 else (x + w - half, y, half, h)
+    half = (h - GAP) // 2
+    return (x, y, w, half) if cy < y + h / 2 else (x, y + h - half, w, half)
+
+
+def main():
+    ev = socket.socket(socket.AF_UNIX)
+    ev.connect(BASE + ".socket2.sock")
+    for line in ev.makefile():
+        if not line.startswith("changefloatingmode>>"):
+            continue
+        addr, _, state = line.strip().split(">>", 1)[1].partition(",")
+        if state != "1":
+            continue
+        addr = "0x" + addr
+        shown, misses, started = None, 0, time.monotonic()
+        while time.monotonic() - started < 120:
+            try:
+                z = zone(addr)
+            except (OSError, ValueError, KeyError):
+                z = None
+            if z is None:
+                misses += 1
+                if misses >= 4:
+                    break                             # dropped, or it was never a drag
+            else:
+                misses = 0
+                z = tuple(int(v) for v in z)
+                if z != shown:
+                    print("Z %d %d %d %d" % z, flush=True)
+                    shown = z
+            time.sleep(1 / 30)
+        if shown is not None:
+            print("E", flush=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, BrokenPipeError):
+        sys.exit(0)

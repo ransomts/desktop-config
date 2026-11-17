@@ -1,0 +1,12 @@
+[Unit]
+Description=Apply the usual desk monitor layout when the dock is attached
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/dock-monitor-layout
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

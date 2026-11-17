@@ -1,0 +1,315 @@
+#!/bin/sh
+# Screen recording with wf-recorder, saved to ~/Videos/Recordings.
+#   screen-record region [SOUND]   # Super+R: pick a region with the mouse
+#   screen-record screen [SOUND]   # Super+Shift+R: the screen under the mouse
+#   screen-record stop             # click the red REC pill
+#   screen-record status           # waybar JSON for the REC pill (empty when idle)
+#   screen-record pick             # Super+Ctrl+R: a list of what to record and how
+#   screen-record last             # print the newest recording's path
+#   screen-record gif [FILE]       # FILE (default: the newest recording) as FILE.gif next to it
+# Either key while recording stops it.
+#
+# SOUND: --mic (the default microphone), --system (what the speakers play; also
+# --system-audio), both (mixed), --cam (the webcam bubble, Quickshell CamBubble.qml,
+# shown while recording), --none (none of these). Any of them is remembered in
+# $XDG_STATE_HOME/screen-record.json, so the plain keys reuse the last choice;
+# without any, the remembered choice applies (nothing remembered yet: the microphone).
+#
+# Mic and system together: a private null sink "screenrec-mix-PID" with one loopback
+# from the mic and one from the speakers' monitor; wf-recorder records its monitor.
+# The three pactl module ids are kept in the state file and unloaded, after checking
+# they are still ours, when the recording ends for any reason (stop, wf-recorder
+# exiting, a stale state file at the next start). The state file
+# ($XDG_RUNTIME_DIR/screen-record) is: line 1 the file being written, then key=value.
+DIR="$HOME/Videos/Recordings"
+STATE="${XDG_RUNTIME_DIR:-/tmp}/screen-record"   # line 1: the file being written; then pid=, mic=, ...
+LOG="${XDG_RUNTIME_DIR:-/tmp}/screen-record.log"
+PREFS="${XDG_STATE_HOME:-$HOME/.local/state}/screen-record.json"
+MIXPREFIX="screenrec-mix-"
+qs="$HOME/.nix-profile/bin/qs"
+
+st_get() { sed -n "s/^$1=//p" "$STATE" 2>/dev/null | head -1; }
+alive() { [ -n "$1" ] && kill -0 "$1" 2>/dev/null && tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -q wf-recorder; }
+# our recorder (pid in the state file); a state written by the old script has no pid
+running() {
+    pid=$(st_get pid)
+    if [ -n "$pid" ]; then alive "$pid"; else pgrep -x wf-recorder >/dev/null; fi
+}
+
+pref() { jq -r --arg k "$1" '.[$k] // false' "$PREFS" 2>/dev/null || echo false; }
+# true when no sound choice has been saved yet (then the microphone is the default)
+no_sound_pref() { ! jq -e 'has("mic") or has("system")' "$PREFS" >/dev/null 2>&1; }
+pref_set() {   # pref_set JQ-ARGS... FILTER
+    mkdir -p "$(dirname "$PREFS")"
+    old=$(cat "$PREFS" 2>/dev/null); [ -n "$old" ] || old='{}'
+    tmp=$(mktemp "$PREFS.XXXXXX") || return 1
+    printf '%s' "$old" | jq "$@" > "$tmp" 2>/dev/null && mv -f "$tmp" "$PREFS" || rm -f "$tmp"
+}
+
+# unload module ids, each only while `pactl list short modules` still shows it with our mix name
+unload_ours() {   # unload_ours MIXNAME ID...
+    mix=$1; shift
+    [ -n "$mix" ] || return 0
+    case "$mix" in "$MIXPREFIX"*) ;; *) return 0 ;; esac
+    list=$(pactl list short modules 2>/dev/null)
+    for id in "$@"; do
+        printf '%s\n' "$list" | awk -v id="$id" -v re="(^|[ \t])(sink_name|sink)=$mix([ \t]|$)" -F'\t' '$1 == id && $0 ~ re { f = 1 } END { exit !f }' \
+            && pactl unload-module "$id" >/dev/null 2>&1
+    done
+}
+# modules left by a recording whose state file is gone (crash, killed script): our prefix, no live owner
+sweep_orphans() {
+    pactl list short modules 2>/dev/null | awk -F'\t' -v p="$MIXPREFIX" 'index($0, p) { print $1 }' | sort -rn | while read -r id; do
+        pactl list short modules 2>/dev/null | awk -F'\t' -v id="$id" '$1 == id' | grep -o "${MIXPREFIX}[0-9]*" | head -1 | {
+            read -r name
+            owner=${name#"$MIXPREFIX"}
+            [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null && [ "$owner" != "$$" ] && exit 0   # still someone's
+            pactl unload-module "$id" >/dev/null 2>&1
+        }
+    done
+}
+
+# Undo what a recording set up: its pactl modules, the webcam bubble if it turned it on,
+# then the state file. Only when the state still belongs to recorder PID (a later
+# recording's state is left alone). Safe to run twice.
+finish() {   # finish [PID]
+    [ -f "$STATE" ] || return 0
+    if [ -n "$1" ] && [ "$(st_get pid)" != "$1" ]; then return 0; fi
+    mix=$(st_get mix); mods=$(st_get modules); camown=$(st_get camowned); f=$(head -1 "$STATE")
+    # shellcheck disable=SC2086
+    [ -n "$mods" ] && unload_ours "$mix" $mods
+    [ "$camown" = 1 ] && [ -x "$qs" ] && "$qs" ipc call cam off >/dev/null 2>&1
+    rm -f "$STATE"
+    [ -n "$f" ] && [ -s "$f" ] && pref_set --arg f "$f" '.last = $f'
+    "$HOME/.local/bin/bar-refresh" 13
+}
+
+# shellcheck disable=SC2086   # $mods is a space-separated list of ids
+undo_mix() { [ -n "$mods" ] && unload_ours "$mix" $mods; mods=""; }
+
+saved_note() {   # saved_note TITLE FILE
+    act=$(notify-send -a Recording -i video-x-generic -A open=Open -A folder="Show in folder" \
+          "$1" "${2#"$HOME"/}")
+    case "$act" in
+        open)   xdg-open "$2" ;;
+        folder) xdg-open "$(dirname "$2")" ;;
+    esac
+}
+
+stop() {
+    pid=$(st_get pid)
+    file=$(head -1 "$STATE" 2>/dev/null)
+    if [ -n "$pid" ]; then kill -INT "$pid" 2>/dev/null; else pkill -INT -x wf-recorder; fi
+    for _ in 1 2 3 4 5 6 7 8 9 10; do running || break; sleep 0.3; done
+    if [ -n "$pid" ]; then finish "$pid"; else rm -f "$STATE"; "$HOME/.local/bin/bar-refresh" 13; fi
+    [ -n "$file" ] && [ -s "$file" ] || exit 0
+    saved_note "Recording saved" "$file"
+}
+
+last() {
+    f=$(jq -r '.last // empty' "$PREFS" 2>/dev/null)
+    if [ -n "$f" ] && [ -s "$f" ] && [ "$f" != "$(head -1 "$STATE" 2>/dev/null)" ]; then printf '%s\n' "$f"; return 0; fi
+    cur=$(head -1 "$STATE" 2>/dev/null)   # never the one still being written
+    f=$(find "$DIR" -maxdepth 1 -type f \( -name '*.mp4' -o -name '*.mkv' -o -name '*.webm' \) -printf '%T@ %p\n' 2>/dev/null |
+        sort -rn | cut -d' ' -f2- | grep -vxF "${cur:-/nonexistent}" | head -1)
+    [ -n "$f" ] || return 1
+    printf '%s\n' "$f"
+}
+
+# two passes (palette, then the GIF with it), 12 fps, at most 960 px wide
+gif() {   # gif IN OUT
+    pal=$(mktemp --suffix=.png) || return 1
+    vf="fps=12,scale='min(960,iw)':-2:flags=lanczos"
+    ffmpeg -hide_banner -loglevel error -nostdin -y -i "$1" -vf "$vf,palettegen=stats_mode=diff" "$pal" &&
+    ffmpeg -hide_banner -loglevel error -nostdin -y -i "$1" -i "$pal" \
+           -lavfi "${vf}[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle" "$2"
+    r=$?; rm -f "$pal"; return $r
+}
+
+pick() {
+    while :; do
+        if running && [ -f "$STATE" ]; then
+            choice=$(printf '%s\n' "󰑊  Stop recording" "󰵸  Make a GIF of the last clip" "󰉋  Open recordings folder" |
+                "$HOME/.local/bin/qs-pick" --prompt "󰑊  " --placeholder "Recording") || exit 0
+        else
+            mic=$(pref mic); sys=$(pref system); cam=$(pref cam)
+            no_sound_pref && mic=true
+            cur=none
+            [ "$mic" = true ] && cur=mic; [ "$sys" = true ] && cur=system
+            [ "$mic" = true ] && [ "$sys" = true ] && cur=both
+            lines=""
+            for where in region screen; do
+                for snd in none mic system both; do
+                    case "$where" in region) w="󰩭  Region" ;; *) w="󰍹  This screen" ;; esac
+                    case "$snd" in
+                        none) s="no sound" ;; mic) s="󰍬 microphone" ;;
+                        system) s="󰕾 system sound" ;; both) s="󰍬 microphone + 󰕾 system" ;;
+                    esac
+                    mark=""; [ "$snd" = "$cur" ] && mark="   (last used)"
+                    lines="$lines$w, $s$mark
+"
+                done
+            done
+            if [ "$cam" = true ]; then camline="󰖠  Webcam bubble while recording: on (pick to turn off)"
+            else camline="󰖠  Webcam bubble while recording: off (pick to turn on)"; fi
+            choice=$(printf '%s%s\n%s\n%s\n' "$lines" "$camline" "󰵸  Make a GIF of the last clip" "󰉋  Open recordings folder" |
+                "$HOME/.local/bin/qs-pick" --prompt "󰑊  " --placeholder "Record") || exit 0
+        fi
+        case "$choice" in
+            *"Stop recording") stop; exit 0 ;;
+            *"Webcam bubble"*)
+                if [ "$cam" = true ]; then pref_set '.cam = false'; else pref_set '.cam = true'; fi
+                continue ;;
+            *"Make a GIF"*) exec "$0" gif ;;
+            *"Open recordings folder") mkdir -p "$DIR"; exec xdg-open "$DIR" ;;
+            *Region*|*"This screen"*)
+                case "$choice" in *Region*) mode=region ;; *) mode=screen ;; esac
+                set -- "$mode"
+                case "$choice" in
+                    *"microphone + "*) set -- "$@" --mic --system ;;
+                    *microphone*) set -- "$@" --mic ;;
+                    *"system sound"*) set -- "$@" --system ;;
+                    *) set -- "$@" --none ;;
+                esac
+                [ "$cam" = true ] && set -- "$@" --cam
+                sleep 0.4    # let the list disappear before choosing or recording
+                exec "$0" "$@" ;;
+            *) exit 0 ;;
+        esac
+    done
+}
+
+case "$1" in
+    status)
+        if running && [ -f "$STATE" ]; then
+            secs=$(( $(date +%s) - $(stat -c %Y "$STATE") ))
+            mic=$(st_get mic); sys=$(st_get system); cam=$(st_get cam)
+            glyphs=""; sound=""
+            [ "$mic" = 1 ] && glyphs="$glyphs 󰍬" && sound="microphone"
+            [ "$sys" = 1 ] && glyphs="$glyphs 󰕾" && sound="${sound:+$sound + }system sound"
+            [ "$cam" = 1 ] && glyphs="$glyphs 󰖠"
+            jq -cn --arg text "$(printf '󰑊 REC %d:%02d%s' $((secs / 60)) $((secs % 60)) "$glyphs")" \
+                --arg file "$(basename "$(head -1 "$STATE")" | sed 's/&/\&amp;/g; s/</\&lt;/g')" \
+                --arg sound "${sound:-none}" --arg cam "$([ "$cam" = 1 ] && echo on || echo off)" \
+                --argjson mic "$([ "$mic" = 1 ] && echo true || echo false)" \
+                --argjson system "$([ "$sys" = 1 ] && echo true || echo false)" \
+                '{text: $text, tooltip: "<b>Recording</b>: \($file)\nSound: \($sound)\nWebcam bubble: \($cam)\nClick: stop",
+                  class: "rec", mic: $mic, system: $system, cam: ($cam == "on")}'
+        else
+            printf '{"text":""}\n'
+        fi ;;
+    stop) running && stop ;;
+    last) last ;;
+    gif)
+        in=${2:-$(last)} || { notify-send -a Recording "No recording to turn into a GIF"; exit 1; }
+        [ -s "$in" ] || { notify-send -a Recording "No recording to turn into a GIF" "$in"; exit 1; }
+        out="${in%.*}.gif"
+        if gif "$in" "$out" && [ -s "$out" ]; then
+            printf '%s\n' "$out"
+            saved_note "GIF saved" "$out" >/dev/null 2>&1 &
+        else
+            notify-send -a Recording -u critical "Could not make the GIF" "${in#"$HOME"/}"; exit 1
+        fi ;;
+    pick) pick ;;
+    region|screen)
+        mode=$1; shift
+        given=0; mic=0; sys=0; cam=0
+        for a in "$@"; do
+            case "$a" in
+                --mic) mic=1; given=1 ;;
+                --system|--system-audio) sys=1; given=1 ;;
+                --cam) cam=1; given=1 ;;
+                --none) given=1 ;;
+                *) echo "screen-record: unknown option $a" >&2; exit 2 ;;
+            esac
+        done
+        if running; then stop; exit 0; fi
+        # a state file with no live recorder: its recording died; undo what it set up
+        if [ -f "$STATE" ]; then finish "$(st_get pid)"; rm -f "$STATE"; fi
+        sweep_orphans
+        if [ "$given" = 1 ]; then
+            pref_set --argjson m "$([ $mic = 1 ] && echo true || echo false)" \
+                     --argjson s "$([ $sys = 1 ] && echo true || echo false)" \
+                     --argjson c "$([ $cam = 1 ] && echo true || echo false)" '.mic = $m | .system = $s | .cam = $c'
+        else
+            [ "$(pref mic)" = true ] && mic=1
+            no_sound_pref && mic=1
+            [ "$(pref system)" = true ] && sys=1
+            [ "$(pref cam)" = true ] && cam=1
+        fi
+        command -v wf-recorder >/dev/null || { notify-send -a Recording -u critical "wf-recorder isn't installed" "sudo apt install wf-recorder"; exit 1; }
+        mkdir -p "$DIR"
+        file="$DIR/$(date +%Y-%m-%d_%H-%M-%S).mp4"
+        if [ "$mode" = region ]; then
+            geom=$(slurp -d) || exit 0
+            set -- -g "$geom"
+        else
+            set -- -o "$(cursor-output)"
+        fi
+
+        # ---- sound ----
+        mix=""; mods=""
+        trap 'undo_mix; exit 1' HUP INT TERM
+        if [ "$mic" = 1 ]; then
+            src=$(pactl get-default-source 2>/dev/null)
+            [ -n "$src" ] || { notify-send -a Recording -u critical "Recording didn't start" "No microphone found"; exit 1; }
+        fi
+        if [ "$sys" = 1 ]; then
+            sink=$(pactl get-default-sink 2>/dev/null)
+            [ -n "$sink" ] || { notify-send -a Recording -u critical "Recording didn't start" "No speakers (output) found"; exit 1; }
+        fi
+        if [ "$mic" = 1 ] && [ "$sys" = 1 ]; then
+            mix="$MIXPREFIX$$"
+            load() {   # load MODULE ARGS... : load a module, remember its id; on failure undo everything
+                id=$(pactl load-module "$@" 2>>"$LOG") && [ -n "$id" ] || {
+                    undo_mix; notify-send -a Recording -u critical "Recording didn't start" "Could not mix the microphone and system sound"; exit 1; }
+                mods="${mods:+$mods }$id"
+            }
+            load module-null-sink "sink_name=$mix" "sink_properties=device.description=Screen-recording-mix priority.session=0"
+            load module-loopback "source=$src" "sink=$mix" latency_msec=30 source_dont_move=true sink_dont_move=true
+            load module-loopback "source=$sink.monitor" "sink=$mix" latency_msec=30 source_dont_move=true sink_dont_move=true
+            # a new sink can be made the default by the session manager: put the old one back
+            [ "$(pactl get-default-sink 2>/dev/null)" = "$sink" ] || pactl set-default-sink "$sink" 2>/dev/null
+            set -- "$@" "--audio=$mix.monitor"
+        elif [ "$mic" = 1 ]; then
+            set -- "$@" "--audio=$src"
+        elif [ "$sys" = 1 ]; then
+            set -- "$@" "--audio=$sink.monitor"
+        fi
+
+        # ---- webcam bubble ----
+        camown=0
+        if [ "$cam" = 1 ] && [ -x "$qs" ]; then
+            if ! "$qs" ipc call cam status 2>/dev/null | grep -q '"shown": *true'; then
+                "$qs" ipc call cam on >/dev/null 2>&1 && camown=1
+            fi
+        fi
+
+        # The recorder runs under a small waiting shell: when it exits for any reason, the
+        # shell undoes the setup (finish only acts while the state is still this recording's).
+        extra="mic=$mic
+system=$sys
+cam=$cam
+camowned=$camown
+mix=$mix
+modules=$mods"
+        : > "$LOG"
+        (
+            trap '' HUP
+            wf-recorder "$@" -f "$file" >>"$LOG" 2>&1 &
+            p=$!
+            printf '%s\npid=%s\n%s\n' "$file" "$p" "$extra" > "$STATE.tmp" && mv -f "$STATE.tmp" "$STATE"
+            wait "$p"
+            finish "$p"
+        ) </dev/null >/dev/null 2>&1 &
+        trap - HUP INT TERM
+        sleep 0.5
+        if running; then
+            "$HOME/.local/bin/bar-refresh" 13
+        else
+            undo_mix
+            [ "$camown" = 1 ] && "$qs" ipc call cam off >/dev/null 2>&1
+            rm -f "$STATE"; notify-send -a Recording -u critical "Recording didn't start"
+        fi ;;
+    *) echo "usage: screen-record region|screen [--mic] [--system] [--cam] [--none] | stop | status | pick | last | gif [FILE]" >&2; exit 2 ;;
+esac

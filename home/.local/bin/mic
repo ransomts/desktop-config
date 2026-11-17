@@ -1,0 +1,39 @@
+#!/bin/sh
+# The default microphone: mute key and push-to-talk.
+#   mic toggle    # Super+Ctrl+M: mute / unmute, with the `osd mic` popup
+#   mic ptt-down  # Super+Ctrl+Space pressed: talk (unmutes; remembers it was muted)
+#   mic ptt-up    # Super+Ctrl+Space released: muted again if it was muted before
+#   mic status    # {"muted": true|false, "ptt": true|false}
+# Push-to-talk keeps "$XDG_RUNTIME_DIR/mic-ptt" while the key is held: it holds
+# "muted" when the press unmuted the mic (the release mutes it again) or "open"
+# when it was already on (the release leaves it on). A repeated press while held
+# does not overwrite it.
+PTT="${XDG_RUNTIME_DIR:-/tmp}/mic-ptt"
+SRC=@DEFAULT_AUDIO_SOURCE@
+osd="$HOME/.local/bin/osd"
+
+muted() { wpctl get-volume "$SRC" 2>/dev/null | grep -q MUTED; }
+
+case "$1" in
+    toggle)
+        wpctl set-mute "$SRC" toggle && "$osd" mic
+        rm -f "$PTT" ;;            # a toggle while holding the key wins over the release
+    ptt-down)
+        [ -f "$PTT" ] && exit 0    # key repeat
+        if muted; then
+            echo muted > "$PTT"
+            wpctl set-mute "$SRC" 0 && "$osd" mic
+        else
+            echo open > "$PTT"
+        fi ;;
+    ptt-up)
+        [ -f "$PTT" ] || exit 0
+        was=$(cat "$PTT"); rm -f "$PTT"
+        [ "$was" = muted ] && wpctl set-mute "$SRC" 1 && "$osd" mic
+        exit 0 ;;
+    status)
+        if muted; then m=true; else m=false; fi
+        if [ -f "$PTT" ]; then p=true; else p=false; fi
+        printf '{"muted": %s, "ptt": %s}\n' "$m" "$p" ;;
+    *) echo "usage: mic toggle | ptt-down | ptt-up | status" >&2; exit 2 ;;
+esac

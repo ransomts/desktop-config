@@ -1,0 +1,552 @@
+#!/usr/bin/env python3
+"""palette: one colour plan for the whole Hyprland rice.
+
+The hand-made Clemson colours are the plan called `clemson`. They live as master copies
+of every themed file in ~/.config/palette/masters/ and are never changed by a generator.
+A generated plan is only two colours (a primary that stands in for Clemson orange and a
+secondary that stands in for Regalia purple). Using a plan rewrites the colour values in
+the themed files: orange-family colours turn to the primary's hue, purple-family colours
+to the secondary's, and every colour keeps its brightness, so text contrast stays what it
+was by hand. Status colours (red, green, amber) and the terminal's ANSI colours are left.
+
+  palette status                       which plan is live, which files it manages
+  palette list                         the plans
+  palette new NAME --seed '#3b82f6'    make a plan from one colour
+        [--alt '#hex']                   ...and choose the secondary yourself
+        [--scheme interval|complement|analogous|triad|mono]   or how to derive it
+  palette new NAME --image FILE        make a plan from a picture's two main colours
+  palette new NAME --random
+  palette preview NAME [-o FILE.png]   draw the plan next to clemson, with contrast numbers
+  palette use NAME [--dry-run]         rewrite the themed files
+  palette restore                      back to clemson (same as: palette use clemson)
+  palette show '#f56600' [NAME]        what one colour becomes
+  palette rm NAME
+
+  palette follow [status]              is a plan chosen by itself, and which one it would be now
+  palette follow scene|time|off        follow the wallpaper scene, the time of day, or nothing (default off)
+  palette follow set SCENE PLAN        the plan for one scene (follow.json; every scene starts as clemson)
+  palette follow set HH:MM PLAN        from this time of day on, this plan (time mode)
+  palette follow unset HH:MM           drop a time
+  palette follow apply [--scene NAME] [--at HH:MM] [--dry-run]
+                                       use the plan the table gives now, if it is not the live one
+                                       (the wallpaper calls this 5 s after a scene change)
+
+Editing a themed file by hand is fine under any plan: the next `palette use` notices,
+takes the edit back into the master copy (colours turned back to Clemson), then goes on.
+"""
+import argparse, colorsys, hashlib, json, math, os, pwd, random, re, subprocess, sys, tarfile, time
+
+HOME = os.path.expanduser("~")
+ROOT = os.path.join(HOME, ".config/palette")
+MASTERS = os.path.join(ROOT, "masters")
+PLANS = os.path.join(ROOT, "plans")
+STATE = os.path.join(ROOT, "state.json")
+MANIFEST = os.path.join(ROOT, "files.json")
+FOLLOW = os.path.join(ROOT, "follow.json")          # scene -> plan, and HH:MM -> plan
+FOLLOW_MODE = os.path.join(ROOT, "follow-mode")     # one word (scene | time | off), read by the shell without running this
+STATE_HOME = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state")
+# the wallpaper's scenes (WallState.qml `scenes`)
+SCENES = ["silk", "aurora", "contours", "ink", "ridges", "sky", "terrain", "flow", "ripples", "field", "pulsar", "depths"]
+
+# Files whose colours follow the plan (paths under ~). `bare`: the file also writes colours
+# without a leading # (rgb(f56600), f56600ff); those are only touched when they are one of
+# the plan's known colours.
+DEFAULT_FILES = [
+    {"path": ".config/quickshell/Theme.qml"},
+    {"path": ".config/quickshell/palettes.js"},
+    {"path": ".config/hypr/hyprland.lua", "bare": True},
+    {"path": ".config/hypr/hyprlock.conf", "bare": True},
+    {"path": ".config/ghostty/themes/Clemson Dark", "skip": r"^palette = (?!208=)"},
+    {"path": ".config/ghostty/themes/Clemson Light", "skip": r"^palette = (?!208=)"},
+    {"path": ".config/fuzzel/colors-dark.ini", "bare": True},
+    {"path": ".config/fuzzel/colors-light.ini", "bare": True},
+    {"path": ".config/gtk-3.0/accent-dark.css"},
+    {"path": ".config/gtk-3.0/accent-light.css"},
+    {"path": ".config/gtk-4.0/accent-dark.css"},
+    {"path": ".config/gtk-4.0/accent-light.css"},
+    {"path": ".config/btop/themes/clemson-dark.theme"},
+    {"path": ".config/btop/themes/clemson-light.theme"},
+    {"path": ".config/cava/config"},
+    {"path": ".config/lazygit/config.yml"},
+    {"path": ".config/mpv/mpv.conf"},
+    {"path": ".config/mpv/script-opts/uosc.conf", "bare": True},
+    {"path": ".config/git/config"},
+    {"path": ".config/drift/config.toml"},
+    {"path": ".mozilla/firefox/idcdk0p9.default-release/chrome/userChrome.css"},
+]
+
+ORANGE, PURPLE = "f56600", "522d80"
+# Colours that mean something by themselves and never follow the plan.
+KEEP = set("""000000 ffffff
+e5484d d13438 cc6666 c82829 cc3333
+7fb069 3f7d2c b5bd68 718c00 5fb36a
+f5a623 a86200 f0c674 b58900 d3b56a 4d3409
+81a2be 4271ae 8abeb7 3e999f b294bb 8959a8""".split())
+
+# ---------------------------------------------------------------- colour maths (OKLCH)
+def hex2rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+
+def rgb2hex(rgb):
+    return "".join("%02x" % max(0, min(255, round(c * 255))) for c in rgb)
+
+def lin(c): return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+def unlin(c): return 12.92 * c if c <= 0.0031308 else 1.055 * c ** (1 / 2.4) - 0.055
+
+def rgb2oklch(rgb):
+    r, g, b = (lin(c) for c in rgb)
+    l = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b) ** (1 / 3)
+    m = (0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b) ** (1 / 3)
+    s = (0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b) ** (1 / 3)
+    L = 0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s
+    a = 1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s
+    bb = 0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s
+    return L, math.hypot(a, bb), math.degrees(math.atan2(bb, a)) % 360
+
+def oklch2lin(L, C, h):
+    a, b = C * math.cos(math.radians(h)), C * math.sin(math.radians(h))
+    l = (L + 0.3963377774 * a + 0.2158037573 * b) ** 3
+    m = (L - 0.1055613458 * a - 0.0638541728 * b) ** 3
+    s = (L - 0.0894841775 * a - 1.2914855480 * b) ** 3
+    return (4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+            -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+            -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s)
+
+def in_gamut(lrgb): return all(-0.0005 <= c <= 1.0005 for c in lrgb)
+
+def fit(L, C, h):
+    """Linear rgb for L,C,h with the chroma pulled in until it is a real screen colour."""
+    lo, hi = 0.0, C
+    if in_gamut(oklch2lin(L, C, h)): return oklch2lin(L, C, h)
+    for _ in range(18):
+        mid = (lo + hi) / 2
+        if in_gamut(oklch2lin(L, mid, h)): lo = mid
+        else: hi = mid
+    return oklch2lin(L, lo, h)
+
+def lum(lrgb): return 0.2126 * lrgb[0] + 0.7152 * lrgb[1] + 0.0722 * lrgb[2]
+def luminance(hexc): return lum([lin(c) for c in hex2rgb(hexc)])
+def contrast(a, b):
+    x, y = sorted((luminance(a), luminance(b)), reverse=True)
+    return (x + 0.05) / (y + 0.05)
+
+def with_luminance(Y, C, h):
+    """The colour of hue h, chroma up to C, whose luminance is Y (so contrast is unchanged)."""
+    lo, hi = 0.0, 1.0
+    for _ in range(26):
+        mid = (lo + hi) / 2
+        if lum(fit(mid, C, h)) < Y: lo = mid
+        else: hi = mid
+    return rgb2hex([unlin(max(0, min(1, c))) for c in fit((lo + hi) / 2, C, h)])
+
+def hue_gap(a, b): return (a - b + 180) % 360 - 180
+
+A_ORANGE, A_PURPLE = rgb2oklch(hex2rgb(ORANGE)), rgb2oklch(hex2rgb(PURPLE))
+
+def recolour(src, plan):
+    """One Clemson colour (rrggbb) under a plan."""
+    src = src.lower()
+    if plan.get("identity"): return src
+    ov = plan.get("overrides", {})
+    if src in ov or "#" + src in ov: return (ov.get(src) or ov.get("#" + src)).lstrip("#").lower()
+    if src in KEEP: return src
+    L, C, h = rgb2oklch(hex2rgb(src))
+    do, dp = abs(hue_gap(h, A_ORANGE[2])), abs(hue_gap(h, A_PURPLE[2]))
+    if C >= 0.035 and min(do, dp) > 62: return src            # a green or a blue: not ours
+    anchor, target = (A_ORANGE, plan["primary"]) if do <= dp else (A_PURPLE, plan["secondary"])
+    tL, tC, th = rgb2oklch(hex2rgb(target))
+    if C < 0.035:                                             # greys keep their faint tint, turned with their family
+        if plan.get("neutral", "tint") == "keep": return src
+        return with_luminance(luminance(src), C, h + hue_gap(th, anchor[2]))
+    ratio = max(0.25, min(1.25, tC / anchor[1]))
+    return with_luminance(luminance(src), C * ratio, h + hue_gap(th, anchor[2]))
+
+# ---------------------------------------------------------------- files
+HASHED = re.compile(r"#([0-9a-fA-F]{6})([0-9a-fA-F]{2})?(?![0-9a-fA-F])")
+BARE = re.compile(r"(?<![0-9a-fA-F#\-.\w])([0-9a-fA-F]{6})([0-9a-fA-F]{2})?(?![0-9a-fA-F\-\w])")
+
+def files():
+    if os.path.exists(MANIFEST): return json.load(open(MANIFEST))
+    return DEFAULT_FILES
+
+def master_path(f): return os.path.join(MASTERS, f["path"])
+def live_path(f): return os.path.join(HOME, f["path"])
+def read(p):
+    with open(p, encoding="utf-8") as fh: return fh.read()
+def sha(text): return hashlib.sha256(text.encode()).hexdigest()
+
+def tokens(text, f):
+    """Every colour written in a file: (start, end, rrggbb). Lines matching `skip` are left out."""
+    skip = re.compile(f["skip"]) if f.get("skip") else None
+    out, pos = [], 0
+    for line in text.splitlines(keepends=True):
+        if not (skip and skip.search(line)):
+            for m in HASHED.finditer(line): out.append((pos + m.start(1), pos + m.end(1), m.group(1), True))
+            if f.get("bare"):
+                for m in BARE.finditer(line): out.append((pos + m.start(1), pos + m.end(1), m.group(1), False))
+        pos += len(line)
+    return sorted(out)
+
+def known_colours():
+    """Clemson colours written with a # anywhere in the masters: the ones a bare token may be."""
+    seen = set()
+    for f in files():
+        if os.path.exists(master_path(f)):
+            for _, _, c, hashed in tokens(read(master_path(f)), f):
+                if hashed: seen.add(c.lower())
+    return seen | {ORANGE, PURPLE}
+
+def table(plan):
+    """clemson rrggbb -> plan rrggbb for every known colour, with no two landing on one value
+    (so a file can always be turned back)."""
+    out, used = {}, set()
+    for c in sorted(known_colours()):
+        v = recolour(c, plan)
+        while v in used and v != c:
+            n = int(v, 16); v = "%06x" % (n + 1 if n & 0xff < 0xff else n - 1)
+        out[c] = v; used.add(v)
+    return out
+
+def rewrite(text, f, mapping):
+    out, last = [], 0
+    for a, b, c, hashed in tokens(text, f):
+        if a < last: continue
+        v = mapping.get(c.lower())
+        if v is None: continue
+        out.append(text[last:a]); out.append(v.upper() if c.isupper() else v); last = b
+    out.append(text[last:])
+    return "".join(out)
+
+def load_plan(name):
+    if name == "clemson": return {"name": "clemson", "identity": True, "primary": "#" + ORANGE, "secondary": "#" + PURPLE}
+    p = os.path.join(PLANS, name + ".json")
+    if not os.path.exists(p): sys.exit("palette: no plan called %r (see: palette list)" % name)
+    return json.load(open(p))
+
+def state():
+    return json.load(open(STATE)) if os.path.exists(STATE) else {"plan": "clemson", "written": {}}
+
+def save_state(st):
+    os.makedirs(ROOT, exist_ok=True)
+    tmp = STATE + ".tmp"
+    json.dump(st, open(tmp, "w"), indent=1, sort_keys=True); os.replace(tmp, STATE)
+
+def write(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".palette-tmp"
+    with open(tmp, "w", encoding="utf-8") as fh: fh.write(text)
+    if os.path.exists(path): os.chmod(tmp, os.stat(path).st_mode & 0o777)
+    os.replace(tmp, path)
+
+def adopt(st, quiet=False):
+    """Take hand edits of the live files back into the masters (in Clemson colours)."""
+    back = {v: k for k, v in table(load_plan(st["plan"])).items()}
+    n = 0
+    for f in files():
+        lp, mp = live_path(f), master_path(f)
+        if not os.path.exists(lp): continue
+        text = read(lp)
+        if os.path.exists(mp) and st["written"].get(f["path"]) == sha(text): continue
+        write(mp, rewrite(text, f, back)); n += 1
+        if not quiet: print("  took your edit of ~/%s into its master copy" % f["path"])
+    return n
+
+def cmd_init(args):
+    """First run: the files as they are now become the clemson masters, plus a dated archive."""
+    st = state()
+    if os.path.isdir(MASTERS) and not args.force: sys.exit("palette: already set up (masters exist)")
+    os.makedirs(PLANS, exist_ok=True)
+    if not os.path.exists(MANIFEST): json.dump(DEFAULT_FILES, open(MANIFEST, "w"), indent=1)
+    arch = os.path.join(ROOT, "clemson-backup-%s.tar.gz" % time.strftime("%Y-%m-%d"))
+    with tarfile.open(arch, "w:gz") as tar:
+        for f in files():
+            if os.path.exists(live_path(f)): tar.add(live_path(f), arcname=f["path"])
+    os.chmod(arch, 0o444)
+    st = {"plan": "clemson", "written": {}}
+    for f in files():
+        if not os.path.exists(live_path(f)): print("  (missing, skipped) ~/" + f["path"]); continue
+        text = read(live_path(f)); write(master_path(f), text); st["written"][f["path"]] = sha(text)
+    save_state(st)
+    print("masters in %s\narchive  %s" % (MASTERS, arch))
+
+def cmd_use(args):
+    st = state(); plan = load_plan(args.name)
+    if not args.dry_run: adopt(st)
+    mapping = table(plan); changed = []
+    for f in files():
+        mp, lp = master_path(f), live_path(f)
+        if not os.path.exists(mp): continue
+        text = rewrite(read(mp), f, mapping)
+        if not os.path.exists(lp) or read(lp) != text:
+            changed.append(f["path"])
+            if not args.dry_run: write(lp, text)
+        if not args.dry_run: st["written"][f["path"]] = sha(text)
+    if args.dry_run:
+        print("would rewrite %d of %d files:" % (len(changed), len(files())))
+        for c in changed: print("  ~/" + c)
+        return
+    st["plan"] = plan["name"]; save_state(st)
+    print("plan %s: %d files rewritten" % (plan["name"], len(changed)))
+    if changed: after(changed)
+
+def after(changed):
+    """Nudge the programs that do not watch their files."""
+    run = lambda *c: subprocess.run(c, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+    # pointed at another home (tests: HOME=/some/tmp): the live Hyprland and shell are not that home's
+    if os.path.realpath(HOME) != os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir):
+        print("  (HOME is not your home: no reload)"); return
+    try:
+        if any("quickshell/" in c for c in changed):
+            os.utime(os.path.join(HOME, ".config/quickshell/shell.qml"))     # Quickshell reloads on a change
+        if any("hyprland.lua" in c for c in changed) and os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+            run("hyprctl", "reload")
+    except Exception as e:
+        print("  (could not nudge: %s)" % e)
+    print("Live now: bar, panels, wallpaper, window borders, new btop/lazygit/mpv/fuzzel windows.\n"
+          "Ghostty: Ctrl+Shift+, in each window. GTK apps and Firefox: on their next start.")
+
+def cmd_status(args):
+    st = state(); stale = []
+    for f in files():
+        lp = live_path(f)
+        if os.path.exists(lp) and st["written"].get(f["path"]) != sha(read(lp)): stale.append(f["path"])
+    p = load_plan(st["plan"])
+    print("plan: %s  (primary %s, secondary %s)" % (st["plan"], p["primary"], p["secondary"]))
+    print("%d files managed" % len(files()))
+    for s in stale: print("  edited by hand since the last run: ~/" + s)
+
+def cmd_list(args):
+    cur = state()["plan"]
+    names = ["clemson"] + sorted(n[:-5] for n in os.listdir(PLANS) if n.endswith(".json")) if os.path.isdir(PLANS) else ["clemson"]
+    for n in names:
+        p = load_plan(n)
+        print("%s %-16s primary %s  secondary %s  %s" % ("*" if n == cur else " ", n, p["primary"], p["secondary"], p.get("from", "the hand-made plan")))
+
+def from_image(path):
+    from PIL import Image
+    im = Image.open(path).convert("RGB"); im.thumbnail((160, 160))
+    q = im.quantize(12, method=Image.Quantize.MEDIANCUT)
+    pal = q.getpalette(); cands = []
+    for count, idx in q.getcolors():
+        rgb = tuple(c / 255 for c in pal[idx * 3:idx * 3 + 3]); L, C, h = rgb2oklch(rgb)
+        if C > 0.04 and 0.2 < L < 0.92: cands.append((count * C * C, rgb2hex(rgb), h))
+    cands.sort(reverse=True)
+    if not cands: sys.exit("palette: that picture has no colour to speak of; use --seed")
+    first = cands[0]
+    second = next((c for c in cands[1:] if abs(hue_gap(c[2], first[2])) >= 40), None)
+    return "#" + first[1], ("#" + second[1]) if second else None
+
+def cmd_new(args):
+    if args.name == "clemson": sys.exit("palette: clemson is the hand-made plan; pick another name")
+    src, alt = "", args.alt
+    if args.image: seed, found = from_image(args.image); alt = alt or found; src = "from " + os.path.basename(args.image)
+    elif args.random:
+        r = random.Random(); seed = "#" + rgb2hex(colorsys.hls_to_rgb(r.random(), 0.55, 0.85)); src = "random"
+    elif args.seed: seed = args.seed; src = "from seed " + seed
+    else: sys.exit("palette: give --seed '#hex', --image FILE or --random")
+    if not re.fullmatch(r"#?[0-9a-fA-F]{6}", seed): sys.exit("palette: a seed looks like '#3b82f6'")
+    seed = "#" + seed.lstrip("#").lower()
+    if not alt:
+        L, C, h = rgb2oklch(hex2rgb(seed))
+        turn = {"interval": hue_gap(A_PURPLE[2], A_ORANGE[2]), "complement": 180, "analogous": -40, "triad": 120, "mono": 0}[args.scheme]
+        pL, pC, _ = A_PURPLE
+        alt = "#" + rgb2hex([unlin(max(0, min(1, c))) for c in fit(pL, max(pC * 0.8, min(C, pC * 1.2)), h + turn)])
+        src += ", secondary by %s" % args.scheme
+    plan = {"name": args.name, "primary": seed, "secondary": "#" + alt.lstrip("#").lower(), "neutral": "tint",
+            "from": src, "overrides": {}}
+    os.makedirs(PLANS, exist_ok=True)
+    json.dump(plan, open(os.path.join(PLANS, args.name + ".json"), "w"), indent=1)
+    print("plan %s: primary %s, secondary %s (%s)" % (args.name, plan["primary"], plan["secondary"], src))
+    print("look first: palette preview %s      then: palette use %s" % (args.name, args.name))
+
+def cmd_rm(args):
+    if state()["plan"] == args.name: sys.exit("palette: %s is live; `palette restore` first" % args.name)
+    os.remove(os.path.join(PLANS, args.name + ".json"))
+
+def cmd_show(args):
+    plan = load_plan(args.name or state()["plan"]); c = args.colour.lstrip("#").lower()
+    print("#%s -> #%s under %s" % (c, recolour(c, plan), plan["name"]))
+
+# ---------------------------------------------------------------- follow: a plan chosen by itself
+# Opt-in. `palette use` reloads Hyprland and Quickshell, and Ghostty windows keep their old
+# colours until Ctrl+Shift+, so nothing changes unless the table names another plan.
+def plan_exists(name):
+    return name == "clemson" or os.path.exists(os.path.join(PLANS, name + ".json"))
+
+def follow_table():
+    t = {"scenes": {s: "clemson" for s in SCENES}, "times": [["00:00", "clemson"]]}
+    if os.path.exists(FOLLOW):
+        try:
+            got = json.load(open(FOLLOW))
+            t["scenes"].update(got.get("scenes", {}))
+            if got.get("times"): t["times"] = [list(x) for x in got["times"]]
+        except (ValueError, AttributeError) as e:
+            sys.exit("palette: %s is not valid (%s); nothing changed" % (FOLLOW, e))
+    t["times"].sort()
+    return t
+
+def save_follow(t):
+    os.makedirs(ROOT, exist_ok=True)
+    tmp = FOLLOW + ".tmp"
+    json.dump(t, open(tmp, "w"), indent=1, sort_keys=True); os.replace(tmp, FOLLOW)
+
+def follow_mode(st=None):
+    m = (st or state()).get("follow", "off")
+    return m if m in ("scene", "time", "off") else "off"
+
+def write_mode(m):
+    # written in place, not renamed over: the shell watches this file, and a watch can lose a renamed file
+    os.makedirs(ROOT, exist_ok=True)
+    with open(FOLLOW_MODE, "w") as fh: fh.write(m + "\n")
+
+def hhmm(v):
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", v or "")
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59: return None
+    return "%02d:%02d" % (int(m.group(1)), int(m.group(2)))
+
+def wallpaper_scene():
+    try: return json.load(open(os.path.join(STATE_HOME, "wallpaper.json"))).get("scene", "silk")
+    except (OSError, ValueError, AttributeError): return "silk"      # WallState's default
+
+def resolve(t, mode, scene=None, at=None):
+    """(plan name, why) the table gives now, or (None, why)."""
+    if mode == "scene":
+        scene = scene or wallpaper_scene()
+        p = t["scenes"].get(scene)
+        return (p, "scene " + scene) if p else (None, "scene %s is not in the table" % scene)
+    if mode == "time":
+        now = at or time.strftime("%H:%M")
+        times = t["times"]
+        if not times: return None, "no times in the table"
+        pick = [x for x in times if x[0] <= now]
+        hit = pick[-1] if pick else times[-1]                # before the first time: last night's
+        return hit[1], "time %s (from %s)" % (now, hit[0])
+    return None, "follow is off"
+
+def cmd_follow(args):
+    st = state(); t = follow_table(); what = args.what or "status"
+    if what in ("scene", "time", "off"):
+        st["follow"] = what; save_state(st); write_mode(what)
+        print("follow: %s" % what)
+        if what != "off":
+            p, why = resolve(t, what)
+            print("  now: %s (%s); run `palette follow apply` to use it" % (p or "no change", why))
+        return
+    if what == "status":
+        mode = follow_mode(st)
+        print("follow: %s   live plan: %s" % (mode, st["plan"]))
+        print("scenes: " + "  ".join("%s=%s" % (k, v) for k, v in sorted(t["scenes"].items())))
+        print("times:  " + "  ".join("%s=%s" % (a, b) for a, b in t["times"]))
+        for m in ("scene", "time"):
+            p, why = resolve(t, m)
+            print("  by %-5s now: %s (%s)" % (m, p or "-", why))
+        return
+    if what in ("set", "unset"):
+        key = args.key
+        if not key: sys.exit("palette: follow %s needs a scene or HH:MM" % what)
+        if what == "set":
+            if not args.plan: sys.exit("palette: follow set KEY PLAN")
+            if not plan_exists(args.plan): sys.exit("palette: no plan called %r (see: palette list); nothing changed" % args.plan)
+        tm = hhmm(key)
+        if tm:
+            times = [x for x in t["times"] if x[0] != tm]
+            if what == "set": times.append([tm, args.plan])
+            elif len(times) == len(t["times"]): sys.exit("palette: no time %s in the table" % tm)
+            t["times"] = sorted(times)
+        elif key in SCENES:
+            if what == "unset": sys.exit("palette: a scene always has a plan; set it to clemson instead")
+            t["scenes"][key] = args.plan
+        else:
+            sys.exit("palette: %r is neither a scene (%s) nor HH:MM; nothing changed" % (key, " ".join(SCENES)))
+        save_follow(t)
+        print("follow: %s -> %s" % (tm or key, args.plan if what == "set" else "(removed)"))
+        return
+    if what == "apply":
+        mode = follow_mode(st)
+        if args.at and not hhmm(args.at): sys.exit("palette: --at wants HH:MM")
+        if mode == "off": print("follow is off: nothing to do"); return
+        p, why = resolve(t, mode, args.scene, hhmm(args.at) if args.at else None)
+        if not p: print("follow: no plan for %s; nothing changed" % why); return
+        if not plan_exists(p): sys.exit("palette: follow.json names %r for %s, and there is no such plan; nothing changed" % (p, why))
+        if p == st["plan"]: print("follow: %s already live (%s)" % (p, why)); return
+        print("follow: %s -> %s (%s)" % (st["plan"], p, why))
+        cmd_use(argparse.Namespace(name=p, dry_run=args.dry_run))
+        return
+    sys.exit("palette: follow scene|time|off|status|set|unset|apply")
+
+# what has to stay readable: (label, text colour, background colour), in Clemson colours
+PAIRS = [("dark  text on background", "e6e1dc", "16161a"), ("dark  accent text", "f56600", "16161a"),
+         ("dark  ink on accent fill", "16161a", "f56600"), ("dark  faint captions", "8a8580", "16161a"),
+         ("light text on background", "26262b", "f6f3ee"), ("light accent text", "522d80", "f6f3ee"),
+         ("light ink on accent fill", "16161a", "f56600"), ("light text on secondary", "f6f3ee", "522d80")]
+
+def cmd_preview(args):
+    from PIL import Image, ImageDraw, ImageFont
+    plan = load_plan(args.name); base = load_plan("clemson")
+    try:
+        fp = subprocess.run(["fc-match", "-f", "%{file}", "FiraCode Nerd Font:bold"], capture_output=True, text=True, timeout=5).stdout
+        font, small = ImageFont.truetype(fp, 15), ImageFont.truetype(fp, 12)
+    except Exception:
+        font = small = ImageFont.load_default()
+    W, H = 1180, 560
+    img = Image.new("RGB", (W, H), "#101010"); d = ImageDraw.Draw(img)
+    ramp_src = {"dark": ["16161a", "1d1830", "6f6190", "7a4fb0", "f56600"], "light": ["44266c", "583392", "b9a5d8", "e9dcf2", "ff8f2e"]}
+    for col, p in enumerate((base, plan)):
+        x0 = 10 + col * (W // 2)
+        c = lambda h: "#" + recolour(h, p)
+        d.text((x0, 8), p["name"], fill="#ffffff", font=font)
+        for row, mode in enumerate(("dark", "light")):
+            y0 = 36 + row * 190; w = W // 2 - 20
+            bg, fg = ("16161a", "e6e1dc") if mode == "dark" else ("f6f3ee", "26262b")
+            acc = "f56600" if mode == "dark" else "522d80"
+            r = ramp_src[mode]
+            for i in range(w):                                 # the wallpaper's colour ramp behind everything
+                t = i / w * 4; k = min(3, int(t)); a, b = hex2rgb(recolour(r[k], p)), hex2rgb(recolour(r[k + 1], p))
+                d.line([(x0 + i, y0), (x0 + i, y0 + 180)], fill="#" + rgb2hex([a[j] + (b[j] - a[j]) * (t - k) for j in range(3)]))
+            d.rounded_rectangle([x0 + 12, y0 + 12, x0 + w - 12, y0 + 46], 12, fill=c(bg))                # bar
+            d.rounded_rectangle([x0 + 20, y0 + 18, x0 + 46, y0 + 40], 8, fill=c("f56600")); d.text((x0 + 29, y0 + 20), "1", fill=c("16161a"), font=font)
+            d.text((x0 + 60, y0 + 20), "2", fill=c("595959" if mode == "dark" else "8c8782"), font=font)
+            d.text((x0 + 150, y0 + 20), "Thu Nov 12  08:16", fill=c(acc), font=font)
+            d.text((x0 + 350, y0 + 20), "wired   60%", fill=c(fg), font=font)
+            d.rounded_rectangle([x0 + 12, y0 + 60, x0 + 300, y0 + 168], 10, fill=c(bg), outline=c("f56600"), width=2)   # a window
+            d.text((x0 + 24, y0 + 70), "Text on the background", fill=c(fg), font=small)
+            d.text((x0 + 24, y0 + 90), "small captions", fill=c("8a8580" if mode == "dark" else "8c8782"), font=small)
+            d.text((x0 + 24, y0 + 110), "accent text", fill=c(acc), font=small)
+            d.rounded_rectangle([x0 + 24, y0 + 134, x0 + 130, y0 + 158], 8, fill=c("f56600")); d.text((x0 + 36, y0 + 138), "Button", fill=c("16161a"), font=small)
+            d.rounded_rectangle([x0 + 140, y0 + 134, x0 + 286, y0 + 158], 8, fill=c("522d80")); d.text((x0 + 152, y0 + 138), "Critical note", fill=c("e6e1dc"), font=small)
+            for i, s in enumerate(("e5484d", "f5a623", "7fb069")):                                    # status colours (kept)
+                d.ellipse([x0 + 320 + i * 26, y0 + 70, x0 + 338 + i * 26, y0 + 88], fill=c(s))
+            d.rounded_rectangle([x0 + 320, y0 + 100, x0 + w - 12, y0 + 168], 10, fill=c("522d80"), outline=c("522d80"))
+            d.text((x0 + 332, y0 + 108), "floating window border,", fill=c("f6f3ee"), font=small)
+            d.text((x0 + 332, y0 + 126), "secondary fills", fill=c("f6f3ee"), font=small)
+        y = 36 + 2 * 190 + 6
+        for label, a, b in PAIRS:
+            ra = contrast(recolour(a, p), recolour(b, p))
+            d.text((x0, y), "%-26s %5.1f : 1 %s" % (label, ra, "" if ra >= 3 else " LOW"), fill="#dddddd" if ra >= 3 else "#ff6666", font=small); y += 17
+    out = args.out or os.path.join(ROOT, "preview-%s.png" % plan["name"])
+    img.save(out); print(out)
+    for label, a, b in PAIRS:
+        print("  %-26s clemson %4.1f   %s %4.1f" % (label, contrast(a, b), plan["name"], contrast(recolour(a, plan), recolour(b, plan))))
+
+def main():
+    ap = argparse.ArgumentParser(prog="palette", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("init"); p.add_argument("--force", action="store_true"); p.set_defaults(fn=cmd_init)
+    sub.add_parser("status").set_defaults(fn=cmd_status)
+    sub.add_parser("list").set_defaults(fn=cmd_list)
+    p = sub.add_parser("new"); p.add_argument("name"); p.add_argument("--seed"); p.add_argument("--alt"); p.add_argument("--image")
+    p.add_argument("--random", action="store_true")
+    p.add_argument("--scheme", default="interval", choices=["interval", "complement", "analogous", "triad", "mono"]); p.set_defaults(fn=cmd_new)
+    p = sub.add_parser("preview"); p.add_argument("name"); p.add_argument("-o", "--out"); p.set_defaults(fn=cmd_preview)
+    p = sub.add_parser("use"); p.add_argument("name"); p.add_argument("--dry-run", action="store_true"); p.set_defaults(fn=cmd_use)
+    p = sub.add_parser("restore"); p.set_defaults(fn=cmd_use, name="clemson", dry_run=False)
+    p = sub.add_parser("show"); p.add_argument("colour"); p.add_argument("name", nargs="?"); p.set_defaults(fn=cmd_show)
+    p = sub.add_parser("rm"); p.add_argument("name"); p.set_defaults(fn=cmd_rm)
+    p = sub.add_parser("follow"); p.add_argument("what", nargs="?", choices=["scene", "time", "off", "status", "set", "unset", "apply"])
+    p.add_argument("key", nargs="?"); p.add_argument("plan", nargs="?")
+    p.add_argument("--scene"); p.add_argument("--at"); p.add_argument("--dry-run", action="store_true"); p.set_defaults(fn=cmd_follow)
+    args = ap.parse_args(); args.fn(args)
+
+if __name__ == "__main__":
+    main()

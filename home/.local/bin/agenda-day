@@ -1,0 +1,71 @@
+#!/usr/bin/env python3
+"""Events for one day from the Org calendar files, as JSON for the Quickshell bar.
+
+    agenda-day              # today
+    agenda-day 2026-11-12
+
+Reads ~/.emacs.d/org/calendars/*.org (written by pull-calendars: one heading per
+event, each with a plain <...> timestamp). Prints a list, all-day events first,
+then by start time:
+    [{"start": "09:30", "end": "10:00", "title": "...", "allday": false,
+      "location": "...", "url": "https://...", "date": "2026-11-13", "id": "0400...",
+      "calendar": "clemson", "tags": ["tentative"]}]
+calendar is the file's base name (clemson.org -> "clemson"); tags are the heading's Org tags.
+url is the event's online-meeting link (:MEETING_URL:, else the first http(s) URL in
+:LOCATION:), or "" when it has none. date + start + id (or title, when id is "") are what
+agenda-open needs to find the entry; it looks the line up at click time, because
+pull-calendars rewrites the files and a line number read here goes stale.
+"""
+import datetime as dt, glob, json, os, re, sys
+
+day = dt.date.fromisoformat(sys.argv[1]) if len(sys.argv) > 1 else dt.date.today()
+STAMP = re.compile(r"<(\d{4}-\d{2}-\d{2})(?: [^\s>\d]+)?(?: (\d{1,2}:\d{2})(?:-(\d{1,2}:\d{2}))?)?[^>]*>"
+                   r"(?:--<(\d{4}-\d{2}-\d{2})(?: [^\s>\d]+)?(?: (\d{1,2}:\d{2}))?[^>]*>)?")
+URL = re.compile(r"https?://[^\s<>\"\]]+")
+pad = lambda t: t if t is None or len(t) == 5 else "0" + t
+
+events, seen = [], set()
+for path in sorted(glob.glob(os.path.expanduser("~/.emacs.d/org/calendars/*.org"))):
+    title, props, tags = None, {}, []
+    cal = os.path.splitext(os.path.basename(path))[0]
+    try:
+        lines = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        continue
+    for line in lines:
+        if line.startswith("* "):
+            props = {}
+            tm = re.search(r"\s+:([\w@:]+):\s*$", line)
+            tags = [t for t in tm.group(1).split(":") if t] if tm else []
+            title = re.sub(r"\s+:[\w@:]+:\s*$", "", line[2:].strip())
+            title = re.sub(r"^(TODO|DONE|CANCELLED)\s+", "", title)
+            continue
+        prop = re.match(r":([A-Z_]+):\s*(.*?)\s*$", line)
+        if title is not None and prop:
+            props[prop.group(1)] = prop.group(2)
+            continue
+        if title is None or not line.startswith("<"):
+            continue
+        m = STAMP.match(line.strip())
+        if not m:
+            continue
+        d1 = dt.date.fromisoformat(m.group(1))
+        d2 = dt.date.fromisoformat(m.group(4)) if m.group(4) else d1
+        if not (d1 <= day <= d2):
+            continue
+        start, end = pad(m.group(2)), pad(m.group(3) or (m.group(5) if d2 == day else None))
+        if d1 != day:                      # a later day of a multi-day event
+            start = None
+        loc = props.get("LOCATION", "")
+        url = props.get("MEETING_URL", "") or (URL.search(loc).group(0) if URL.search(loc) else "")
+        ev = {"start": start or "", "end": end or "", "title": title, "allday": start is None,
+              "location": loc, "url": url, "date": day.isoformat(), "id": props.get("ID", ""),
+              "calendar": cal, "tags": tags}
+        key = (ev["start"], ev["end"], ev["title"])
+        if key not in seen:
+            seen.add(key)
+            events.append(ev)
+
+events.sort(key=lambda e: (not e["allday"], e["start"], e["title"]))
+json.dump(events, sys.stdout, ensure_ascii=False)
+print()

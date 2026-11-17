@@ -1,0 +1,62 @@
+#!/usr/bin/python3 -I
+"""Check the current user's password against a PAM service, using the system's libpam.
+
+  pam-check [SERVICE]     password on stdin (one line); SERVICE defaults to "hyprlock"
+  exit 0: correct   1: wrong   2: PAM could not run (not a verdict on the password)
+
+The Quickshell lock screen uses this because Quickshell is a Nix build: its own libpam
+cannot use this system's password helper, so its built-in PAM support always fails here.
+"""
+import ctypes, ctypes.util, os, pwd, sys
+
+PAM_PROMPT_ECHO_OFF, PAM_PROMPT_ECHO_ON = 1, 2
+PAM_SUCCESS, PAM_AUTH_ERR, PAM_MAXTRIES, PAM_USER_UNKNOWN, PAM_CRED_INSUFFICIENT = 0, 7, 11, 10, 8
+
+class Message(ctypes.Structure):
+    _fields_ = [("msg_style", ctypes.c_int), ("msg", ctypes.c_char_p)]
+class Response(ctypes.Structure):
+    _fields_ = [("resp", ctypes.c_void_p), ("resp_retcode", ctypes.c_int)]
+CONV = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.POINTER(Message)),
+                        ctypes.POINTER(ctypes.POINTER(Response)), ctypes.c_void_p)
+class Conv(ctypes.Structure):
+    _fields_ = [("conv", CONV), ("appdata_ptr", ctypes.c_void_p)]
+
+def main():
+    service = (sys.argv[1] if len(sys.argv) > 1 else "hyprlock").encode()
+    password = sys.stdin.readline().rstrip("\n").encode()
+    user = pwd.getpwuid(os.getuid()).pw_name.encode()
+    try:
+        libpam = ctypes.CDLL(ctypes.util.find_library("pam") or "libpam.so.0")
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6")
+    except OSError:
+        return 2
+    libc.calloc.restype = ctypes.c_void_p
+    libc.calloc.argtypes = [ctypes.c_size_t, ctypes.c_size_t]
+    libc.strdup.restype = ctypes.c_void_p
+    libc.strdup.argtypes = [ctypes.c_char_p]
+
+    def converse(n, messages, responses, _):
+        # PAM frees the replies itself, so they must come from the C allocator
+        block = libc.calloc(n, ctypes.sizeof(Response))
+        if not block: return 5
+        replies = ctypes.cast(block, ctypes.POINTER(Response))
+        for i in range(n):
+            if messages[i].contents.msg_style in (PAM_PROMPT_ECHO_OFF, PAM_PROMPT_ECHO_ON):
+                replies[i].resp = libc.strdup(password)
+        responses[0] = replies
+        return PAM_SUCCESS
+
+    conv = Conv(CONV(converse), None)
+    handle = ctypes.c_void_p()
+    libpam.pam_start.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.POINTER(Conv), ctypes.POINTER(ctypes.c_void_p)]
+    libpam.pam_authenticate.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    libpam.pam_end.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    if libpam.pam_start(service, user, ctypes.byref(conv), ctypes.byref(handle)) != PAM_SUCCESS:
+        return 2
+    result = libpam.pam_authenticate(handle, 0)
+    libpam.pam_end(handle, result)
+    if result == PAM_SUCCESS: return 0
+    if result in (PAM_AUTH_ERR, PAM_MAXTRIES, PAM_USER_UNKNOWN, PAM_CRED_INSUFFICIENT): return 1
+    return 2
+
+sys.exit(main())

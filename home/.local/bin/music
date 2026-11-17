@@ -1,0 +1,63 @@
+#!/bin/bash
+# music: show / hide ncmpcpp, which lives on the special workspace "music".
+#
+#   music        toggle it (start it first if it is not running)
+#   music hide   hide it, only if it is showing (ncmpcpp's q key)
+#
+# The Hyprland rule "ncmpcpp" puts the ghostty window with class
+# org.tsr.ncmpcpp on special:music, floating and centred.  Bound to Super+`,
+# used by the launcher entry and by a click on the bar's media cover.
+set -u
+toggle() { hyprctl dispatch 'hl.dsp.workspace.toggle_special("music")' >/dev/null; }
+running() { hyprctl clients -j | grep -q '"class": "org.tsr.ncmpcpp"'; }
+showing() {
+    hyprctl monitors -j | python3 -c '
+import json, sys
+sys.exit(0 if any(m["focused"] and m["specialWorkspace"]["name"] == "special:music"
+                  for m in json.load(sys.stdin)) else 1)'
+}
+
+# Size the window for the monitor it is shown on: 62% of the height, and 62%
+# of the width but at most 1.7x the height, so the vertical screen gets a tall
+# window and the ultrawide a normal one rather than a 2.4:1 strip.  The static
+# rule can't take min(), and special:music follows the focused monitor, so this
+# runs on every show.
+fit() {
+    local size
+    size=$(hyprctl monitors -j | python3 -c '
+import json, sys
+for m in json.load(sys.stdin):
+    if m["focused"]:
+        w, h = m["width"] / m["scale"], m["height"] / m["scale"]
+        if m["transform"] % 2: w, h = h, w
+        H = round(h * 0.62); W = round(min(w * 0.62, H * 1.7))
+        print(W, H)')
+    [ -n "$size" ] || return 0
+    hyprctl dispatch "hl.dsp.window.resize({ x = ${size% *}, y = ${size#* }, window = \"class:^org\\\\.tsr\\\\.ncmpcpp\$\" })" >/dev/null
+    hyprctl dispatch 'hl.dsp.window.center({ window = "class:^org\\.tsr\\.ncmpcpp$" })' >/dev/null
+}
+
+case "${1:-toggle}" in
+    hide)
+        # Logged (journalctl -t music) since q is the one path run from inside ncmpcpp.
+        if showing; then toggle; logger -t music "hide: hid special:music"
+        else logger -t music "hide: special:music not showing on the focused monitor"; fi ;;
+    toggle)
+        if running; then
+            toggle
+            showing && fit
+        else
+            # The patched Nix build (~/.config/ncmpcpp/nix: play from here, click to
+            # play), whatever PATH Hyprland hands us; apt's ncmpcpp if it is missing.
+            ncm="$HOME/.nix-profile/bin/ncmpcpp"; [ -x "$ncm" ] || ncm=ncmpcpp
+            setsid -f ghostty --class=org.tsr.ncmpcpp --title=ncmpcpp \
+                --window-padding-x=18 --window-padding-y=14 \
+                --window-padding-balance=true -e "$ncm" >/dev/null 2>&1
+            # Show the workspace once the window has landed on it.
+            for _ in $(seq 50); do running && break; sleep 0.1; done
+            showing || toggle
+            fit
+        fi ;;
+    *)
+        echo "usage: music [toggle|hide]" >&2; exit 2 ;;
+esac

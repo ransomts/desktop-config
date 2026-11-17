@@ -1,0 +1,48 @@
+#!/bin/sh
+# Keep the GTK theme name in step with COSMIC dark/light mode.
+#
+# COSMIC sets these same values when you toggle, but not always at login
+# (2026-10-19: gtk-theme was Adwaita in dark mode). Electron apps (Discord flatpak)
+# decide "system is dark" from the GTK theme, which flatpak GTK reads from
+# org.gnome.desktop.interface gtk-theme via the settings portal -- so that
+# key has to say adw-gtk3-dark in dark mode or they start light. Watches the
+# same is_dark file as wallpaper-follows-theme.
+#
+#   gtk-theme-follows-cosmic        # apply once, then watch
+#   gtk-theme-follows-cosmic once   # apply once and exit
+
+MODE_DIR="$HOME/.config/cosmic/com.system76.CosmicTheme.Mode/v1"
+
+apply() {
+    if [ "$(cat "$MODE_DIR/is_dark" 2>/dev/null)" = "true" ]; then
+        theme=adw-gtk3-dark scheme=prefer-dark icons=Papirus-Dark
+    else
+        # Papirus-Light: dark panel icons, for the light waybar.
+        theme=adw-gtk3 scheme=prefer-light icons=Papirus-Light
+    fi
+    gsettings set org.gnome.desktop.interface gtk-theme "$theme"
+    gsettings set org.gnome.desktop.interface color-scheme "$scheme"
+    # Icons only in the default profile (Hyprland; Qt follows it through
+    # QT_QPA_PLATFORMTHEME=gtk3). COSMIC keeps its own icon theme in its profile.
+    # Skipped if Papirus isn't installed (papirus-orange-install puts it there).
+    if [ -d "$HOME/.local/share/icons/$icons" ] || [ -d "/usr/share/icons/$icons" ]; then
+        gsettings set org.gnome.desktop.interface icon-theme "$icons"
+    fi
+    # COSMIC sessions give apps DCONF_PROFILE=cosmic, which reads its own
+    # ~/.config/dconf/cosmic first. Anything started under COSMIC that is still
+    # running (the Emacs daemon) keeps reading that copy, so set it too;
+    # otherwise in Hyprland it went stale (light) and new Emacs frames painted
+    # a white GTK window before Emacs drew its dark theme.
+    DCONF_PROFILE=/usr/share/dconf/profile/cosmic gsettings set org.gnome.desktop.interface gtk-theme "$theme"
+    DCONF_PROFILE=/usr/share/dconf/profile/cosmic gsettings set org.gnome.desktop.interface color-scheme "$scheme"
+    # waybar, fuzzel and mako don't read any of the above; they have their own palettes.
+    [ -x "$HOME/.local/bin/hypr-theme-apply" ] && "$HOME/.local/bin/hypr-theme-apply" "${scheme#prefer-}"
+}
+
+apply
+[ "$1" = "once" ] && exit 0
+
+# Watch the directory, not the file: cosmic-config writes via rename.
+inotifywait -m -q -e close_write -e moved_to "$MODE_DIR" | while read -r _ _ file; do
+    [ "$file" = "is_dark" ] && apply
+done

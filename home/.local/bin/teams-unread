@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""Unread Microsoft Teams messages, for the bar's Teams pill (Quickshell Bar.qml, Sys.teams).
+
+  teams-unread            print {"text","tooltip","class","rooms":[...]} (empty output: nothing unread)
+  teams-unread open [ROOM_ID]
+                          open that chat in Emacs (ement) at its first unread message and count it
+                          read; no ROOM_ID: the chat with the oldest unread messages
+  teams-unread list       the ement room list in Emacs
+
+Teams reaches this machine through the local Matrix stack (~/Docker/matrix: Synapse + the
+mautrix-teams bridge), so this asks Synapse, never Microsoft: an incremental /sync (timeout 0)
+from the last run's position, kept with the per-chat counts in $XDG_RUNTIME_DIR/teams-unread.json.
+The first run does a filtered initial sync (about 6 s). Teams chats are the rooms whose m.bridge
+state says protocol "msteams". The counts are Synapse's notification counts, so they follow the
+same push rules ement does (muted chats count nothing; group chats count mentions and keywords).
+The access token is the one ement saved (~/.emacs.d/var/ement-sessions.el), as in
+~/Docker/matrix/scripts/matrix_common.py: no new device, no password.
+"""
+import html
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+HOMESERVER = "http://localhost:8008"
+USER_ID = "@tsranso:localhost"
+SESSIONS = os.path.expanduser("~/.emacs.d/var/ement-sessions.el")
+STATE = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "teams-unread.json")
+PROTOCOL = "msteams"
+ICON = "󰊻"      # nf-md-microsoft_teams
+
+FILTER = {
+    "presence": {"types": []},
+    "account_data": {"types": []},
+    "room": {
+        "account_data": {"types": []},
+        "ephemeral": {"types": ["m.receipt"]},   # so reading a chat elsewhere brings its new count
+        "timeline": {"limit": 1, "types": ["m.room.message"]},
+        "state": {"types": ["m.bridge", "m.room.name", "m.room.member"], "lazy_load_members": True},
+    },
+}
+
+
+def token():
+    try:
+        text = open(SESSIONS).read()
+    except OSError:
+        return None
+    m = re.search(r'\((?:#\d+=)?"%s"(?:(?!\((?:#\d+=)?"@).)*?:token\s+"([^"]+)"' % re.escape(USER_ID), text, re.S)
+    return m.group(1) if m else None
+
+
+def get(path, tok, params=None, timeout=30):
+    url = HOMESERVER + path + ("?" + urllib.parse.urlencode(params) if params else "")
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tok}"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+def load():
+    try:
+        with open(STATE) as f:
+            s = json.load(f)
+        if s.get("filter") == FILTER:
+            return s
+    except (OSError, ValueError):
+        pass
+    return {"filter": FILTER, "since": None, "rooms": {}}
+
+
+def save(s):
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(s, f)
+    os.replace(tmp, STATE)
+
+
+def preview(content):
+    body = (content.get("body") or "").strip().replace("\n", " ")
+    kind = content.get("msgtype", "")
+    if kind == "m.image":
+        return "[picture]"
+    if kind in ("m.file", "m.video", "m.audio"):
+        return "[file] " + body
+    return body
+
+
+def merge(s, sync, tok):
+    rooms = s["rooms"]
+    for rid in (sync.get("rooms", {}).get("leave") or {}):
+        rooms.pop(rid, None)
+    for rid, rm in (sync.get("rooms", {}).get("join") or {}).items():
+        r = rooms.setdefault(rid, {"teams": False, "name": "", "count": 0, "mentions": 0, "last": None, "names": {}})
+        names = r.setdefault("names", {})
+        events = (rm.get("state", {}).get("events") or []) + (rm.get("timeline", {}).get("events") or [])
+        for e in events:
+            t, c = e.get("type"), e.get("content") or {}
+            if t == "m.bridge" and "state_key" in e:
+                r["teams"] = (c.get("protocol") or {}).get("id") == PROTOCOL
+            elif t == "m.room.name" and "state_key" in e:
+                r["name"] = c.get("name") or ""
+            elif t == "m.room.member" and c.get("displayname"):
+                names[e["state_key"]] = c["displayname"]
+        for e in rm.get("timeline", {}).get("events") or []:
+            if e.get("type") == "m.room.message" and e.get("sender") != USER_ID:
+                r["last"] = {"sender": e["sender"], "body": preview(e.get("content") or {}), "ts": e.get("origin_server_ts", 0)}
+        heroes = (rm.get("summary") or {}).get("m.heroes")
+        if heroes:
+            r["heroes"] = heroes
+        n = rm.get("unread_notifications")
+        if n is not None:
+            r["count"] = n.get("notification_count", 0) or 0
+            r["mentions"] = n.get("highlight_count", 0) or 0
+        if r["count"] == 0:
+            r["last"] = None
+    # a DM has no m.room.name: name it after the other people (ement does the same)
+    for r in rooms.values():
+        if r["teams"] and r["count"] and not r["name"]:
+            people = []
+            for h in r.get("heroes") or []:
+                if h not in r["names"]:
+                    try:
+                        r["names"][h] = get(f"/_matrix/client/v3/profile/{urllib.parse.quote(h)}", tok, timeout=5).get("displayname") or h
+                    except Exception:
+                        r["names"][h] = h
+                people.append(r["names"][h])
+            r["name"] = ", ".join(people) or "Chat"
+
+
+def status():
+    tok = token()
+    if not tok:
+        return None
+    s = load()
+    params = {"filter": json.dumps(FILTER, separators=(",", ":")), "timeout": 0}
+    if s["since"]:
+        params["since"] = s["since"]
+    try:
+        sync = get("/_matrix/client/v3/sync", tok, params, timeout=60 if not s["since"] else 20)
+    except Exception as e:
+        # Synapse down or the token revoked: say so only if there was something to say before
+        old = [r for r in s["rooms"].values() if r["teams"] and r["count"]]
+        if not old:
+            return None
+        return {"text": f"{ICON} ?", "class": "stale", "rooms": [],
+                "tooltip": f"<b>Teams</b>: can't reach the Matrix server ({html.escape(str(e))[:80]})"}
+    merge(s, sync, tok)
+    s["since"] = sync.get("next_batch")
+    save(s)
+
+    unread = [dict(r, id=rid) for rid, r in s["rooms"].items() if r["teams"] and r["count"] > 0]
+    if not unread:
+        return None
+    unread.sort(key=lambda r: (r["last"] or {}).get("ts", 0), reverse=True)
+    total = sum(r["count"] for r in unread)
+    mentions = sum(r["mentions"] for r in unread)
+    out = []
+    for r in unread:
+        last = r["last"] or {}
+        who = r["names"].get(last.get("sender", ""), "")
+        body = last.get("body", "")
+        r["name"] = re.sub(r"^DM: ", "", r["name"])
+        line = (who + ": " if who and who != r["name"] else "") + body
+        out.append({"id": r["id"], "name": r["name"], "count": r["count"], "mentions": r["mentions"],
+                    "preview": line[:140], "ts": last.get("ts", 0)})
+    tip = [f"<b>Teams</b>: {total} unread in {len(unread)} chat{'s' if len(unread) != 1 else ''}"
+           + (f", {mentions} mentioning you" if mentions else "")]
+    for r in out[:6]:
+        tip.append(f"{html.escape(r['name'])} ({r['count']})" + (f": {html.escape(r['preview'][:60])}" if r["preview"] else ""))
+    if len(out) > 6:
+        tip.append(f"and {len(out) - 6} more")
+    tip.append("Click: list · Right-click: open the oldest · Middle-click: all chats in Emacs")
+    return {"text": f"{ICON} {total}", "class": "mention" if mentions else "unread",
+            "tooltip": "\n".join(tip), "rooms": out}
+
+
+def emacs(lisp):
+    subprocess.run(["timeout", "10", "emacsclient", "--eval", lisp], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["hyprctl", "dispatch", 'hl.dsp.focus({ window = "class:^(emacs|Emacs)$" })'], stdout=subprocess.DEVNULL)
+
+
+def forget(rid=None):
+    """Count a chat (or, with none, the oldest one) read here at once; the next sync confirms it."""
+    s = load()
+    if rid and rid in s["rooms"]:
+        s["rooms"][rid]["count"] = 0
+        s["rooms"][rid]["mentions"] = 0
+        save(s)
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd == "":
+        o = status()
+        if o:
+            print(json.dumps(o, ensure_ascii=False))
+    elif cmd == "open":
+        rid = sys.argv[2] if len(sys.argv) > 2 else ""
+        if not re.fullmatch(r"(![A-Za-z0-9._=\-]+:[A-Za-z0-9.\-]+)?", rid):
+            sys.exit("not a room ID: " + rid)
+        if rid:
+            emacs('(tsr/ement-after-connect (lambda () (let ((rs (tsr/ement--find-room "%s"))) '
+                  '(when rs (ement-view-room (car rs) (cdr rs)) '
+                  '(with-current-buffer (alist-get (quote buffer) (ement-room-local (car rs))) '
+                  '(tsr/ement-room-goto-first-unread (quote mark-read)))))))' % rid)
+            forget(rid)
+        else:
+            emacs("(tsr/ement-view-unread)")
+    elif cmd == "list":
+        emacs("(tsr/ement-room-list)")
+    else:
+        sys.exit(__doc__)

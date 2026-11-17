@@ -1,0 +1,12 @@
+[Unit]
+Description=Power savings on battery (stop lidarr/nzbget, dim backlight), undone on AC
+
+[Service]
+Environment="ON_BATTERY_CONTAINERS=lidarr nzbget"
+Environment=ON_BATTERY_BRIGHTNESS=8
+ExecStart=%h/.local/bin/on-battery
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

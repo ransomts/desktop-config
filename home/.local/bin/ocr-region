@@ -1,0 +1,13 @@
+#!/bin/sh
+# Super+O: drag over any text on screen (a scanned PDF, a video, an image) and
+# its text lands on the clipboard. grim + slurp + tesseract.
+command -v tesseract >/dev/null || { notify-send -a OCR -u critical "tesseract isn't installed" "sudo apt install tesseract-ocr"; exit 1; }
+geom=$(slurp) || exit 0
+text=$(grim -g "$geom" -s 2 - | tesseract stdin stdout --psm 6 2>/dev/null | sed -e 's/[[:space:]]*$//' | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')
+if [ -z "$text" ]; then
+    notify-send -a OCR -i edit-copy "No text found in that region"
+    exit 1
+fi
+printf '%s' "$text" | wl-copy
+preview=$(printf '%s' "$text" | head -c 160 | tr '\n' ' ')
+notify-send -a OCR -i edit-copy "Copied $(printf '%s' "$text" | wc -w) words" "$preview…"

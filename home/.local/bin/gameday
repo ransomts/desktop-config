@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""Is Clemson football playing today? JSON for the wallpaper's game-day mark (WallSeason.qml).
+
+    gameday            # {"today": {"opponent": "Georgia Tech", "home": true, "time": "12:30"} or null,
+                       #  "next": {"date": "2026-11-14", ...} or null}
+
+The schedule comes from ESPN's public team feed and is kept for 12 hours in
+~/.cache/gameday.json; offline, the last copy is used. Dates and times are local.
+"""
+import datetime as dt, json, os, time, urllib.request
+
+URL = "https://site.api.espn.com/apis/site/v2/sports/football/college-football/teams/228/schedule"   # 228: Clemson
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "gameday.json")
+
+
+def schedule():
+    try:
+        if time.time() - os.path.getmtime(CACHE) < 12 * 3600:
+            return json.load(open(CACHE))
+    except (OSError, ValueError):
+        pass
+    try:
+        with urllib.request.urlopen(URL, timeout=8) as r:
+            feed = json.load(r)
+        games = []
+        for e in feed.get("events", []):
+            comp = e["competitions"][0]
+            us = next(c for c in comp["competitors"] if c["team"]["id"] == "228")
+            them = next(c for c in comp["competitors"] if c["team"]["id"] != "228")
+            games.append({"utc": e["date"], "opponent": them["team"].get("location") or them["team"]["displayName"],
+                          "home": us.get("homeAway") == "home", "timed": bool(e.get("timeValid", True))})
+        os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+        json.dump(games, open(CACHE, "w"))
+        return games
+    except Exception:
+        try:
+            return json.load(open(CACHE))
+        except (OSError, ValueError):
+            return []
+
+
+def local(game):
+    when = dt.datetime.fromisoformat(game["utc"].replace("Z", "+00:00")).astimezone()
+    return {"date": when.date().isoformat(), "opponent": game["opponent"], "home": game["home"],
+            "time": when.strftime("%H:%M") if game["timed"] else ""}
+
+
+today = dt.date.today().isoformat()
+games = sorted((local(g) for g in schedule()), key=lambda g: g["date"])
+print(json.dumps({"today": next((g for g in games if g["date"] == today), None),
+                  "next": next((g for g in games if g["date"] > today), None)}))

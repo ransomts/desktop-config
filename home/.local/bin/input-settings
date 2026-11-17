@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""input-settings: the keyboard, touchpad and pointer options the settings window's Input page edits.
+
+  input-settings get              JSON: current values (hyprctl getoption), what is saved, the devices
+  input-settings set KEY VALUE    validate, apply live with one `hyprctl eval`, then record in the file
+  input-settings lua              the Lua that reproduces the saved overrides (what `apply` evaluates)
+  input-settings apply            re-apply every saved override with one eval (run once at login)
+  input-settings reset KEY|all    put a key (or every saved override) back to the hyprland.lua value
+
+KEY is one of the names in `keys`, or device:NAME:sensitivity / device:NAME:layout for one device
+(hl.device). The saved file is ~/.config/shell/input.json (INPUT_SETTINGS_FILE overrides it);
+hyprctl is found on PATH (HYPRCTL overrides it). Defaults are the values hyprland.lua sets today.
+"""
+import json, os, re, subprocess, sys
+
+FILE = os.environ.get("INPUT_SETTINGS_FILE") or os.path.expanduser("~/.config/shell/input.json")
+HYPRCTL = os.environ.get("HYPRCTL") or "hyprctl"
+LAYOUT_KEY = "Super+Space"
+
+# key: (kind, lo/choices, hi, path in the input table, default). Order is the order of the generated Lua.
+SPECS = {
+    "sensitivity":                      ("float", -1.0, 1.0, ("sensitivity",), 0.0),
+    "accel_profile":                    ("choice", ("flat", "adaptive"), None, ("accel_profile",), "adaptive"),
+    "natural_scroll":                   ("bool", None, None, ("natural_scroll",), False),
+    "scroll_factor":                    ("float", 0.1, 10.0, ("scroll_factor",), 1.0),
+    "follow_mouse":                     ("int", 0, 3, ("follow_mouse",), 1),
+    "repeat_rate":                      ("int", 1, 100, ("repeat_rate",), 25),
+    "repeat_delay":                     ("int", 100, 2000, ("repeat_delay",), 600),
+    "numlock_by_default":               ("bool", None, None, ("numlock_by_default",), False),
+    "first_layout":                     ("choice", ("dvorak", "us"), None, ("kb_variant",), "dvorak"),
+    "touchpad.natural_scroll":          ("bool", None, None, ("touchpad", "natural_scroll"), True),
+    "touchpad.scroll_factor":           ("float", 0.1, 10.0, ("touchpad", "scroll_factor"), 1.0),
+    "touchpad.tap_to_click":            ("bool", None, None, ("touchpad", "tap_to_click"), True),
+    "touchpad.tap_and_drag":            ("bool", None, None, ("touchpad", "tap_and_drag"), True),
+    "touchpad.disable_while_typing":    ("bool", None, None, ("touchpad", "disable_while_typing"), True),
+    "touchpad.middle_button_emulation": ("bool", None, None, ("touchpad", "middle_button_emulation"), False),
+    "touchpad.clickfinger_behavior":    ("bool", None, None, ("touchpad", "clickfinger_behavior"), False),
+}
+DEVICE_FIELDS = {   # field: (kind, lo/choices, hi, default)
+    "sensitivity": ("float", -1.0, 1.0, 0.0),
+    "layout":      ("choice", ("us", "dvorak"), None, "us"),     # us = the keyboard does Dvorak itself
+}
+KB_OPTIONS = "caps:ctrl_modifier"           # kept on a per-device layout, as hyprland.lua has it
+SYSTEM_RE = re.compile(r"button|video-bus|hotkeys|hid-events|switch|lid", re.I)
+
+
+class Fail(Exception):
+    pass
+
+
+def die(msg, code=1):
+    print("input-settings: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def hypr(*args):
+    try:
+        r = subprocess.run([HYPRCTL, *args], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise Fail("hyprctl: %s" % e)
+    out = (r.stdout + r.stderr).strip()
+    if r.returncode != 0 or out.lower().startswith("error"):
+        raise Fail("hyprctl %s failed: %s" % (args[0], out or "exit %d" % r.returncode))
+    return r.stdout
+
+
+# ---------- values ----------
+def parse_value(kind, spec_lo, spec_hi, raw, what):
+    s = str(raw).strip()
+    if kind == "bool":
+        v = s.lower()
+        if v in ("true", "on", "yes", "1"): return True
+        if v in ("false", "off", "no", "0"): return False
+        raise Fail("%s: %r is not true/false" % (what, raw))
+    if kind == "choice":
+        if s not in spec_lo: raise Fail("%s: %r is not one of %s" % (what, raw, ", ".join(spec_lo)))
+        return s
+    try:
+        n = float(s) if kind == "float" else int(s)
+    except ValueError:
+        raise Fail("%s: %r is not a %s" % (what, raw, "number" if kind == "float" else "whole number"))
+    if n != n or n in (float("inf"), float("-inf")): raise Fail("%s: %r is not a number" % (what, raw))
+    if n < spec_lo or n > spec_hi: raise Fail("%s: %s is outside %s to %s" % (what, raw, spec_lo, spec_hi))
+    return round(n, 3) if kind == "float" else n
+
+
+NAME_RE = re.compile(r"^[A-Za-z0-9._:+-]{1,120}$")
+
+
+def split_key(key):
+    """('global', key) or ('device', (name, field)); Fail on anything else."""
+    if key in SPECS: return "global", key
+    if key.startswith("device:"):
+        name, _, field = key[7:].rpartition(":")
+        if name and NAME_RE.match(name) and field in DEVICE_FIELDS: return "device", (name, field)
+        raise Fail("bad device key %r (device:NAME:%s)" % (key, "|".join(DEVICE_FIELDS)))
+    raise Fail("unknown key %r (known: %s, device:NAME:sensitivity, device:NAME:layout)" % (key, ", ".join(SPECS)))
+
+
+def check(key, raw):
+    kind, ident = split_key(key)
+    if kind == "global":
+        k, lo, hi, _, _ = SPECS[ident]
+        return parse_value(k, lo, hi, raw, ident)
+    k, lo, hi, _ = DEVICE_FIELDS[ident[1]]
+    return parse_value(k, lo, hi, raw, ident[1])
+
+
+# ---------- the saved file ----------
+def load():
+    try:
+        with open(FILE, encoding="utf-8") as f: d = json.load(f)
+    except FileNotFoundError:
+        d = {}
+    except ValueError as e:
+        raise Fail("%s is not valid JSON (%s); fix or remove it" % (FILE, e))
+    if not isinstance(d, dict): raise Fail("%s is not a JSON object" % FILE)
+    d.setdefault("overrides", {}); d.setdefault("devices", {})
+    if not isinstance(d["overrides"], dict) or not isinstance(d["devices"], dict): raise Fail("%s has the wrong shape" % FILE)
+    return d
+
+
+def save(d):
+    os.makedirs(os.path.dirname(FILE), exist_ok=True)
+    tmp = FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f: json.dump(d, f, indent=2); f.write("\n")
+    os.replace(tmp, FILE)
+
+
+# ---------- Lua ----------
+def lua_val(v):
+    if isinstance(v, bool): return "true" if v else "false"
+    if isinstance(v, int): return str(v)
+    if isinstance(v, float): return repr(round(v, 3))
+    return '"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def global_value(key, v):
+    """The value as the option takes it (first_layout becomes the variant string)."""
+    if key == "first_layout": return "dvorak," if v == "dvorak" else ",dvorak"
+    return v
+
+
+def lua_for(overrides, devices):
+    tree = {}
+    for key in SPECS:
+        if key in overrides:
+            t = tree
+            *head, last = SPECS[key][3]
+            for p in head: t = t.setdefault(p, {})
+            t[last] = global_value(key, overrides[key])
+    def table(t):
+        parts = []
+        for k, v in t.items():
+            parts.append("%s = %s" % (k, table(v) if isinstance(v, dict) else lua_val(v)))
+        return "{ " + ", ".join(parts) + " }"
+    stmts = []
+    if tree: stmts.append("hl.config({ input = %s })" % table(tree))
+    for name in sorted(devices):
+        f = devices[name]; parts = ["name = " + lua_val(name)]
+        if "sensitivity" in f: parts.append("sensitivity = " + lua_val(f["sensitivity"]))
+        if "layout" in f:
+            parts += ['kb_layout = "us"', 'kb_variant = ' + lua_val("dvorak" if f["layout"] == "dvorak" else ""), "kb_options = " + lua_val(KB_OPTIONS)]
+        if len(parts) > 1: stmts.append("hl.device({ %s })" % ", ".join(parts))
+    return "; ".join(stmts)
+
+
+def evaluate(lua):
+    if lua: hypr("eval", lua)
+
+
+# ---------- commands ----------
+def getopt(name):
+    try: d = json.loads(hypr("-j", "getoption", "input:" + name))
+    except ValueError: return None
+    for t in ("bool", "int", "float", "str"):
+        if t in d:
+            v = d[t]
+            return None if v == "[[EMPTY]]" else v
+    return None
+
+
+def read_current():
+    vals = {}
+    for key, (kind, lo, hi, path, default) in SPECS.items():
+        try: raw = getopt(":".join(path))
+        except Fail: raw = None
+        if key == "first_layout":
+            vals[key] = "us" if (raw is not None and str(raw).startswith(",")) else "dvorak" if raw else default
+        elif key == "accel_profile":
+            vals[key] = "flat" if raw == "flat" else "adaptive"
+        elif raw is None: vals[key] = default
+        elif kind == "float": vals[key] = round(float(raw), 3)
+        elif kind == "int": vals[key] = int(raw)
+        elif kind == "bool": vals[key] = bool(raw)
+        else: vals[key] = raw
+    return vals
+
+
+def read_devices():
+    out = []
+    try: d = json.loads(hypr("-j", "devices"))
+    except (Fail, ValueError): return out
+    pads = [m.get("name", "").lower().rsplit("-touchpad", 1)[0] for m in d.get("mice", []) if "touchpad" in m.get("name", "").lower()]
+    for m in d.get("mice", []):
+        n = m.get("name", "")
+        pad = "touchpad" in n.lower() or any(p and n.lower().startswith(p + "-") for p in pads)    # a pad's own "-mouse" twin
+        out.append({"name": n, "kind": "touchpad" if pad else "mouse"})
+    for k in d.get("keyboards", []):
+        n = k.get("name", "")
+        out.append({"name": n, "kind": "keyboard", "system": bool(SYSTEM_RE.search(n)), "layout": k.get("layout"), "keymap": k.get("active_keymap")})
+    return out
+
+
+def cmd_get(_):
+    st = load()
+    print(json.dumps({"values": read_current(), "saved": st["overrides"], "deviceSaved": st["devices"],
+                      "devices": read_devices(), "layoutKey": LAYOUT_KEY, "file": FILE}, indent=1))
+
+
+def cmd_set(a):
+    if len(a) != 2: die("usage: input-settings set KEY VALUE", 2)
+    key, v = a[0], check(a[0], a[1])
+    kind, ident = split_key(key)
+    st = load()
+    if kind == "global":
+        evaluate(lua_for({key: v}, {}))
+        st["overrides"][key] = v
+    else:
+        name, field = ident
+        evaluate(lua_for({}, {name: {field: v}}))
+        st["devices"].setdefault(name, {})[field] = v
+    save(st)
+    print(json.dumps({"ok": True, "key": key, "value": v}))
+
+
+def default_for(key):
+    kind, ident = split_key(key)
+    return ("global", SPECS[ident][4]) if kind == "global" else ("device", DEVICE_FIELDS[ident[1]][3])
+
+
+def cmd_reset(a):
+    if len(a) != 1: die("usage: input-settings reset KEY|all", 2)
+    st = load()
+    if a[0] == "all":
+        g = {k: SPECS[k][4] for k in st["overrides"] if k in SPECS}
+        dv = {n: {f: DEVICE_FIELDS[f][3] for f in fs if f in DEVICE_FIELDS} for n, fs in st["devices"].items()}
+        evaluate(lua_for(g, {n: f for n, f in dv.items() if f}))
+        st["overrides"] = {}; st["devices"] = {}
+    else:
+        kind, ident = split_key(a[0])
+        d = default_for(a[0])[1]
+        if kind == "global":
+            evaluate(lua_for({a[0]: d}, {})); st["overrides"].pop(a[0], None)
+        else:
+            name, field = ident
+            evaluate(lua_for({}, {name: {field: d}}))
+            st["devices"].get(name, {}).pop(field, None)
+            if not st["devices"].get(name): st["devices"].pop(name, None)
+    save(st)
+    print(json.dumps({"ok": True, "reset": a[0]}))
+
+
+def saved_lua():
+    st = load()
+    ov = {k: v for k, v in st["overrides"].items() if k in SPECS}
+    dv = {n: {f: v for f, v in fs.items() if f in DEVICE_FIELDS} for n, fs in st["devices"].items() if NAME_RE.match(n)}
+    return lua_for(ov, dv)
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip()); return 0
+    cmd, rest = argv[0], argv[1:]
+    try:
+        if cmd == "get": cmd_get(rest)
+        elif cmd == "set": cmd_set(rest)
+        elif cmd == "reset": cmd_reset(rest)
+        elif cmd == "lua":
+            s = saved_lua()
+            if s: print(s)
+        elif cmd == "apply":
+            s = saved_lua()
+            if s: evaluate(s)
+        elif cmd == "keys": print(json.dumps({k: {"kind": v[0], "range": [v[1], v[2]] if v[0] in ("int", "float") else v[1], "default": v[4]} for k, v in SPECS.items()}, indent=1))
+        else: die("unknown command %r" % cmd, 2)
+    except Fail as e:
+        die(str(e), 1)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

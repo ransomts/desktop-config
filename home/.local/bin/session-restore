@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""Reopen the apps session-save remembered, each on its desktop and monitor slot.
+
+  session-restore --list        what would be reopened, and what would be skipped and why
+  session-restore --dry-run     the exact hyprctl and launch commands, nothing run
+  session-restore               reopen (explicit; works even when "enabled" is false)
+  session-restore --status      one line of JSON: enabled, count, summary, saved (for Quickshell)
+  session-restore --login-check JSON {"offer": bool, ...}: true once per login, when enabled and
+                                at least one window can be reopened (marker: $XDG_RUNTIME_DIR/session-login)
+  session-restore --set-enabled true|false
+
+Settings in ~/.config/shell/session.json (all optional):
+  {"enabled": false, "skip": ["firefox","emacs","discord","nm-applet","blueman","git-annex"],
+   "allow": [], "terminalsRestoreCwd": true, "mode": "move", "delayMs": 600, "timeoutS": 10}
+skip: apps never reopened (desktop id or window class, case-insensitive). Firefox and Emacs restore
+themselves; discord, nm-applet, blueman and git-annex are started at login by ~/.config/autostart.
+allow: when not empty, only these apps are reopened.
+An app that already has as many windows open as were saved is left alone; with fewer, the
+first N saved ones are taken to be the open ones and only the rest are opened.
+
+mode "move" (default): start `uwsm app -- ID.desktop`, wait for the new window of that app, then
+  hyprctl eval 'hl.dispatch(hl.dsp.window.move({ workspace = 21, window = hl.get_window("address:0x..."), follow = false }))'
+mode "exec": one command per window, the window opens on its workspace by itself (floating and size too):
+  hyprctl eval 'hl.exec_cmd("uwsm app -- ID.desktop", { workspace = "21 silent" })'
+  (Hyprland matches an exec rule to the process it started; whether that survives `uwsm app` and
+  single-instance apps is not verified, which is why "move" is the default.)
+"""
+import argparse, json, os, subprocess, sys, shlex, time
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import session_lib as L
+
+
+def log(*a):
+    print("session-restore:", *a, file=sys.stderr)
+
+
+def describe(e, table):
+    r = L.resolve(table, e["class"])
+    where = "desktop %d slot %d" % (e["desktop"], e["slot"])
+    cwd = ("  in " + e["cwd"]) if e.get("cwd") else ""
+    return "%-18s %s%s%s" % (where, r[1] if r else e["app"], "  (floating)" if e.get("floating") else "", cwd)
+
+
+def state():
+    cfg, last = L.load_config(), L.load_last()
+    entries = last["entries"] if last else []
+    keep, _ = L.filtered(entries, cfg)
+    return cfg, last, keep
+
+
+def login_check():
+    cfg, last, keep = state()
+    rt = os.environ.get("XDG_RUNTIME_DIR")
+    out = {"offer": False}
+    if not rt or not os.path.isdir(rt):
+        out["why"] = "no runtime dir"
+    else:
+        marker = os.path.join(rt, "session-login")
+        if os.path.exists(marker):
+            out["why"] = "not a new login"
+        else:
+            try:
+                with open(marker, "w") as f:       # made even when disabled: enabling later must not offer mid-session
+                    f.write(str(os.getpid()) + "\n")
+            except OSError:
+                out["why"] = "marker not writable"
+                return out
+            if not cfg.get("enabled"):
+                out["why"] = "disabled"
+            elif not keep:
+                out["why"] = "nothing to reopen"
+            else:
+                out = {"offer": True, "count": len(keep), "summary": L.summary(keep)}
+    return out
+
+
+def restore(dry):
+    cfg, last, _ = state()
+    if not last:
+        log("no saved session")
+        return 1
+    try:
+        clients, monitors = L.hyprctl_json("clients"), L.hyprctl_json("monitors")
+    except Exception as ex:
+        log(ex)
+        return 1
+    table = L.desktop_table()
+    todo, dropped = L.plan(last["entries"], cfg, clients, table)
+    nmon, mode = len(monitors), cfg.get("mode", "move")
+    delay = max(0, int(cfg.get("delayMs", 600))) / 1000.0
+    timeout = float(cfg.get("timeoutS", 10))
+    poll = float(os.environ.get("SESSION_POLL_S", "0.25"))
+    seen = {c["address"] for c in clients}
+    for e in todo:
+        try:
+            if mode == "exec":
+                cmd = ["hyprctl", "eval", L.exec_lua(e, cfg, nmon)]
+                print(shlex.join(cmd))
+                if not dry:
+                    subprocess.run(cmd, timeout=5)
+            else:
+                argv = L.launch_argv(e, cfg)
+                ws = L.workspace_of(e, nmon)
+                print(shlex.join(argv))
+                if dry:
+                    print(shlex.join(["hyprctl", "eval", L.move_lua("<address of the new window>", ws)]))
+                if not dry:
+                    subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                    addr = wait_new(e, table, seen, timeout, poll)
+                    if addr:
+                        seen.add(addr)
+                        subprocess.run(["hyprctl", "eval", L.move_lua(addr, ws)], timeout=5)
+                    else:
+                        log("no new window for %s within %gs, left where it is" % (e["app"], timeout))
+        except (OSError, ValueError, subprocess.SubprocessError) as ex:
+            log("could not reopen %s: %s" % (e["app"], ex))
+        if not dry:
+            time.sleep(delay)
+    return 0
+
+
+def wait_new(e, table, seen, timeout, poll):
+    end = time.time() + timeout
+    while True:
+        try:
+            for c in L.hyprctl_json("clients"):
+                r = L.resolve(table, c.get("class"))
+                if c["address"] not in seen and c.get("mapped", True) and r and r[0] == e["app"]:
+                    return c["address"]
+        except Exception:
+            pass
+        if time.time() >= end:
+            return None
+        time.sleep(poll)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--list", action="store_true")
+    g.add_argument("--dry-run", action="store_true")
+    g.add_argument("--status", action="store_true")
+    g.add_argument("--count", action="store_true")
+    g.add_argument("--login-check", action="store_true")
+    g.add_argument("--set-enabled", choices=["true", "false"])
+    a = ap.parse_args()
+    if a.set_enabled:
+        L.set_enabled(a.set_enabled == "true")
+        return 0
+    if a.login_check:
+        print(json.dumps(login_check()))
+        return 0
+    if a.status or a.count:
+        cfg, last, keep = state()
+        if a.count:
+            print(len(keep))
+        else:
+            print(json.dumps({"enabled": bool(cfg.get("enabled")), "count": len(keep), "summary": L.summary(keep),
+                              "saved": (last or {}).get("saved", "")}))
+        return 0
+    if a.list:
+        cfg, last, keep = state()
+        if not last:
+            print("no saved session")
+            return 0
+        try:
+            clients = L.hyprctl_json("clients")
+        except Exception:
+            clients = []
+        table = L.desktop_table()
+        todo, dropped = L.plan(last["entries"], cfg, clients, table)
+        print("saved %s: %d windows, %d would be reopened" % (last.get("saved", "?"), len(last["entries"]), len(todo)))
+        for e in todo:
+            print("  reopen  " + describe(e, table))
+        for e, why in dropped:
+            print("  skip    %s   [%s]" % (describe(e, table), why))
+        return 0
+    return restore(a.dry_run)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""Data for the Quickshell dashboard (Dashboard.qml, Super+I), as JSON.
+
+    dashboard-data sys      # CPU, memory, disks, temperature, load, uptime (quick; asked every 2 s while open)
+    dashboard-data feeds    # weather, unread mail, tomorrow's events (asked when the dashboard opens)
+
+Weather comes from open-meteo (the same source as the wallpaper and the new-tab
+page) and is kept for 20 minutes in ~/.cache/dashboard-weather.json, so opening
+the dashboard often does not mean asking often. Mail is read from the mu index;
+nothing is fetched. Tomorrow's events come from ~/.local/bin/agenda-day.
+"""
+import datetime as dt, json, os, shutil, subprocess, sys, time, urllib.request
+
+HOME = os.path.expanduser("~")
+LAT, LNG = 34.68, -82.84                      # Clemson, SC (as in WallState.qml)
+INBOXES = [("Clemson", "/work/INBOX"), ("Personal", "/personal/INBOX")]
+DISKS = [("System", "/"), ("Data", "/mnt/data")]
+
+# WMO weather code -> (words, Nerd Font weather glyph by day, by night)
+SUN, MOON, PARTLY, PARTLY_N, CLOUD = "", "", "", "", ""
+FOG, DRIZZLE, RAIN, SNOW, STORM = "", "", "", "", ""
+WMO = {0: ("Clear", SUN, MOON), 1: ("Mostly clear", SUN, MOON), 2: ("Partly cloudy", PARTLY, PARTLY_N),
+       3: ("Overcast", CLOUD, CLOUD), 45: ("Fog", FOG, FOG), 48: ("Freezing fog", FOG, FOG)}
+for codes, entry in (((51, 53, 55, 56, 57), ("Drizzle", DRIZZLE, DRIZZLE)),
+                     ((61, 63, 65, 66, 67), ("Rain", RAIN, RAIN)), ((80, 81, 82), ("Showers", RAIN, RAIN)),
+                     ((71, 73, 75, 77, 85, 86), ("Snow", SNOW, SNOW)), ((95, 96, 99), ("Thunderstorm", STORM, STORM))):
+    for c in codes:
+        WMO[c] = entry
+
+
+def look(code, day=True):
+    words, by_day, by_night = WMO.get(code, ("", CLOUD, CLOUD))
+    return words, by_day if day else by_night
+
+
+def read(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return default
+
+
+def cpu_times():
+    f = [int(x) for x in read("/proc/stat").split("\n")[0].split()[1:]]
+    return sum(f), f[3] + f[4]                 # total, idle + iowait
+
+
+def sys_state():
+    t1, i1 = cpu_times()
+    time.sleep(0.25)
+    t2, i2 = cpu_times()
+    mem = {l.split(":")[0]: int(l.split()[1]) for l in read("/proc/meminfo").splitlines() if ":" in l}
+    temp = 0
+    for zone in sorted(os.listdir("/sys/class/thermal")):
+        if read(f"/sys/class/thermal/{zone}/type").strip() == "x86_pkg_temp":
+            temp = int(read(f"/sys/class/thermal/{zone}/temp", "0").strip() or 0) / 1000
+            break
+    disks = []
+    for name, path in DISKS:
+        try:
+            u = shutil.disk_usage(path)
+            disks.append({"name": name, "used": u.used / u.total, "free_gb": round(u.free / 2**30)})
+        except OSError:
+            pass
+    up = float(read("/proc/uptime", "0").split()[0])
+    return {
+        "cpu": (1 - (i2 - i1) / max(1, t2 - t1)),
+        "mem": 1 - mem.get("MemAvailable", 0) / max(1, mem.get("MemTotal", 1)),
+        "mem_gb": round((mem.get("MemTotal", 0) - mem.get("MemAvailable", 0)) / 2**20, 1),
+        "mem_total_gb": round(mem.get("MemTotal", 0) / 2**20),
+        "temp": round(temp),
+        "load": read("/proc/loadavg").split()[0] if read("/proc/loadavg") else "",
+        "uptime": f"{int(up // 86400)}d {int(up % 86400 // 3600)}h" if up >= 86400 else f"{int(up // 3600)}h {int(up % 3600 // 60)}m",
+        "disks": disks,
+    }
+
+
+def weather():
+    cache = os.path.join(os.environ.get("XDG_CACHE_HOME", HOME + "/.cache"), "dashboard-weather.json")
+    try:
+        if time.time() - os.path.getmtime(cache) < 20 * 60:
+            return json.load(open(cache))
+    except (OSError, ValueError):
+        pass
+    url = ("https://api.open-meteo.com/v1/forecast?latitude=%s&longitude=%s"
+           "&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m,relative_humidity_2m,is_day"
+           "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,sunrise,sunset"
+           "&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=auto&forecast_days=4" % (LAT, LNG))
+    try:
+        with urllib.request.urlopen(url, timeout=8) as r:
+            d = json.load(r)
+        cur, daily = d["current"], d["daily"]
+        words, glyph = look(cur["weather_code"], cur.get("is_day", 1) == 1)
+        out = {
+            "ok": True, "temp": round(cur["temperature_2m"]), "feels": round(cur["apparent_temperature"]),
+            "words": words, "glyph": glyph, "wind": round(cur["wind_speed_10m"]), "humidity": round(cur["relative_humidity_2m"]),
+            "sunrise": daily["sunrise"][0][11:16], "sunset": daily["sunset"][0][11:16],
+            "days": [{
+                "name": "Today" if i == 0 else dt.date.fromisoformat(daily["time"][i]).strftime("%a"),
+                "glyph": look(daily["weather_code"][i])[1], "words": look(daily["weather_code"][i])[0],
+                "hi": round(daily["temperature_2m_max"][i]), "lo": round(daily["temperature_2m_min"][i]),
+                "rain": daily["precipitation_probability_max"][i] or 0,
+            } for i in range(len(daily["time"]))],
+        }
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        json.dump(out, open(cache, "w"))
+        return out
+    except Exception:
+        try:                                    # offline: the last answer, however old, marked as such
+            old = json.load(open(cache))
+            old["stale"] = True
+            return old
+        except (OSError, ValueError):
+            return {"ok": False}
+
+
+def mail():
+    mu = shutil.which("mu") or HOME + "/.local/bin/mu"
+    boxes, latest = [], []
+    for name, maildir in INBOXES:
+        try:
+            out = subprocess.run([mu, "find", f'flag:unread AND NOT flag:trashed AND maildir:"{maildir}"',
+                                  "--fields", "d\tf\ts", "--sortfield=date", "--reverse"],
+                                 capture_output=True, text=True, timeout=8).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        lines = [l for l in out.splitlines() if l.count("\t") >= 2]
+        boxes.append({"name": name, "unread": len(lines)})
+        for l in lines[:6]:
+            date, sender, subject = l.split("\t", 2)
+            sender = sender.split("<")[0].strip().strip('"') or sender
+            latest.append({"box": name, "date": date, "from": sender, "subject": subject})
+    return {"boxes": boxes, "latest": latest}
+
+
+def tomorrow():
+    day = dt.date.today() + dt.timedelta(days=1)
+    try:
+        out = subprocess.run([HOME + "/.local/bin/agenda-day", day.isoformat()], capture_output=True, text=True, timeout=8).stdout
+        return {"name": day.strftime("%A"), "events": json.loads(out)}
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {"name": day.strftime("%A"), "events": []}
+
+
+what = sys.argv[1] if len(sys.argv) > 1 else "sys"
+if what == "sys":
+    print(json.dumps(sys_state()))
+elif what == "feeds":
+    print(json.dumps({"weather": weather(), "mail": mail(), "tomorrow": tomorrow()}))
+else:
+    sys.exit("usage: dashboard-data sys|feeds")
