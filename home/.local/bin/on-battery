@@ -21,7 +21,8 @@ to_battery() {
     if [ "$now" -gt "$dim" ]; then
         echo "$now" > "$state/brightness"; echo "$dim" > "$state/dimmed-to"
         brightnessctl -q -d "$dev" s "$dim"; echo "backlight $now -> $dim"
-    else
+    elif [ "$(cat "$state/dimmed-to" 2>/dev/null)" != "$now" ]; then
+        # keep the saved level when we dimmed to this already (service restarted on battery)
         rm -f "$state/brightness" "$state/dimmed-to"
     fi
 }

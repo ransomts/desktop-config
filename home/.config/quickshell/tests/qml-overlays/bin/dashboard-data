@@ -1,0 +1,8 @@
+#!/bin/sh
+# Stand-in dashboard-data (qml-overlays-test): prints $QO_FIX/sys.json or feeds.json, records the call.
+echo "dashboard-data $*" >> "$QO_CALLS"
+case "$1" in
+    sys) cat "$QO_FIX/sys.json" ;;
+    feeds) cat "$QO_FIX/feeds.json" ;;
+    *) exit 2 ;;
+esac

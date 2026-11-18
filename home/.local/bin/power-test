@@ -1,0 +1,177 @@
+#!/bin/sh
+# Tests for battery care and break reminders: bin/charge-profile, Charge.qml, ChargeTravel.qml, Breaks.qml.
+#
+#   power-test               run everything; PASS/FAIL lines and a summary; exit 1 on a failure
+#   power-test -v            also print everything Quickshell logged
+#   power-test -d DIR        test the config in DIR instead of ~/.config/quickshell
+#   power-test -b DIR        take charge-profile from DIR instead of ~/.local/bin
+#
+# Script part: charge-profile against a stub `system76-power` (output in the real format, captured
+# read-only from this laptop: tests/power/fixtures) and a stub notify-send; it checks that status, list,
+# set and next work, what the popup says, and that a refused authorisation changes nothing.
+# Quickshell part (cases in tests/power/shell.qml, stub Sys/Notif beside it): the real Charge.qml
+# running the real charge-profile over the stub, the travel reminder with a fake agenda and clock,
+# and Breaks with a fake clock and fake activity. Nothing real is read or changed: the real
+# thresholds, counters, config and state files are never touched, every path is temporary.
+verbose=0; src="$HOME/.config/quickshell"; bin="$HOME/.local/bin"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) verbose=1 ;;
+        -d) src="$2"; shift ;;
+        -b) bin="$2"; shift ;;
+        *) echo "usage: power-test [-v] [-d CONFIG_DIR] [-b BIN_DIR]" >&2; exit 2 ;;
+    esac
+    shift
+done
+qs="$HOME/.nix-profile/bin/qs"
+tests="$src/tests/power"
+[ -x "$qs" ] && [ -f "$tests/shell.qml" ] || { echo "power-test: no qs, or no $tests/shell.qml" >&2; exit 2; }
+work=$(mktemp -d) || exit 2
+trap 'rm -rf "$work"' EXIT
+ok=0
+pass() { echo "PASS $1"; }
+fail() { echo "FAIL $1${2:+   [$2]}"; ok=1; }
+check() { if [ "$2" = 0 ]; then pass "$1"; else fail "$1" "$3"; fi; }
+
+# ---------------- stubs (shared by both parts) ----------------
+stubs="$work/stubs"; tb="$work/bin"; td="$work/t"
+mkdir -p "$stubs" "$tb" "$td/state" "$td/run" "$td/stats"
+cp "$bin/charge-profile" "$tb/charge-profile"
+cp "$tests/fixtures/list-profiles.txt" "$td/list-profiles.txt"
+# system76-power: state in p76.state; DENY file = authorisation refused; every call logged
+cat > "$stubs/system76-power" <<STUB
+#!/bin/sh
+d="$td"
+[ -n "\$P76_MISSING" ] && exit 127
+[ "\$1" = charge-thresholds ] || exit 2
+shift
+echo "charge-thresholds \$*" | sed 's/ *\$//' >> "\$d/p76.log"
+state=\$(cat "\$d/p76.state" 2>/dev/null || echo full_charge)
+case "\$1" in
+    --list-profiles) cat "\$d/list-profiles.txt" ;;
+    --profile) [ -e "\$d/deny" ] && { echo "Error: org.freedesktop.PolicyKit1.Error.NotAuthorized" >&2; exit 1; }
+               case "\$2" in full_charge|balanced|max_lifespan) echo "\$2" > "\$d/p76.state" ;; *) exit 2 ;; esac ;;
+    [0-9]*) [ -e "\$d/deny" ] && { echo "Error: org.freedesktop.PolicyKit1.Error.NotAuthorized" >&2; exit 1; }
+            echo custom > "\$d/p76.state"; echo "\$1 \$2" > "\$d/p76.custom" ;;
+    "") case "\$state" in
+            full_charge)  printf 'Profile: Full Charge (full_charge)\nStart: 90\nEnd: 100\n' ;;
+            balanced)     printf 'Profile: Balanced (balanced)\nStart: 86\nEnd: 90\n' ;;
+            max_lifespan) printf 'Profile: Maximum Lifespan (max_lifespan)\nStart: 50\nEnd: 60\n' ;;
+            custom)       set -- \$(cat "\$d/p76.custom" 2>/dev/null || echo "40 70"); printf 'Start: %s\nEnd: %s\n' "\$1" "\$2" ;;
+        esac ;;
+esac
+STUB
+printf '#!/bin/sh\necho "notify-send $*" >> "%s/notify.log"\n' "$td" > "$stubs/notify-send"
+# agenda-day DATE: the file agenda-DATE.json, or []; the date is logged
+cat > "$tb/agenda-day" <<STUB
+#!/bin/sh
+echo "\$1" >> "$td/agenda.log"
+cat "$td/agenda-\$1.json" 2>/dev/null || echo '[]'
+STUB
+chmod +x "$stubs"/* "$tb"/*
+echo full_charge > "$td/p76.state"; : > "$td/p76.log"; : > "$td/agenda.log"; : > "$td/notify.log"
+
+# ---------------- script part ----------------
+cp_() { env PATH="$stubs:$PATH" sh "$tb/charge-profile" "$@"; }
+state() { cat "$td/p76.state"; }
+setstate() { echo "$1" > "$td/p76.state"; }
+j() { python3 -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
+
+echo "case: charge-profile status and list"
+setstate full_charge
+[ "$(cp_ status | j 'd["profile"],d["start"],d["end"]')" = "full_charge 90 100" ]; check "status: full charge" $?
+setstate balanced
+[ "$(cp_ status | j 'd["profile"],d["start"],d["end"]')" = "balanced 86 90" ]; check "status: balanced" $?
+setstate max_lifespan
+[ "$(cp_ status | j 'd["profile"],d["start"],d["end"]')" = "max_lifespan 50 60" ]; check "status: longest life" $?
+setstate custom
+[ "$(cp_ status | j 'd["profile"],d["end"]')" = "custom 70" ]; check "status: custom thresholds have no profile line" $?
+[ "$(cp_ list | j 'sorted(d), d["balanced"]["end"], d["max_lifespan"]["end"], d["full_charge"]["title"]')" = "['balanced', 'full_charge', 'max_lifespan'] 90 60 Full Charge" ]; check "list: three profiles with their thresholds and titles" $?
+grep -q -- '--profile' "$td/p76.log"; [ $? -ne 0 ]; check "reading never sets anything" $?
+P76_MISSING=1 cp_ status >/dev/null 2>&1; [ $? -eq 1 ]; check "status with system76-power failing: exit 1" $?
+
+echo "case: charge-profile set and next"
+setstate full_charge; : > "$td/notify.log"; : > "$td/p76.log"
+out=$(cp_ set balanced); rc=$?
+{ [ $rc -eq 0 ] && [ "$(state)" = balanced ] && [ "$(echo "$out" | j 'd["profile"]')" = balanced ]; }; check "set balanced: exit 0, profile changed, status printed" $? "$rc $(state) $out"
+grep -q '^charge-thresholds --profile balanced$' "$td/p76.log"; check "it asked system76-power for exactly that profile" $?
+grep -q 'notify-send -a osd -h string:x-canonical-private-synchronous:osd-charge -i battery Charge limit: Balanced (stops at 90%)' "$td/notify.log"; check "popup: osd style, replaces the last one, names the real percentage" $? "$(cat "$td/notify.log")"
+: > "$td/notify.log"; cp_ set max_lifespan >/dev/null
+grep -q 'Charge limit: Longest life (stops at 60%)' "$td/notify.log"; check "popup for longest life" $? "$(cat "$td/notify.log")"
+: > "$td/notify.log"; cp_ set full_charge >/dev/null
+grep -q 'Charge limit: Full charge$' "$td/notify.log"; check "popup for full charge" $? "$(cat "$td/notify.log")"
+: > "$td/notify.log"; CHARGE_NOTIFY=0 cp_ set balanced >/dev/null; [ ! -s "$td/notify.log" ]; check "CHARGE_NOTIFY=0 shows no popup" $?
+setstate full_charge
+seq=""; for i in 1 2 3 4; do cp_ next >/dev/null; seq="$seq $(state)"; done
+[ "$seq" = " balanced max_lifespan full_charge balanced" ]; check "next cycles full -> balanced -> longest life -> full -> balanced" $? "$seq"
+setstate custom; cp_ next >/dev/null; [ "$(state)" = full_charge ]; check "next from custom thresholds goes to full charge" $?
+
+echo "case: charge-profile cap and toggle"
+setstate full_charge; : > "$td/notify.log"; : > "$td/p76.log"
+[ "$(cp_ status | j 'd["capto"]')" = 80 ]; check "status names the cap (80)" $?
+cp_ toggle >/dev/null
+grep -q '^charge-thresholds 70 80$' "$td/p76.log"; check "toggle from full asks for thresholds 70 80" $? "$(cat "$td/p76.log")"
+[ "$(cp_ status | j 'd["profile"],d["start"],d["end"]')" = "custom 70 80" ]; check "now custom 70-80" $?
+grep -q 'Charge limit: Stops at 80%' "$td/notify.log"; check "popup says where it stops" $? "$(cat "$td/notify.log")"
+cp_ toggle >/dev/null; [ "$(state)" = full_charge ]; check "toggle from the cap goes back to full charge" $?
+setstate balanced; cp_ toggle >/dev/null; [ "$(state)" = full_charge ]; check "toggle from any other limit goes to full charge" $?
+: > "$td/p76.log"; CHARGE_CAP="60 75" cp_ set cap >/dev/null
+grep -q '^charge-thresholds 60 75$' "$td/p76.log"; check "CHARGE_CAP changes the cap" $? "$(cat "$td/p76.log")"
+[ "$(CHARGE_CAP='60 75' cp_ status | j 'd["end"],d["capto"]')" = "75 75" ]; check "and status follows it" $?
+: > "$td/p76.log"; CHARGE_CAP='x; touch /tmp/x' cp_ set cap >/dev/null
+grep -q '^charge-thresholds 70 80$' "$td/p76.log"; check "a CHARGE_CAP that is not two numbers falls back to 70 80" $? "$(cat "$td/p76.log")"
+setstate full_charge; touch "$td/deny"; cp_ toggle >/dev/null 2>&1; rc=$?; rm -f "$td/deny"
+{ [ $rc -eq 1 ] && [ "$(state)" = full_charge ]; }; check "toggle refused: exit 1, unchanged" $? "$rc $(state)"
+rm -f "$td/p76.custom"; setstate full_charge
+
+echo "case: charge-profile refused or wrong"
+setstate balanced; : > "$td/notify.log"; touch "$td/deny"
+cp_ set full_charge >/dev/null 2>"$work/err"; rc=$?
+{ [ $rc -eq 1 ] && [ "$(state)" = balanced ]; }; check "authorisation refused: exit 1, profile unchanged" $? "$rc $(state)"
+grep -q 'Charge limit not changed' "$td/notify.log"; check "refusal says so in the popup" $? "$(cat "$td/notify.log")"
+grep -q 'could not set full_charge' "$work/err"; check "and on stderr" $?
+cp_ next >/dev/null 2>&1; [ $? -eq 1 ] && [ "$(state)" = balanced ]; check "next refused: unchanged" $?
+rm -f "$td/deny"
+: > "$td/p76.log"; cp_ set turbo >/dev/null 2>&1; rc=$?
+{ [ $rc -eq 2 ] && ! grep -q -- '--profile' "$td/p76.log"; }; check "unknown name: exit 2, system76-power not asked" $?
+cp_ set 'balanced; touch /tmp/x' >/dev/null 2>&1; [ $? -eq 2 ]; check "a name with shell characters is refused" $?
+cp_ bogus >/dev/null 2>&1; [ $? -eq 2 ]; check "unknown command: usage, exit 2" $?
+
+# ---------------- Quickshell part ----------------
+echo full_charge > "$td/p76.state"; : > "$td/p76.log"; : > "$td/agenda.log"; : > "$td/notify.log"
+mkdir -p "$work/cfg"
+cp "$src"/Charge.qml "$src"/ChargeTravel.qml "$src"/BreaksCore.qml "$work/cfg/"
+cp "$tests"/Sys.qml "$tests"/Notif.qml "$tests"/shell.qml "$work/cfg/"
+log="$work/log"
+env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u QT_QPA_PLATFORMTHEME -u QT_STYLE_OVERRIDE \
+    PATH="$stubs:$PATH" CHARGE_NOTIFY=0 POWER_TEST_BIN="$tb" POWER_TEST_DIR="$td" POWER_CONFIG="$td/power.json" \
+    BREAKS_CONFIG="$td/breaks.json" KEYSTATS_DIR="$td/stats" XDG_RUNTIME_DIR="$td/run" \
+    QT_QPA_PLATFORM=offscreen XDG_STATE_HOME="$td/state" \
+    dbus-run-session -- timeout 150 "$qs" -p "$work/cfg/shell.qml" --no-color > "$log" 2>&1
+code=$?
+[ "$verbose" = 1 ] && cat "$log"
+grep -o 'PWRTEST \(PASS\|FAIL\|case:\|RESULT\).*' "$log" | sed 's/^PWRTEST //'
+if ! grep -q 'PWRTEST RESULT' "$log"; then
+    echo "power-test: the Quickshell run did not finish (exit $code). Last lines:" >&2
+    grep -vE 'dbus-daemon|portal' "$log" | tail -15 >&2
+    exit 2
+fi
+grep -q 'PWRTEST RESULT pass [0-9]* fail 0$' "$log" || ok=1
+if grep -q '\(Charge\|ChargeTravel\|Breaks\|BreaksCore\)\.qml.*\(TypeError\|ReferenceError\|Binding loop\|Cannot assign\)' "$log"; then
+    echo "FAIL the new files logged errors:"; grep '\(Charge\|ChargeTravel\|Breaks\|BreaksCore\)\.qml' "$log" | sort -u | head -8; ok=1
+fi
+
+# ---------------- the singleton wrappers, in a fresh process with fresh files ----------------
+echo "case: Breaks and Charge singleton wrappers"
+mkdir -p "$work/wrap" "$work/wrapstate"
+cp "$src"/Charge.qml "$src"/Breaks.qml "$src"/BreaksCore.qml "$tests"/Sys.qml "$tests"/Notif.qml "$work/wrap/"
+cp "$tests/wrap.qml" "$work/wrap/shell.qml"
+wlog="$work/wlog"
+env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u QT_QPA_PLATFORMTHEME -u QT_STYLE_OVERRIDE \
+    PATH="$stubs:$PATH" CHARGE_NOTIFY=0 POWER_TEST_BIN="$tb" POWER_TEST_DIR="$td" BREAKS_CONFIG="$work/wrapstate/breaks.json" \
+    KEYSTATS_DIR="$work/wrapstate/none" XDG_RUNTIME_DIR="$work/wrapstate" XDG_STATE_HOME="$work/wrapstate" QT_QPA_PLATFORM=offscreen \
+    dbus-run-session -- timeout 30 "$qs" -p "$work/wrap/shell.qml" --no-color > "$wlog" 2>&1
+[ "$verbose" = 1 ] && cat "$wlog"
+grep -o 'PWRTEST \(PASS\|FAIL\).*' "$wlog" | sed 's/^PWRTEST //'
+[ "$(grep -c 'PWRTEST PASS' "$wlog")" = 3 ] || { echo "FAIL the wrapper run did not pass three checks"; ok=1; }
+exit $ok

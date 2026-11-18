@@ -1,0 +1,67 @@
+#!/bin/sh
+# Tests for the wallpaper's agenda band (Quickshell WallAgenda.qml) and the scripts behind it.
+#
+#   agenda-test               run everything; PASS/FAIL lines and a summary; exit 1 on a failure
+#   agenda-test -v            also print everything Quickshell logged
+#   agenda-test -o FILE.png   save a picture of the test band as it ended
+#   agenda-test -d DIR        test the config in DIR instead of ~/.config/quickshell
+#
+# Two parts:
+#  - band: the real WallAgenda.qml on a made-up day, offscreen, driven with synthetic mouse
+#    events (cases in ~/.config/quickshell/tests/agenda/shell.qml, stub Sys beside it).
+#    Lanes, hit areas, what each click launches, tooltip text and placement. Nothing is
+#    launched, no window appears, the real cursor never moves.
+#  - live: today's real agenda-day output, every timed event looked up with agenda-open -n
+#    (read-only), so a click on any of them would find its Org entry.
+verbose=0; out=""; src="$HOME/.config/quickshell"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) verbose=1 ;;
+        -o) out="$2"; shift ;;
+        -d) src="$2"; shift ;;
+        *) echo "usage: agenda-test [-v] [-o FILE.png] [-d CONFIG_DIR]" >&2; exit 2 ;;
+    esac
+    shift
+done
+qs="$HOME/.nix-profile/bin/qs"
+tests="$src/tests/agenda"
+[ -d "$tests" ] || tests="$HOME/.config/quickshell/tests/agenda"
+[ -x "$qs" ] && [ -f "$tests/shell.qml" ] || { echo "agenda-test: no qs, or no $tests/shell.qml" >&2; exit 2; }
+
+work=$(mktemp -d) || exit 2
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/cfg" "$work/state"
+cp "$src/WallAgenda.qml" "$src/Theme.qml" "$work/cfg/"
+cp "$tests"/*.qml "$work/cfg/"
+
+log="$work/log"
+env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u QT_QPA_PLATFORMTHEME -u QT_STYLE_OVERRIDE \
+    QT_QPA_PLATFORM=offscreen XDG_STATE_HOME="$work/state" AGENDA_TEST_OUT="$out" \
+    dbus-run-session -- timeout 60 "$qs" -p "$work/cfg/shell.qml" --no-color > "$log" 2>&1
+code=$?
+[ "$verbose" = 1 ] && cat "$log"
+grep -o 'AGENDATEST \(PASS\|FAIL\|case:\|RESULT\).*' "$log" | sed 's/^AGENDATEST //'
+if ! grep -q 'AGENDATEST RESULT' "$log"; then
+    echo "agenda-test: the band run did not finish (exit $code). Last lines:" >&2
+    grep -vE 'dbus-daemon|portal' "$log" | tail -15 >&2
+    exit 2
+fi
+ok=0; grep -q 'AGENDATEST RESULT pass [0-9]* fail 0$' "$log" || ok=1
+if grep -q 'WallAgenda.qml.*\(TypeError\|ReferenceError\|Binding loop\)' "$log"; then
+    echo "FAIL the band logged errors:"; grep 'WallAgenda.qml' "$log" | sort -u | head -5; ok=1
+fi
+
+echo "case: live (today's calendar, read-only)"
+"$HOME/.local/bin/agenda-day" | python3 -c '
+import json, subprocess, sys
+bad = n = 0
+for e in json.load(sys.stdin):
+    if e["allday"] or not e["start"]:
+        continue
+    n += 1
+    r = subprocess.run([sys.argv[1], "-n", e["date"], e["start"], e["title"], e["id"]], capture_output=True, text=True)
+    if r.returncode:
+        bad += 1; print("FAIL agenda-open finds", e["start"], e["title"], "  [" + r.stderr.strip() + "]")
+print(("PASS" if not bad else "FAIL"), f"agenda-open finds {n - bad} of {n} events today")
+sys.exit(1 if bad else 0)' "$HOME/.local/bin/agenda-open" || ok=1
+exit $ok

@@ -1,0 +1,10 @@
+#!/bin/sh
+# data-test stub: `mu find ... maildir:"/X/INBOX"` prints $DT_DIR/mu/clemson.txt or personal.txt
+echo "mu $*" >> "$DT_DIR/calls.log"
+[ -e "$DT_DIR/mu/fail" ] && { echo "mu: error: database locked" >&2; exit 1; }
+case "$*" in
+    *work*) f=clemson ;;
+    *) f=personal ;;
+esac
+[ -f "$DT_DIR/mu/$f.txt" ] && /bin/cat "$DT_DIR/mu/$f.txt"
+exit 0

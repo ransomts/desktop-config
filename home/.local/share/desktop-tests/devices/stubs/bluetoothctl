@@ -1,0 +1,36 @@
+#!/bin/sh
+# Fake bluetoothctl over $FAKE_DIR/bt/<MAC with _>/:
+#   state    off | a2dp | hfp (A2DP never came up: headset profiles only) | manual-hfp (A2DP listed,
+#            headset active) | nosink (Connected: yes but no card/sink: "Protocol not available")
+#            | a2dp-unavail (a2dp-sink listed but available: no) | a2dp-nosink (A2DP listed, no sink)
+#   trusted  exists = Trusted: yes      name, icon  (defaults MOMENTUM 4, audio-headphones)
+#   connectq one result per `connect` (a state, or "fail" = stays as it is); then the file "default"
+F=${FAKE_DIR:?}
+echo "bluetoothctl $*" >> "$F/calls.log"
+d() { echo "$F/bt/$(echo "$1" | tr : _)"; }
+st() { cat "$(d "$1")/state" 2>/dev/null || echo off; }
+case "$1" in
+    info)
+        dir=$(d "$2"); [ -d "$dir" ] || { echo "Device $2 not available"; exit 1; }
+        s=$(st "$2"); [ "$s" = off ] && c=no || c=yes
+        [ -e "$dir/trusted" ] && t=yes || t=no
+        printf 'Device %s (public)\n\tName: %s\n\tAlias: %s\n\tClass: 0x00240404\n\tIcon: %s\n\tPaired: yes\n\tBonded: yes\n\tTrusted: %s\n\tBlocked: no\n\tConnected: %s\n\tLegacyPairing: no\n' \
+            "$2" "$(cat "$dir/name" 2>/dev/null || echo 'MOMENTUM 4')" "$(cat "$dir/name" 2>/dev/null || echo 'MOMENTUM 4')" \
+            "$(cat "$dir/icon" 2>/dev/null || echo audio-headphones)" "$t" "$c" ;;
+    devices)
+        for dir in "$F"/bt/*/; do
+            [ -d "$dir" ] || continue
+            mac=$(basename "$dir" | tr _ :)
+            [ "$2" = Connected ] && [ "$(st "$mac")" = off ] && continue
+            echo "Device $mac $(cat "$dir/name" 2>/dev/null || echo 'MOMENTUM 4')"
+        done ;;
+    connect)
+        dir=$(d "$2"); [ -d "$dir" ] || { echo "Device $2 not available"; exit 1; }
+        r=$(head -n1 "$dir/connectq" 2>/dev/null)
+        if [ -n "$r" ]; then sed -i 1d "$dir/connectq"; else r=$(cat "$dir/default" 2>/dev/null || echo fail); fi
+        [ "$r" = fail ] && { echo "Failed to connect: org.bluez.Error.Failed br-connection-page-timeout"; exit 1; }
+        echo "$r" > "$dir/state"; echo "Connection successful" ;;
+    disconnect) dir=$(d "$2"); [ -d "$dir" ] && echo off > "$dir/state"; echo "Successful disconnected" ;;
+    trust) dir=$(d "$2"); [ -d "$dir" ] && : > "$dir/trusted"; echo "Changing $2 trust succeeded" ;;
+esac
+exit 0

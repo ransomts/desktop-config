@@ -1,0 +1,5 @@
+#!/bin/sh
+# stub (hypr-scripts-test): record; a "Music" frame appears on the workspace in $W/emacs-ws
+# (default special:library) unless $W/no-window
+echo "emacsclient $*" >> "$CALLS"
+[ -e "$W/no-window" ] || python3 -I "$(dirname "$0")/../fakehypr.py" add-client emacs Music "$(cat "$W/emacs-ws" 2>/dev/null || echo special:library)"

@@ -42,12 +42,11 @@ def main(argv):
         print(__doc__.strip().splitlines()[2].strip(), file=sys.stderr)
         return 2
     kind, title = argv[1], argv[2]
-    rest = argv[3:]
-    body = ""
-    if rest and not (rest[0].split("=", 1)[0].isidentifier() and "=" in rest[0]):
-        body, rest = rest[0], rest[1:]
+    # argv[3] is always the body (the callers pass it positionally, even empty): a body
+    # that looks like key=value ("build=green") must stay the body. Extras are argv[4:].
+    body = argv[3] if len(argv) > 3 else ""
     extra = {}
-    for kv in rest:
+    for kv in argv[4:]:
         k, _, v = kv.partition("=")
         if k.isidentifier():
             extra[k.lower()] = v
@@ -62,7 +61,7 @@ def main(argv):
         "MSG_BODY": body,
     }
     for k, v in extra.items():
-        fields["MSG_" + k.upper()] = v
+        fields.setdefault("MSG_" + k.upper(), v)       # an extra never overwrites MSG_TITLE/MSG_BODY
     try:
         journal_send(fields)
     except OSError:

@@ -1,0 +1,399 @@
+#!/bin/sh
+# Tests for recording with sound (screen-record), the mic keys (mic) and the webcam bubble
+# (Quickshell CamState.qml, CamView.qml, CamBubble.qml).
+#
+#   capture-test               run everything; PASS/FAIL lines and a summary; exit 1 on a failure
+#   capture-test -v            also print the stub call log and everything Quickshell logged
+#   capture-test -o PREFIX     save PREFIX-dark.png and PREFIX-light.png of the bubble
+#   capture-test -d DIR        test the Quickshell config in DIR instead of ~/.config/quickshell
+#   capture-test -b DIR        test the scripts in DIR instead of the ones beside this script
+#   capture-test -p FILE       also compare plain region/screen/status/stop with FILE (an older
+#                              screen-record) call for call
+#
+# Three parts, none of which records, opens the camera or the microphone, or touches PipeWire:
+#  - screen-record and mic run with a made-up HOME, XDG_RUNTIME_DIR and XDG_STATE_HOME and
+#    stubs first on PATH for wf-recorder, pactl, slurp, cursor-output, ffmpeg, notify-send,
+#    xdg-open, pgrep, pkill, wpctl, and in the fake HOME for qs, qs-pick, osd, bar-refresh.
+#    The stubs log every call; the cases check the log, the state file and the remembered choice.
+#    The stub pactl keeps a made-up module list (with modules that are not ours, which must survive).
+#  - gif for real: ffmpeg makes a 2 s test clip from a generated pattern and screen-record gif
+#    turns it into a GIF (width and frame rate checked with ffprobe).
+#  - the bubble: the real CamState/CamView offscreen (tests/capture/shell.qml) fed by ffmpeg's
+#    generated test pattern (lavfi) instead of the camera, driven with synthetic mouse events.
+verbose=0; out=""; src="$HOME/.config/quickshell"; bin=$(cd "$(dirname "$0")" && pwd); ref=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) verbose=1 ;;
+        -o) out="$2"; shift ;;
+        -d) src="$2"; shift ;;
+        -b) bin="$2"; shift ;;
+        -p) ref="$2"; shift ;;
+        *) echo "usage: capture-test [-v] [-o PREFIX] [-d CONFIG_DIR] [-b BIN_DIR] [-p OLD_SCREEN_RECORD]" >&2; exit 2 ;;
+    esac
+    shift
+done
+case "$out" in ""|/*) ;; *) out="$PWD/$out" ;; esac
+[ -x "$bin/screen-record" ] && [ -x "$bin/mic" ] || { echo "capture-test: no screen-record or mic in $bin" >&2; exit 2; }
+for t in jq ffmpeg ffprobe python3 setpriv; do command -v $t >/dev/null || { echo "capture-test: needs $t" >&2; exit 2; }; done
+
+work=$(mktemp -d) || exit 2
+trap 'cleanup_work' EXIT
+cleanup_work() {
+    [ -f "$work/stub/wf.pid" ] && kill "$(cat "$work/stub/wf.pid")" 2>/dev/null
+    rm -rf "$work"
+}
+pass=0; fail=0
+check() {   # check NAME COND-EXIT [DETAIL]
+    if [ "$2" = 0 ]; then pass=$((pass + 1)); echo "PASS $1"
+    else fail=$((fail + 1)); echo "FAIL $1${3:+   [$3]}"; fi
+}
+ok() { "$@" >/dev/null 2>&1; echo $?; }    # ok CMD...: 0 when CMD succeeds
+
+# ---------------- stubs ----------------
+S="$work/stub"; H="$work/home"
+mkdir -p "$S" "$H/.local/bin" "$H/.nix-profile/bin" "$work/run" "$work/state"
+CALLS="$work/calls"; : > "$CALLS"
+logstub() {   # logstub NAME: a stub that only logs its call
+    printf '#!/bin/sh\nn=$(basename "$0"); { printf "%%s" "$n"; for a in "$@"; do printf " [%%s]" "$a"; done; echo; } >> "%s"\n' "$CALLS" > "$1"
+    chmod +x "$1"
+}
+for n in notify-send xdg-open; do logstub "$S/$n"; done
+for n in bar-refresh osd; do logstub "$H/.local/bin/$n"; done
+logstub "$S/hyprctl"
+
+cat > "$S/wf-recorder" <<EOF
+#!/usr/bin/env python3
+# stub: logs its arguments, waits for SIGINT/SIGTERM, then writes a few bytes to the -f file
+import os, signal, sys, time
+a = sys.argv[1:]
+with open("$CALLS", "a") as f: f.write("wf-recorder" + "".join(" [%s]" % x for x in a) + "\n")
+if os.environ.get("WF_FAIL") == "1": sys.exit(1)
+open("$S/wf.pid", "w").write(str(os.getpid()))
+out = a[a.index("-f") + 1]
+def stop(sig, frm):
+    with open("$CALLS", "a") as f: f.write("wf-recorder-got %s\n" % signal.Signals(sig).name)
+    open(out, "wb").write(b"not really a video\n")
+    sys.exit(0)
+signal.signal(signal.SIGINT, stop); signal.signal(signal.SIGTERM, stop)
+while True: time.sleep(0.05)
+EOF
+chmod +x "$S/wf-recorder"
+# pgrep/pkill: the old script finds wf-recorder by name; these only ever see the stub's pid
+cat > "$S/pgrep" <<EOF
+#!/bin/sh
+echo "pgrep \$*" >> "$CALLS"
+[ "\$1" = -x ] && [ "\$2" = wf-recorder ] || exit 1
+p=\$(cat "$S/wf.pid" 2>/dev/null) && [ -n "\$p" ] && kill -0 "\$p" 2>/dev/null && [ -n "\$(tr -d '\0' < /proc/\$p/cmdline 2>/dev/null)" ] && echo "\$p"
+EOF
+cat > "$S/pkill" <<EOF
+#!/bin/sh
+echo "pkill \$*" >> "$CALLS"
+[ "\$1" = -INT ] && [ "\$2" = -x ] && [ "\$3" = wf-recorder ] || exit 1
+p=\$(cat "$S/wf.pid" 2>/dev/null) && kill -INT "\$p" 2>/dev/null
+EOF
+printf '#!/bin/sh\necho "10,20 300x200"\n' > "$S/slurp"
+printf '#!/bin/sh\necho eDP-TEST\n' > "$S/cursor-output"
+# pactl: a made-up module table in $S/modules ("ID<TAB>NAME<TAB>ARGS"), ids from 501
+cat > "$S/pactl" <<EOF
+#!/bin/sh
+{ printf pactl; for a in "\$@"; do printf ' [%s]' "\$a"; done; echo; } >> "$CALLS"
+M="$S/modules"; touch "\$M"
+case "\$1" in
+    get-default-source) echo test-mic ;;
+    get-default-sink) echo test-speakers ;;
+    set-default-sink) ;;
+    list) [ "\$2" = short ] && [ "\$3" = modules ] && cat "\$M" ;;
+    load-module)
+        n=\$(( \$(cat "$S/loads" 2>/dev/null || echo 0) + 1 )); echo \$n > "$S/loads"
+        [ -n "\$PACTL_FAIL_AT" ] && [ "\$n" = "\$PACTL_FAIL_AT" ] && { echo "Failure: Module initialization failed" >&2; exit 1; }
+        id=\$(( \$(cat "$S/nextid" 2>/dev/null || echo 501) )); echo \$((id + 1)) > "$S/nextid"
+        name=\$2; shift 2
+        printf '%s\t%s\t%s\n' "\$id" "\$name" "\$*" >> "\$M"; echo "\$id" ;;
+    unload-module)
+        grep -q "^\$2	" "\$M" || { echo "Failure: No such entity" >&2; exit 1; }
+        grep -v "^\$2	" "\$M" > "\$M.new"; mv "\$M.new" "\$M" ;;
+    *) exit 1 ;;
+esac
+EOF
+# ffmpeg: logs and writes its last argument
+cat > "$S/ffmpeg" <<EOF
+#!/bin/sh
+{ printf ffmpeg; for a in "\$@"; do printf ' [%s]' "\$a"; done; echo; } >> "$CALLS"
+for last; do :; done; echo fake > "\$last"
+EOF
+# wpctl: one made-up source whose mute flag lives in $S/muted
+cat > "$S/wpctl" <<EOF
+#!/bin/sh
+{ printf wpctl; for a in "\$@"; do printf ' [%s]' "\$a"; done; echo; } >> "$CALLS"
+m=\$(cat "$S/muted" 2>/dev/null || echo 0)
+case "\$1" in
+    get-volume) if [ "\$m" = 1 ]; then echo "Volume: 0.50 [MUTED]"; else echo "Volume: 0.50"; fi ;;
+    set-mute) case "\$3" in toggle) echo \$((1 - m)) > "$S/muted" ;; 0|1) echo "\$3" > "$S/muted" ;; esac ;;
+esac
+EOF
+# qs: only `ipc call cam ...`; status says shown when $S/cam-shown exists
+cat > "$H/.nix-profile/bin/qs" <<EOF
+#!/bin/sh
+{ printf qs; for a in "\$@"; do printf ' [%s]' "\$a"; done; echo; } >> "$CALLS"
+case "\$*" in
+    "ipc call cam status") if [ -f "$S/cam-shown" ]; then echo '{"shown":true,"size":220}'; else echo '{"shown":false,"size":220}'; fi ;;
+    "ipc call cam on") touch "$S/cam-shown" ;;
+    "ipc call cam off") rm -f "$S/cam-shown" ;;
+    *) exit 1 ;;
+esac
+EOF
+# qs-pick: logs the list it was given, answers with the next line of $S/answers (a substring)
+cat > "$H/.local/bin/qs-pick" <<EOF
+#!/bin/sh
+echo "qs-pick \$*" >> "$CALLS"
+cat > "$S/picklist"; cat "$S/picklist" >> "$S/picklists"
+want=\$(head -1 "$S/answers"); sed -i 1d "$S/answers"
+[ -n "\$want" ] || exit 1
+grep -F -- "\$want" "$S/picklist" | head -1 | grep . || exit 1
+EOF
+chmod +x "$S"/* "$H/.nix-profile/bin/qs" "$H/.local/bin/qs-pick"
+
+run() {   # run SCRIPT ARGS...: in the fake world
+    env -i PATH="$S:/usr/bin:/bin" HOME="$H" XDG_RUNTIME_DIR="$work/run" XDG_STATE_HOME="$work/state" \
+        LANG=C.UTF-8 WF_FAIL="${WF_FAIL:-}" PACTL_FAIL_AT="${PACTL_FAIL_AT:-}" "$@"
+}
+SR="$bin/screen-record"
+STATE="$work/run/screen-record"; PREFS="$work/state/screen-record.json"; REC="$H/Videos/Recordings"
+# A saved "no sound" choice: without one, screen-record defaults to the microphone (since 2026-11-17),
+# and the cases below were written for plain, silent recordings. "case: first run" covers the default.
+fresh() { : > "$CALLS"; rm -f "$S/loads" "$S/wf.pid" "$S/cam-shown" "$STATE"; mkdir -p "$(dirname "$PREFS")"; echo '{"mic":false,"system":false}' > "$PREFS"; printf '3\tlibpipewire-module-rt\t\n9\tmodule-loopback\tsource=other sink=elsewhere\n12\tmodule-null-sink\tsink_name=screenrec-mixer-not-ours\n' > "$S/modules"; }
+foreign_ok() { [ "$(grep -c '^3	\|^9	\|^12	' "$S/modules")" = 3 ]; echo $?; }
+recarg() { grep '^wf-recorder \[' "$CALLS" | tail -1; }
+waitgone() { for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -f "$STATE" ] || return 0; sleep 0.1; done; return 1; }
+has() { grep -qF -- "$1" "${2:-$CALLS}"; echo $?; }
+hasnt() { grep -qF -- "$1" "${2:-$CALLS}"; [ $? = 1 ]; echo $?; }
+norm() { sed "s|$REC/[0-9_-]*\.mp4|FILE|g; s|Videos/Recordings/[0-9_-]*\.mp4|FILE|g; s|[0-9_-]*\.mp4|FILE|g; s|REC [0-9]*:[0-9]*|REC M:SS|g"; }
+G_REC=$(printf '\363\260\221\212'); G_MIC=$(printf '\363\260\215\254'); G_SPK=$(printf '\363\260\225\276'); G_CAM=$(printf '\363\260\226\240')
+
+echo "case: plain recordings, as before"
+fresh
+run "$SR" region; check "region: exits 0, wf-recorder gets -g GEOM -f FILE (no audio)" \
+    "$( [ "$(recarg | norm)" = "wf-recorder [-g] [10,20 300x200] [-f] [FILE]" ]; echo $?)" "$(recarg)"
+st=$(run "$SR" status)
+check "status: REC pill text with no sound glyphs" "$(printf '%s' "$st" | jq -e --arg g "$G_REC" '.text | test("^" + $g + " REC 0:0[0-9]$")' >/dev/null; echo $?)" "$st"
+check "status: tooltip names the file, class rec" "$(printf '%s' "$st" | jq -e '(.tooltip | startswith("<b>Recording</b>: 20")) and .class == "rec" and .mic == false' >/dev/null; echo $?)" "$st"
+check "state: line 1 the file, then pid=" "$( head -1 "$STATE" | grep -q "^$REC/.*\.mp4$" && grep -q "^pid=[0-9]" "$STATE"; echo $?)"
+run "$SR" region      # either key while recording stops it
+check "region again stops it: SIGINT, state gone" "$( [ "$(has 'wf-recorder-got SIGINT')" = 0 ] && waitgone; echo $?)"
+check "stop: 'Recording saved' notification with Open / Show in folder" "$(has 'notify-send [-a] [Recording] [-i] [video-x-generic] [-A] [open=Open] [-A] [folder=Show in folder] [Recording saved] [Videos/Recordings/')"
+check "no pactl module loaded, no camera call" "$( [ "$(has 'load-module')" = 1 ] && [ "$(has 'ipc call cam')" = 1 ]; echo $?)"
+check "status when idle: {\"text\":\"\"}" "$( [ "$(run "$SR" status)" = '{"text":""}' ]; echo $?)"
+check "nothing remembered by a plain recording" "$( [ ! -f "$PREFS" ] || [ "$(jq -r .mic "$PREFS")" != true ]; echo $?)"
+fresh; run "$SR" screen; check "screen: -o OUTPUT -f FILE" "$( [ "$(recarg | norm)" = "wf-recorder [-o] [eDP-TEST] [-f] [FILE]" ]; echo $?)" "$(recarg)"
+run "$SR" stop; waitgone
+check "stop: recorder got SIGINT, state removed, bar refreshed" "$( [ "$(has 'wf-recorder-got SIGINT')" = 0 ] && [ ! -f "$STATE" ] && [ "$(has 'bar-refresh [13]')" = 0 ]; echo $?)"
+check "stop when idle does nothing" "$( : > "$CALLS"; run "$SR" stop; [ "$(has wf-recorder-got)" = 1 ]; echo $?)"
+check "last: the recording just made" "$(run "$SR" last | grep -q "^$REC/.*\.mp4$"; echo $?)"
+check "unknown option: exit 2" "$(run "$SR" region --loud 2>/dev/null; [ $? = 2 ]; echo $?)"
+
+if [ -n "$ref" ]; then
+    echo "case: same calls as $ref"
+    for m in region screen; do
+        fresh; run "$ref" $m; old_rec=$(recarg | norm); old_st=$(run "$ref" status | jq -c '{text, tooltip: (.tooltip|split("\n")[0]), class}' | norm); run "$ref" stop; waitgone
+        old_note=$(grep '^notify-send' "$CALLS" | norm)
+        fresh; run "$SR" $m; new_rec=$(recarg | norm); new_st=$(run "$SR" status | jq -c '{text, tooltip: (.tooltip|split("\n")[0]), class}' | norm); run "$SR" stop; waitgone
+        new_note=$(grep '^notify-send' "$CALLS" | norm)
+        check "$m: same wf-recorder command line" "$( [ "$old_rec" = "$new_rec" ]; echo $?)" "$old_rec | $new_rec"
+        check "$m: same status text, first tooltip line and class" "$( [ "$old_st" = "$new_st" ]; echo $?)" "$old_st | $new_st"
+        check "$m: same notification on stop" "$( [ "$old_note" = "$new_note" ] && [ -n "$new_note" ]; echo $?)" "$old_note | $new_note"
+    done
+fi
+
+echo "case: first run (no sound choice saved yet): the microphone"
+fresh; rm -f "$PREFS"
+run "$SR" region; check "no choice saved: region records the default microphone" "$(recarg | grep -q -- '--audio'; echo $?)" "$(recarg)"
+st=$(run "$SR" status)
+check "no choice saved: status shows the mic glyph" "$(printf '%s' "$st" | jq -e '.mic == true' >/dev/null; echo $?)" "$st"
+run "$SR" stop; waitgone
+
+echo "case: --mic"
+fresh; run "$SR" region --mic
+check "wf-recorder --audio=<default source>" "$(recarg | grep -qF '[-g] [10,20 300x200] [--audio=test-mic] [-f]'; echo $?)" "$(recarg)"
+st=$(run "$SR" status)
+check "status: mic glyph, .mic true, tooltip 'Sound: microphone'" "$(printf '%s' "$st" | jq -e --arg g "$G_MIC" '(.text | endswith(" " + $g)) and .mic and (.system | not) and (.tooltip | contains("Sound: microphone\n"))' >/dev/null; echo $?)" "$st"
+check "remembered {mic:true, system:false, cam:false}" "$(jq -e '.mic == true and .system == false and .cam == false' "$PREFS" >/dev/null; echo $?)"
+check "no modules for one source" "$(hasnt load-module)"
+run "$SR" stop; waitgone
+
+echo "case: --system (also --system-audio)"
+fresh; run "$SR" screen --system-audio
+check "wf-recorder --audio=<default sink>.monitor" "$(recarg | grep -qF '[--audio=test-speakers.monitor]'; echo $?)" "$(recarg)"
+st=$(run "$SR" status)
+check "status: speaker glyph, .system true" "$(printf '%s' "$st" | jq -e --arg g "$G_SPK" '(.text | endswith(" " + $g)) and .system and (.mic | not)' >/dev/null; echo $?)" "$st"
+run "$SR" stop; waitgone
+
+echo "case: --mic --system (mixed)"
+fresh; run "$SR" region --mic --system
+mix=$(sed -n 's/^mix=//p' "$STATE"); mods=$(sed -n 's/^modules=//p' "$STATE")
+check "a null sink screenrec-mix-PID and two loopbacks into it" "$( [ "$(grep -c "sink=$mix\b\|sink_name=$mix\b" "$S/modules")" = 3 ] && grep -q "module-loopback	source=test-mic sink=$mix " "$S/modules" && grep -q "module-loopback	source=test-speakers.monitor sink=$mix " "$S/modules"; echo $?)" "$(cat "$S/modules")"
+check "wf-recorder records the mix's monitor" "$(recarg | grep -qF "[--audio=$mix.monitor]"; echo $?)" "$(recarg)"
+check "state keeps the three module ids" "$( [ "$(echo $mods | wc -w)" = 3 ]; echo $?)" "$mods"
+check "default sink checked after loading" "$(has 'pactl [get-default-sink]')"
+st=$(run "$SR" status)
+check "status: both glyphs, 'microphone + system sound'" "$(printf '%s' "$st" | jq -e '.mic and .system and (.tooltip | contains("Sound: microphone + system sound"))' >/dev/null; echo $?)" "$st"
+: > "$CALLS"; run "$SR" stop; waitgone
+check "stop unloads exactly those three" "$( [ "$(grep -c '^pactl \[unload-module\]' "$CALLS")" = 3 ] && for id in $mods; do grep -qF "pactl [unload-module] [$id]" "$CALLS" || exit 1; done; echo $?)" "$(grep unload "$CALLS")"
+check "...after the recorder stopped" "$(awk '/wf-recorder-got/ { s = NR } /unload-module/ && !u { u = NR } END { exit !(s && u > s) }' "$CALLS"; echo $?)"
+check "the modules that were not ours are still there" "$(foreign_ok)" "$(cat "$S/modules")"
+check "no screenrec module left" "$(grep -q screenrec-mix- "$S/modules"; [ $? = 1 ]; echo $?)"
+
+echo "case: remembered choice"
+: > "$CALLS"; run "$SR" screen
+check "plain screen after --mic --system: mixed again" "$(recarg | grep -qF '[--audio=screenrec-mix-'; echo $?)" "$(recarg)"
+run "$SR" stop; waitgone
+run "$SR" region --none; run "$SR" stop; waitgone
+: > "$CALLS"; run "$SR" region
+check "after --none: plain region has no audio" "$(recarg | grep -q 'audio'; [ $? = 1 ]; echo $?)" "$(recarg)"
+run "$SR" stop; waitgone
+
+echo "case: the recorder dies on its own"
+fresh; run "$SR" region --mic --system; mods=$(sed -n 's/^modules=//p' "$STATE")
+kill -TERM "$(cat "$S/wf.pid")"; waitgone
+check "its waiting shell unloads the modules and removes the state" "$( [ ! -f "$STATE" ] && ! grep -q screenrec-mix- "$S/modules"; echo $?)" "$(cat "$S/modules")"
+check "foreign modules untouched" "$(foreign_ok)"
+
+echo "case: stale state at the next start"
+fresh
+printf '%s\n' "$REC/old.mp4" "pid=999999" "mic=1" "system=1" "cam=0" "camowned=0" "mix=screenrec-mix-4242" "modules=601 602 603" > "$STATE"
+printf '601\tmodule-null-sink\tsink_name=screenrec-mix-4242 sink_properties=x\n602\tmodule-loopback\tsource=test-mic sink=screenrec-mix-4242 latency_msec=30\n603\tmodule-loopback\tsource=test-speakers.monitor sink=screenrec-mix-4242 latency_msec=30\n610\tmodule-null-sink\tsink_name=screenrec-mix-31337 sink_properties=x\n' >> "$S/modules"
+check "status ignores a stale state (recorder not running)" "$( [ "$(run "$SR" status)" = '{"text":""}' ]; echo $?)"
+run "$SR" region --none
+check "start unloads the stale state's modules and an orphan of ours" "$(for id in 601 602 603 610; do grep -qF "pactl [unload-module] [$id]" "$CALLS" || exit 1; done; echo $?)" "$(grep unload "$CALLS")"
+check "foreign modules untouched" "$(foreign_ok)" "$(cat "$S/modules")"
+check "and the new recording started" "$(head -1 "$STATE" | grep -q '^/.*[0-9]\.mp4$' && grep -q '^pid=' "$STATE"; echo $?)"
+run "$SR" stop; waitgone
+
+echo "case: setup fails half way"
+fresh; PACTL_FAIL_AT=3 run "$SR" region --mic --system 2>/dev/null
+check "the two modules it made are unloaded, nothing records" "$( [ "$(grep -c '^pactl \[unload-module\]' "$CALLS")" = 2 ] && ! grep -q screenrec-mix- "$S/modules" && [ "$(has '^wf-recorder [')" = 1 ] && [ ! -f "$STATE" ]; echo $?)" "$(grep 'unload\|^wf' "$CALLS")"
+check "critical notification" "$(has "[-u] [critical] [Recording didn't start] [Could not mix")"
+fresh; WF_FAIL=1 run "$SR" region --mic --system --cam
+waitgone
+check "recorder fails at once: modules unloaded, bubble off again, state gone, notified" "$( ! grep -q screenrec-mix- "$S/modules" && [ ! -f "$STATE" ] && [ ! -f "$S/cam-shown" ] && [ "$(has "[Recording didn't start]")" = 0 ]; echo $?)" "$(cat "$S/modules")"
+
+echo "case: --cam"
+fresh; run "$SR" region --cam
+check "bubble turned on (status asked first), state camowned=1" "$( [ "$(has 'qs [ipc] [call] [cam] [status]')" = 0 ] && [ "$(has 'qs [ipc] [call] [cam] [on]')" = 0 ] && grep -q '^camowned=1' "$STATE"; echo $?)"
+check "status: cam glyph, .cam true" "$(run "$SR" status | jq -e --arg g "$G_CAM" '.cam and (.text | endswith(" " + $g))' >/dev/null; echo $?)"
+run "$SR" stop; waitgone
+check "stop turns the bubble off" "$(has 'qs [ipc] [call] [cam] [off]')"
+fresh; touch "$S/cam-shown"; run "$SR" region --cam; run "$SR" stop; waitgone
+check "bubble already on: left on after stop" "$( [ "$(has 'qs [ipc] [call] [cam] [on]')" = 1 ] && [ "$(has 'qs [ipc] [call] [cam] [off]')" = 1 ] && [ -f "$S/cam-shown" ]; echo $?)"
+
+echo "case: gif (stub ffmpeg)"
+fresh; run "$SR" region; run "$SR" stop; waitgone
+last=$(run "$SR" last); : > "$CALLS"
+gout=$(run "$SR" gif)
+check "gif: prints FILE.gif beside the clip" "$( [ "$gout" = "${last%.mp4}.gif" ] && [ -s "$gout" ]; echo $?)" "$gout"
+check "pass 1: palettegen at 12 fps, max 960 wide" "$(has "ffmpeg [-hide_banner] [-loglevel] [error] [-nostdin] [-y] [-i] [$last] [-vf] [fps=12,scale='min(960,iw)':-2:flags=lanczos,palettegen=stats_mode=diff]")"
+check "pass 2: paletteuse with that palette" "$(grep '^ffmpeg' "$CALLS" | sed -n 2p | grep -qF "[-i] [$last] [-i] [/tmp/" && grep '^ffmpeg' "$CALLS" | sed -n 2p | grep -qF "[fps=12,scale='min(960,iw)':-2:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle] [${last%.mp4}.gif]"; echo $?)" "$(grep '^ffmpeg' "$CALLS")"
+other="$REC/other clip.mp4"; echo x > "$other"; : > "$CALLS"
+check "gif FILE: the given file (spaces too)" "$( [ "$(run "$SR" gif "$other")" = "$REC/other clip.gif" ]; echo $?)"
+check "gif of a missing file: exit 1" "$(run "$SR" gif "$REC/nope.mp4"; [ $? = 1 ]; echo $?)"
+
+echo "case: gif (real ffmpeg on a generated clip)"
+R="$work/realbin"; mkdir -p "$R"; for n in notify-send xdg-open; do cp "$S/$n" "$R/"; done
+clip="$REC/pattern.mp4"
+ffmpeg -hide_banner -loglevel error -nostdin -y -f lavfi -i testsrc2=size=1280x720:rate=30 -t 2 -pix_fmt yuv420p "$clip"
+gout=$(env -i PATH="$R:/usr/bin:/bin" HOME="$H" XDG_RUNTIME_DIR="$work/run" XDG_STATE_HOME="$work/state" "$SR" gif "$clip")
+dims=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate -of csv=p=0 "$gout" 2>/dev/null)
+check "GIF made: 960x540 at 12 fps" "$( [ "$dims" = "960,540,12/1" ]; echo $?)" "$dims"
+small="$REC/small.mp4"
+ffmpeg -hide_banner -loglevel error -nostdin -y -f lavfi -i testsrc2=size=640x360:rate=30 -t 1 -pix_fmt yuv420p "$small"
+gout=$(env -i PATH="$R:/usr/bin:/bin" HOME="$H" XDG_RUNTIME_DIR="$work/run" XDG_STATE_HOME="$work/state" "$SR" gif "$small")
+dims=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$gout" 2>/dev/null)
+check "a small clip keeps its size (640x360)" "$( [ "$dims" = "640,360" ]; echo $?)" "$dims"
+
+echo "case: pick"
+fresh; : > "$S/picklists"
+printf '%s\n' "This screen, $G_MIC microphone + $G_SPK system" > "$S/answers"
+run "$SR" pick
+check "the list: 8 record lines, webcam, GIF, folder" "$( [ "$(grep -c 'Region, \|This screen, ' "$S/picklists")" = 8 ] && grep -q 'Webcam bubble while recording: off' "$S/picklists" && grep -q 'Make a GIF of the last clip' "$S/picklists" && grep -q 'Open recordings folder' "$S/picklists"; echo $?)" "$(cat "$S/picklists")"
+check "picking 'This screen, microphone + system' records the screen mixed" "$(recarg | grep -q '^wf-recorder \[-o\] \[eDP-TEST\] \[--audio=screenrec-mix-'; echo $?)" "$(recarg)"
+: > "$S/picklists"; printf '%s\n' "Stop recording" > "$S/answers"; run "$SR" pick; waitgone
+check "while recording the list offers Stop, and it stops" "$(grep -q 'Stop recording' "$S/picklists" && [ ! -f "$STATE" ]; echo $?)"
+: > "$S/picklists"; printf '%s\n' "Webcam bubble" "Region, no sound" > "$S/answers"; : > "$CALLS"; run "$SR" pick
+check "webcam line flips the remembered choice and asks again" "$( [ "$(grep -c '^qs-pick' "$CALLS")" = 2 ] && grep -q 'Webcam bubble while recording: on' "$S/picklists" && jq -e '.cam == true' "$PREFS" >/dev/null; echo $?)"
+check "...then records with the bubble, marks the last sound used" "$( [ "$(has 'qs [ipc] [call] [cam] [on]')" = 0 ] && grep -q 'microphone + .* system   (last used)' "$S/picklists"; echo $?)"
+run "$SR" stop; waitgone
+printf '%s\n' "Open recordings folder" > "$S/answers"; : > "$CALLS"; run "$SR" pick
+check "Open recordings folder" "$(has "xdg-open [$REC]")"
+printf '\n' > "$S/answers"; : > "$CALLS"; run "$SR" pick
+check "Esc: nothing happens" "$( [ "$(grep -v '^qs-pick\|^pgrep' "$CALLS" | grep -c .)" = 0 ]; echo $?)" "$(cat "$CALLS")"
+
+echo "case: mic"
+M="$bin/mic"
+: > "$CALLS"; echo 0 > "$S/muted"
+run "$M" toggle
+check "toggle: wpctl set-mute default source toggle, then osd mic" "$( [ "$(cat "$S/muted")" = 1 ] && [ "$(has 'wpctl [set-mute] [@DEFAULT_AUDIO_SOURCE@] [toggle]')" = 0 ] && [ "$(has 'osd [mic]')" = 0 ]; echo $?)"
+check "status: muted" "$( [ "$(run "$M" status)" = '{"muted": true, "ptt": false}' ]; echo $?)" "$(run "$M" status)"
+run "$M" ptt-down
+check "ptt-down while muted: unmuted, held" "$( [ "$(cat "$S/muted")" = 0 ] && [ "$(run "$M" status)" = '{"muted": false, "ptt": true}' ]; echo $?)"
+run "$M" ptt-down
+check "key repeat changes nothing" "$( [ "$(cat "$S/muted")" = 0 ] && [ "$(cat "$work/run/mic-ptt")" = muted ]; echo $?)"
+run "$M" ptt-up
+check "ptt-up: muted again" "$( [ "$(cat "$S/muted")" = 1 ] && [ ! -f "$work/run/mic-ptt" ]; echo $?)"
+echo 0 > "$S/muted"; : > "$CALLS"; run "$M" ptt-down; run "$M" ptt-up
+check "push-to-talk while already on: stays on, no popups" "$( [ "$(cat "$S/muted")" = 0 ] && [ "$(has 'set-mute')" = 1 ] && [ "$(has 'osd')" = 1 ]; echo $?)"
+run "$M" ptt-up
+check "a stray release does nothing" "$( [ "$(cat "$S/muted")" = 0 ]; echo $?)"
+echo 1 > "$S/muted"; run "$M" ptt-down; run "$M" toggle; run "$M" ptt-up
+check "toggle while holding wins over the release (stays muted)" "$( [ ! -f "$work/run/mic-ptt" ] && [ "$(cat "$S/muted")" = 1 ]; echo $?)" "muted=$(cat "$S/muted")"
+check "bad argument: exit 2" "$(run "$M" loud 2>/dev/null; [ $? = 2 ]; echo $?)"
+
+[ "$verbose" = 1 ] && { echo "---- last stub calls"; cat "$CALLS"; }
+
+# ---------------- the bubble ----------------
+echo "case: bubble (Quickshell, offscreen)"
+qs="$HOME/.nix-profile/bin/qs"
+tests="$src/tests/capture"
+if [ -x "$qs" ] && [ -f "$tests/shell.qml" ]; then
+    cfg="$work/cfg"; mkdir -p "$cfg" "$work/qstate" "$work/frames"
+    cp "$src/CamState.qml" "$src/CamView.qml" "$cfg/" || exit 2
+    sed 's|path: Quickshell.env("HOME") + "/.config/cosmic[^"]*"|path: "/nonexistent/is_dark"|' "$src/Theme.qml" > "$cfg/Theme.qml"
+    grep -q '/nonexistent/is_dark' "$cfg/Theme.qml" || { echo "capture-test: could not unhook Theme.qml's is_dark" >&2; exit 2; }
+    cp "$tests"/*.qml "$cfg/"
+    # CamBubble.qml with its PanelWindow made a FloatingWindow (layer shell does not exist offscreen): loads, holds a CamView
+    python3 - "$src/CamBubble.qml" "$cfg/CamBubbleWin.qml" <<'PY'
+import sys
+s = open(sys.argv[1], encoding="utf-8").read()
+s = s.replace("PanelWindow {", "FloatingWindow {\n    implicitWidth: 400; implicitHeight: 300", 1)
+s = "\n".join(l for l in s.split("\n") if "WlrLayershell." not in l and "exclusionMode" not in l and not l.strip().startswith("anchors {") and not l.strip().startswith("screen:"))
+open(sys.argv[2], "w", encoding="utf-8").write(s)
+PY
+    printf '{"size": 220, "device": "/nonexistent/video-test", "pos": {}}\n' > "$work/qstate/cam-bubble.json"
+    log="$work/qslog"
+    env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u QT_QPA_PLATFORMTHEME -u QT_STYLE_OVERRIDE \
+        QT_QPA_PLATFORM=offscreen XDG_STATE_HOME="$work/qstate" CAM_FRAME_DIR="$work/frames" CAM_TEST_OUT="$out" \
+        dbus-run-session -- timeout 90 "$qs" -p "$cfg/shell.qml" --no-color > "$log" 2>&1
+    code=$?
+    [ "$verbose" = 1 ] && cat "$log"
+    grep -o 'CTEST \(PASS\|FAIL\|case:\).*' "$log" | sed 's/^CTEST //'
+    r=$(grep -o 'CTEST RESULT pass [0-9]* fail [0-9]*' "$log" | tail -1)
+    if [ -z "$r" ]; then
+        echo "FAIL the bubble run did not finish (exit $code). Last lines:"; grep -vE 'dbus-daemon|portal' "$log" | tail -15
+        fail=$((fail + 1))
+    else
+        set -- $r; pass=$((pass + $4)); fail=$((fail + $6))
+    fi
+    if grep -q 'Cam[A-Za-z]*\.qml.*\(TypeError\|ReferenceError\|Binding loop\|Cannot assign\|is not a type\)' "$log"; then
+        echo "FAIL the bubble logged errors:"; grep 'Cam[A-Za-z]*\.qml' "$log" | sort -u | head -8; fail=$((fail + 1))
+    else pass=$((pass + 1)); echo "PASS no QML errors from Cam*.qml"; fi
+    check "size and per-screen place written to \$XDG_STATE_HOME/cam-bubble.json" \
+        "$(jq -e '.size == 220 and (.pos.TEST | length == 2) and (.pos.OTHER | length == 2)' "$work/qstate/cam-bubble.json" >/dev/null; echo $?)" "$(cat "$work/qstate/cam-bubble.json")"
+    if [ -n "$out" ]; then
+        for m in dark light; do
+            if [ -s "$out-$m.png" ]; then echo "picture: $out-$m.png"; else echo "FAIL no picture $out-$m.png"; fail=$((fail + 1)); fi
+        done
+    fi
+else
+    echo "FAIL no qs, or no $tests/shell.qml"; fail=$((fail + 1))
+fi
+
+echo "RESULT pass $pass fail $fail"
+[ "$fail" = 0 ]

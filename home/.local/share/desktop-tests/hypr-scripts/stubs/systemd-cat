@@ -1,0 +1,8 @@
+#!/bin/sh
+# stub (hypr-scripts-test): record (and QT_QUICK_BACKEND if set); `-t TAG CMD...` runs CMD,
+# `-t TAG` alone appends stdin to $W/journal
+echo "systemd-cat $*" >> "$CALLS"
+[ -n "$QT_QUICK_BACKEND" ] && echo "env QT_QUICK_BACKEND=$QT_QUICK_BACKEND" >> "$CALLS"
+[ "$1" = -t ] && shift 2
+[ $# -gt 0 ] && exec "$@"
+cat >> "$W/journal"

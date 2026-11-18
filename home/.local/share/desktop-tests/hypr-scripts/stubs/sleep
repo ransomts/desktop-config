@@ -1,0 +1,5 @@
+#!/bin/sh
+# stub (hypr-scripts-test): returns at once; logs to $W/sleeps; runs $W/hooks/sleep once if there
+echo "sleep $*" >> "$W/sleeps"
+if [ -x "$W/hooks/sleep" ]; then mv "$W/hooks/sleep" "$W/hooks/sleep.done"; "$W/hooks/sleep.done"; fi
+exit 0

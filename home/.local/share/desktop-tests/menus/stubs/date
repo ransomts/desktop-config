@@ -1,0 +1,7 @@
+#!/bin/sh
+# date stand-in: the clock is $FAKE_NOW ("2026-11-18 12:00"); "-d yesterday" is a day before it.
+now=${FAKE_NOW:?FAKE_NOW not set}
+if [ "$1" = -d ] && [ "$2" = yesterday ]; then
+    shift 2; s=$(/usr/bin/date -d "$now" +%s); exec /usr/bin/date -d "@$((s - 86400))" "$@"
+fi
+exec /usr/bin/date -d "$now" "$@"

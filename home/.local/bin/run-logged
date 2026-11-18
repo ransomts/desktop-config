@@ -8,11 +8,12 @@
 #     journalctl --user -t run-logged
 # A command that succeeds leaves nothing. stdout is discarded, as it was before.
 if [ $# -eq 1 ]; then set -- sh -c "$1"; fi
-out=$( { "$@" 2>&1 >/dev/null; echo "run-logged-rc=$?"; } | tail -n 7 )
+# the bare echo ends a last stderr line that has no newline, so it is not lost with the marker
+out=$( { "$@" 2>&1 >/dev/null; r=$?; echo; echo "run-logged-rc=$r"; } | tail -n 8 )
 rc=${out##*run-logged-rc=}
 case "$rc" in ''|*[!0-9]*) rc=0 ;; esac
 [ "$rc" -eq 0 ] && exit 0
-err=$(printf '%s\n' "$out" | sed '$d' | tr '\n' ' ' | cut -c1-600)
+err=$(printf '%s\n' "$out" | sed '$d' | sed '/^$/d' | tail -n 6 | tr '\n' ' ' | cut -c1-600)
 [ "$1" = sh ] && [ "$2" = -c ] && shift 2
 printf 'exit %s: %s%s\n' "$rc" "$(printf '%s' "$*" | cut -c1-300)" "${err:+ | $err}" | logger -t run-logged -p user.warning
 exit "$rc"

@@ -1,0 +1,599 @@
+#!/bin/bash
+# Tests for the ~/.local/bin helpers that drive Hyprland through hyprctl: keymapp-toggle,
+# keymapp-when-plugged, music, music-library, gvm-lights, cursor-output, window-switcher (its
+# fallback list), hypr-window-list, logout-confirm, lock-screen, anim-preset, hyprland-log,
+# dock-monitor-layout and display-menu (the menu itself).
+#
+#   hypr-scripts-test            run everything; PASS/FAIL lines, then RESULT; exit 1 on a failure
+#   hypr-scripts-test -v         also print every check's recorded calls
+#   hypr-scripts-test -k         keep the temporary directory (its path is printed)
+#   hypr-scripts-test -b DIR     take the scripts from DIR instead of ~/.local/bin
+#
+# Not here because other suites cover them: lock-now (dayflow-test), display-menu gone/check
+# (dayflow-test), window-switcher opening the launcher (launcher-test).
+#
+# Isolation: a fake hyprctl (~/.local/share/desktop-tests/hypr-scripts/fakehypr.py) answers
+# clients/monitors/activeworkspace/cursorpos/locked from canned JSON in a temp dir and keeps a little
+# state (toggle_special shows/hides a special workspace on the focused monitor, window.move moves a
+# client), and records every dispatch/eval/notify. Recording stubs first on PATH (stubs/ beside it)
+# stand in for systemctl, pgrep (answers from a file), pkill, sleep (returns at once, so the scripts'
+# wait loops cost nothing), notify-send, logger, systemd-cat, ghostty, emacsclient, uwsm, hyprlock,
+# loginctl, sudo, udevadm (plays a script of events), cosmic-randr (state in a table), edid-decode,
+# tail -F. HOME, XDG_RUNTIME_DIR, XDG_STATE_HOME, XDG_CONFIG_HOME and XDG_CACHE_HOME are temporary,
+# with stub qs, qs-pick, gvm-gui, session-save, notif-dnd, bar-refresh, hypr-window-list in it.
+# WAYLAND_DISPLAY, DISPLAY and HYPRLAND_INSTANCE_SIGNATURE are unset. Nothing live is touched.
+# Test hooks used: KEYMAPP_USB_SYSFS (keymapp-when-plugged), DOCK_DRM_SYSFS (dock-monitor-layout),
+# LOGOUT_CMD (logout-confirm). A part whose script is not in the scripts dir prints
+# "skip: SCRIPT not present" and counts neither way.
+set -u
+verbose=0; keep=0; bin="$HOME/.local/bin"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) verbose=1 ;;
+        -k) keep=1 ;;
+        -b) bin="$2"; shift ;;
+        *) echo "usage: hypr-scripts-test [-v] [-k] [-b BIN_DIR]" >&2; exit 2 ;;
+    esac
+    shift
+done
+bin=$(cd "$bin" && pwd) || exit 2
+lib="$(cd "$(dirname "$0")/.." && pwd)/share/desktop-tests/hypr-scripts"       # beside the suite
+[ -d "$lib" ] || lib="$HOME/.local/share/desktop-tests/hypr-scripts"
+for t in python3 setsid flock stdbuf gzip timeout awk; do
+    command -v "$t" >/dev/null || { echo "hypr-scripts-test: needs $t" >&2; exit 2; }
+done
+[ -f "$lib/fakehypr.py" ] && [ -d "$lib/stubs" ] || { echo "hypr-scripts-test: no $lib" >&2; exit 2; }
+
+work=$(mktemp -d) || exit 2
+if [ "$keep" = 1 ]; then echo "keeping $work"; else trap 'rm -rf "$work"' EXIT; fi
+H="$work/home"; HS="$work/hypr"; rt="$work/rt"; calls="$work/calls"; state="$work/state"
+mkdir -p "$H/.local/bin" "$H/.nix-profile/bin" "$H/.config/quickshell" "$H/.config/hypr" \
+         "$H/.local/share/applications" "$HS" "$rt" "$state" "$work/cache"
+chmod 700 "$rt"
+cp "$lib/home-stubs/"{session-save,notif-dnd,bar-refresh,gvm-gui,qs-pick,hypr-window-list} "$H/.local/bin/"
+cp "$lib/home-stubs/qs" "$H/.nix-profile/bin/qs"
+
+npass=0; nfail=0
+pass() { echo "PASS $1"; npass=$((npass + 1)); }
+fail() { echo "FAIL $1${2:+   [$2]}"; nfail=$((nfail + 1)); }
+check() { if [ "$2" = 0 ]; then pass "$1"; else fail "$1" "${3:-}"; fi; [ "$verbose" = 1 ] && [ -n "${3:-}" ] && echo "     $3"; true; }
+eq() { [ "$2" = "$3" ]; check "$1" $? "got: $2 | want: $3"; }
+has() { grep -qF -- "$3" <<< "$2"; check "$1" $? "no '$3' in: $2"; }
+hasnt() { ! grep -qF -- "$3" <<< "$2"; check "$1" $? "unexpected '$3' in: $2"; }
+# part SCRIPT LABEL: start a section, or skip it (uncounted) when SCRIPT isn't in the scripts dir
+part() { if [ -f "$bin/$1" ]; then echo "case: $2"; else echo "skip: $1 not present"; return 1; fi; }
+C() { tr '\n' ';' < "$calls"; }                                  # every recorded call
+HC() { grep '^hyprctl' "$calls" | tr '\n' ';'; }                 # the hyprctl ones
+nsleeps() { wc -l < "$work/sleeps" 2>/dev/null | tr -d ' ' || echo 0; }
+nq() { grep -c -- "$1" "$HS/queries" 2>/dev/null || true; }      # hyprctl queries matching
+special() { python3 -c 'import json,sys; print(next((m["specialWorkspace"]["name"] for m in json.load(open(sys.argv[1])) if m["focused"]), ""))' "$HS/monitors.json"; }
+
+# fresh: forget every call and every switch; empty windows and one plain focused monitor
+fresh() {
+    rm -rf "$HS"/* "$HS"/.[!.]* "$calls" "$work/sleeps" "$work/hooks" "$work"/{procs,active,pick,pick-grep,pick-input,winlist,no-window,notify-rc,qs-rc,lock-result,emacs-ws,randr.tsv,randr-fail,udev-script,journal,usb,drm}
+    mkdir -p "$work/hooks"; : > "$calls"; : > "$HS/queries"; : > "$work/sleeps"
+    echo '[]' > "$HS/clients.json"
+    setmons "$(mon DP-1 "Dell" 1920 1080 1 0 0 0 true)"
+}
+# mon NAME DESC W H SCALE TRANSFORM X Y FOCUSED [SPECIAL] [DISABLED]
+mon() { printf '{"id":0,"name":"%s","description":"%s","width":%s,"height":%s,"scale":%s,"transform":%s,"x":%s,"y":%s,"focused":%s,"specialWorkspace":{"name":"%s"},"disabled":%s}' \
+    "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10:-}" "${11:-false}"; }
+setmons() { local IFS=,; echo "[$*]" > "$HS/monitors.json"; }
+# cli ADDR CLASS TITLE WSID WSNAME HIST [MAPPED]
+cli() { printf '{"address":"%s","mapped":%s,"class":"%s","title":"%s","workspace":{"id":%s,"name":"%s"},"focusHistoryID":%s}' \
+    "$1" "${7:-true}" "$2" "$3" "$4" "$5" "$6"; }
+setclients() { local IFS=,; echo "[$*]" > "$HS/clients.json"; }
+
+run() {
+    env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u LOGOUT_CMD -u LOCK_SCREEN \
+        -u QT_QUICK_BACKEND -u KEYMAPP_USB_SYSFS -u DOCK_DRM_SYSFS \
+        HOME="$H" PATH="$lib/stubs:/usr/local/bin:/usr/bin:/bin" XDG_RUNTIME_DIR="$rt" \
+        XDG_STATE_HOME="$state" XDG_CONFIG_HOME="$H/.config" XDG_CACHE_HOME="$work/cache" \
+        FAKE_HYPR="$HS" FAKEHYPR="$lib/fakehypr.py" CALLS="$calls" W="$work" \
+        timeout 60 "$@"
+}
+
+# ======================================================================================
+if part keymapp-toggle "keymapp-toggle"; then
+TK='hyprctl dispatch hl.dsp.workspace.toggle_special("keymapp")'
+fresh; echo keymapp > "$work/procs"
+setclients "$(cli 0x1 keymapp Keymapp -98 special:keymapp 1)"
+run env HYPRLAND_INSTANCE_SIGNATURE=fake "$bin/keymapp-toggle"
+eq "running: toggles special:keymapp and nothing else" "$(grep -v '^pgrep' "$calls" | tr '\n' ';')" "$TK;"
+eq "the first press shows it" "$(special)" "special:keymapp"
+run env HYPRLAND_INSTANCE_SIGNATURE=fake "$bin/keymapp-toggle"
+eq "the second press hides it" "$(special)" ""
+hasnt "running: the service is not started" "$(C)" "systemctl"
+
+fresh; : > "$work/procs"
+printf '#!/bin/sh\npython3 -I "%s" add-client keymapp Keymapp special:keymapp\n' "$lib/fakehypr.py" > "$work/hooks/start-keymapp.service"
+chmod +x "$work/hooks/start-keymapp.service"
+run env HYPRLAND_INSTANCE_SIGNATURE=fake "$bin/keymapp-toggle"
+eq "not running: pgrep -x, start the service, then toggle" "$(C)" "pgrep -x keymapp;systemctl --user start keymapp.service;$TK;"
+eq "  and it waited no longer than the window took" "$(nsleeps)" 0
+eq "  the window shows" "$(special)" "special:keymapp"
+
+fresh; : > "$work/procs"
+run env HYPRLAND_INSTANCE_SIGNATURE=fake "$bin/keymapp-toggle"
+eq "window never comes: gives up after 50 looks" "$(nq clients)" 50
+has "  and still toggles" "$(C)" "$TK"
+
+fresh; echo keymapp > "$work/procs"
+run "$bin/keymapp-toggle"
+hasnt "outside Hyprland (no signature): no dispatch" "$(C)" "hyprctl"
+fi
+
+# ======================================================================================
+if part keymapp-when-plugged "keymapp-when-plugged"; then
+usbdev() { mkdir -p "$work/usb/$1"; echo "$2" > "$work/usb/$1/idVendor"; echo "$3" > "$work/usb/$1/idProduct"; }
+kwp() { run env KEYMAPP_USB_SYSFS="$work/usb" KEYMAPP_UNPLUG_GRACE=7 "$bin/keymapp-when-plugged"; }
+fresh; usbdev 1-1 046d c52b; usbdev 1-4 3297 1969
+kwp
+eq "Moonlander present: start keymapp.service" "$(grep systemctl "$calls" | tr '\n' ';')" "systemctl --user start keymapp.service;"
+has "then listens to udev usb device events" "$(C)" "udevadm monitor --udev --subsystem-match=usb/usb_device"
+fresh; usbdev 1-4 0483 df11
+kwp
+has "Moonlander bootloader (0483:df11, during a flash) counts as present" "$(C)" "systemctl --user start keymapp.service"
+fresh; usbdev 1-1 046d c52b; usbdev 1-2 0483 5740
+kwp
+eq "only other devices (another STM32 too), service off: just asks whether it is active" "$(grep systemctl "$calls" | tr '\n' ';')" "systemctl --user --quiet is-active keymapp.service;"
+eq "  and does not wait out the grace period" "$(nsleeps)" 0
+fresh; usbdev 1-1 046d c52b; echo keymapp.service > "$work/active"
+kwp
+eq "gone while running: waits KEYMAPP_UNPLUG_GRACE, then stops it" "$(cat "$work/sleeps"; grep 'systemctl.*stop' "$calls")" "sleep 7
+systemctl --user stop keymapp.service"
+fresh; echo keymapp.service > "$work/active"; mkdir -p "$work/usb"
+printf '#!/bin/sh\nmkdir -p "%s/usb/1-4"; echo 0483 > "%s/usb/1-4/idVendor"; echo df11 > "%s/usb/1-4/idProduct"\n' "$work" "$work" "$work" > "$work/hooks/sleep"
+chmod +x "$work/hooks/sleep"
+kwp
+hasnt "back within the grace period (re-enumerated as the bootloader): not stopped" "$(C)" "stop keymapp.service"
+fresh; mkdir -p "$work/usb"
+cat > "$work/udev-script" <<EOF
+emit monitor will print the received events for:
+emit UDEV - the event which udev sends out after rule processing
+run mkdir -p "\$W/usb/1-4" && echo 3297 > "\$W/usb/1-4/idVendor" && echo 1969 > "\$W/usb/1-4/idProduct"
+emit UDEV  [100.000001] change   /devices/pci0000:00/0000:00:14.0/usb3/3-4 (usb)
+emit UDEV  [100.000002] bind     /devices/pci0000:00/0000:00:14.0/usb3/3-4 (usb)
+emit UDEV  [100.000003] add      /devices/pci0000:00/0000:00:14.0/usb3/3-4 (usb)
+wait-calls start keymapp
+run rm -rf "\$W/usb/1-4"
+emit UDEV  [101.000000] remove   /devices/pci0000:00/0000:00:14.0/usb3/3-4 (usb)
+wait-calls stop keymapp
+EOF
+kwp
+eq "events: only add/remove act: plug starts it once, unplug stops it after the grace" \
+   "$(grep systemctl "$calls" | tr '\n' ';')" \
+   "systemctl --user --quiet is-active keymapp.service;systemctl --user start keymapp.service;systemctl --user --quiet is-active keymapp.service;systemctl --user stop keymapp.service;"
+fi
+
+# ======================================================================================
+if part music "music"; then
+TM='hyprctl dispatch hl.dsp.workspace.toggle_special("music")'
+RM() { printf 'hyprctl dispatch hl.dsp.window.resize({ x = %s, y = %s, window = "class:^org\\\\.tsr\\\\.ncmpcpp$" })' "$1" "$2"; }
+CM='hyprctl dispatch hl.dsp.window.center({ window = "class:^org\\.tsr\\.ncmpcpp$" })'
+music_fresh() {
+    fresh
+    setmons "$(mon DP-1 Dell 1920 1080 1 0 0 0 true "${1:-}")" "$(mon HDMI-A-1 Samsung 3440 1440 1 0 1920 0 false)"
+    setclients "$(cli 0x1 org.tsr.ncmpcpp ncmpcpp -98 special:music 1)"
+}
+music_fresh
+run "$bin/music"
+eq "running, hidden: show it, then size it for the monitor and centre it" "$(HC)" "$TM;$(RM 1139 670);$CM;"
+eq "  special:music is on the focused monitor" "$(special)" "special:music"
+: > "$calls"; run "$bin/music"
+eq "running, showing: hide it, no resize" "$(HC)" "$TM;"
+eq "  hidden again" "$(special)" ""
+fit_case() {    # WHAT W H SCALE TRANSFORM -> resize x,y
+    music_fresh; setmons "$(mon X "x" "$2" "$3" "$4" "$5" 0 0 true)"
+    run "$bin/music"; has "fit: $1" "$(HC)" "$(RM "$6" "$7")"
+}
+fit_case "ultrawide 3440x1440: width capped at 1.7x height" 3440 1440 1 0 1518 893
+fit_case "rotated 1920x1080 (transform 1): a tall window" 1920 1080 1 1 670 1190
+fit_case "scaled 2880x1800 at 1.5: logical size" 2880 1800 1.5 0 1190 744
+fit_case "transform 3 is rotated too" 1920 1080 1 3 670 1190
+music_fresh special:music
+run "$bin/music" hide
+eq "hide while showing: hides" "$(HC)" "$TM;"
+has "  and logs it" "$(C)" "logger -t music hide: hid special:music"
+music_fresh
+run "$bin/music" hide
+eq "hide while not showing: no dispatch" "$(HC)" ""
+music_fresh; setmons "$(mon DP-1 Dell 1920 1080 1 0 0 0 true)" "$(mon HDMI-A-1 Samsung 3440 1440 1 0 1920 0 false special:music)"
+run "$bin/music" hide
+eq "hide while showing only on an unfocused monitor: no dispatch" "$(HC)" ""
+music_fresh; echo '[]' > "$HS/clients.json"
+run "$bin/music"
+has "not running: starts ghostty with the ncmpcpp class and padding" "$(C)" "ghostty --class=org.tsr.ncmpcpp --title=ncmpcpp --window-padding-x=18 --window-padding-y=14 --window-padding-balance=true -e ncmpcpp"
+eq "  then shows special:music, sizes and centres it" "$(HC)" "$TM;$(RM 1139 670);$CM;"
+music_fresh; echo '[]' > "$HS/clients.json"
+printf '#!/bin/sh\n' > "$H/.nix-profile/bin/ncmpcpp"; chmod +x "$H/.nix-profile/bin/ncmpcpp"
+run "$bin/music"
+has "the Nix ncmpcpp is preferred when it is there" "$(C)" "-e $H/.nix-profile/bin/ncmpcpp"
+rm -f "$H/.nix-profile/bin/ncmpcpp"
+music_fresh special:music; echo '[]' > "$HS/clients.json"
+run "$bin/music"
+eq "not running while special:music already shows (empty): no toggle, just fit" "$(HC)" "$(RM 1139 670);$CM;"
+music_fresh; echo '[]' > "$HS/clients.json"; : > "$work/no-window"
+run "$bin/music"
+eq "window never comes: one look before starting, then gives up after 50 more" "$(nq clients)" 51
+eq "  and still shows and fits" "$(HC)" "$TM;$(RM 1139 670);$CM;"
+music_fresh
+run "$bin/music" bogus 2>/dev/null; rc=$?
+{ [ $rc = 2 ] && [ -z "$(HC)" ]; }; check "unknown argument: exit 2, nothing dispatched" $? "rc=$rc $(C)"
+fi
+
+# ======================================================================================
+if part music-library "music-library"; then
+TL='hyprctl dispatch hl.dsp.workspace.toggle_special("library")'
+RL='hyprctl dispatch hl.dsp.window.resize({ x = 1139, y = 670, window = "title:^Music$" })'
+CL='hyprctl dispatch hl.dsp.window.center({ window = "title:^Music$" })'
+ML='hyprctl dispatch hl.dsp.window.move({ workspace = "special:library", window = "title:^Music$", follow = false })'
+lib_fresh() {
+    fresh; setmons "$(mon DP-1 Dell 1920 1080 1 0 0 0 true "${1:-}")"
+    setclients "$(cli 0x1 emacs "notes.org" 11 11 0)" "$(cli 0x2 emacs Music -97 special:library 1)"
+}
+lib_fresh
+run "$bin/music-library"
+eq "open, hidden: show it, size and centre it" "$(HC)" "$TL;$RL;$CL;"
+: > "$calls"; run "$bin/music-library"
+eq "open, showing: hide it" "$(HC)" "$TL;"
+eq "  hidden again" "$(special)" ""
+lib_fresh special:library
+run "$bin/music-library" show
+eq "show while showing: never hides (re-fits only)" "$(HC)" "$RL;$CL;"
+lib_fresh
+run "$bin/music-library" show
+eq "show while hidden: shows" "$(HC)" "$TL;$RL;$CL;"
+lib_fresh; setclients "$(cli 0x1 emacs "notes.org" 11 11 0)"
+run "$bin/music-library"
+has "not open: asks the Emacs daemon for a Music frame" "$(C)" "emacsclient -c -n -F ((name . \"Music\")) -e (tsr/music-library-here)"
+eq "  then shows it (toggle mode becomes show)" "$(HC)" "$TL;$RL;$CL;"
+hasnt "another Emacs frame is not the library" "$(HC)" "window.move"
+lib_fresh special:library; setclients "$(cli 0x1 emacs "notes.org" 11 11 0)"
+run "$bin/music-library"
+eq "not open while special:library already shows: opens it without hiding" "$(HC)" "$RL;$CL;"
+lib_fresh; echo '[]' > "$HS/clients.json"; echo 3 > "$work/emacs-ws"
+run "$bin/music-library"
+eq "frame lands off special:library (rule missing): move it there, then show" "$(HC)" "$ML;$TL;$RL;$CL;"
+lib_fresh special:library; setclients "$(cli 0x2 emacs Music 12 12 1)"
+run "$bin/music-library"
+eq "moved off by hand while special:library shows: move back, do not hide" "$(HC)" "$ML;$RL;$CL;"
+lib_fresh; echo '[]' > "$HS/clients.json"; : > "$work/no-window"
+run "$bin/music-library"; rc=$?
+{ [ $rc = 1 ] && [ -z "$(HC)" ]; }; check "frame never appears: exit 1, nothing dispatched" $? "rc=$rc $(C)"
+has "  and says so in the journal" "$(C)" "logger -t music-library the Music frame didn't appear"
+lib_fresh
+run "$bin/music-library" hide 2>/dev/null; rc=$?
+{ [ $rc = 2 ] && ! grep -q emacsclient "$calls" && [ -z "$(HC)" ]; }; check "unknown argument: exit 2, nothing done" $? "rc=$rc $(C)"
+fi
+
+# ======================================================================================
+if part gvm-lights "gvm-lights"; then
+TG='hyprctl dispatch hl.dsp.workspace.toggle_special("lights")'
+CG='hyprctl dispatch hl.dsp.window.center({ window = "class:^edu\\.clemson\\.tsranso\\.GvmLight$" })'
+gvm_fresh() {
+    fresh; setmons "$(mon DP-1 Dell 1920 1080 1 0 0 0 true "${1:-}")"
+    setclients "$(cli 0x1 edu.clemson.tsranso.GvmLight "GVM Light" -96 special:lights 1)"
+}
+gvm_fresh
+run "$bin/gvm-lights"
+eq "running, hidden: show and centre" "$(HC)" "$TG;$CG;"
+: > "$calls"; run "$bin/gvm-lights"
+eq "running, showing: hide (gvm-gui keeps running)" "$(HC)" "$TG;"
+hasnt "  nothing started or killed" "$(C)" "gvm-gui"
+gvm_fresh special:lights
+run "$bin/gvm-lights" hide
+eq "hide while showing: hides" "$(HC)" "$TG;"
+gvm_fresh
+run "$bin/gvm-lights" hide
+eq "hide while hidden: nothing" "$(HC)" ""
+gvm_fresh; echo '[]' > "$HS/clients.json"
+run "$bin/gvm-lights"
+has "not running: starts \$HOME/.local/bin/gvm-gui" "$(C)" "gvm-gui"
+eq "  then shows and centres it" "$(HC)" "$TG;$CG;"
+gvm_fresh; echo '[]' > "$HS/clients.json"; : > "$work/no-window"
+run "$bin/gvm-lights"
+eq "window never comes: one look, 50 more, then still shows" "$(nq clients) $(HC)" "51 $TG;$CG;"
+gvm_fresh
+run "$bin/gvm-lights" off 2>/dev/null; rc=$?
+{ [ $rc = 2 ] && [ -z "$(HC)" ]; }; check "unknown argument: exit 2" $? "rc=$rc"
+fi
+
+# ======================================================================================
+if part cursor-output "cursor-output"; then
+fresh
+setmons "$(mon DP-5 "DELL P2425HE" 1920 1080 1 0 0 840 false)" "$(mon DP-6 "DELL P2214H" 1920 1080 1 1 1920 0 false)" \
+        "$(mon DP-7 "S34J55x" 3440 1440 1 0 3000 480 true)" "$(mon eDP-1 "laptop" 2880 1800 1.5 0 6440 840 false)"
+co() { echo "$1" > "$HS/cursorpos"; run "$bin/cursor-output"; }
+eq "pointer on the left monitor" "$(co '100, 900')" DP-5
+eq "left edge of the next one belongs to it" "$(co '1920, 900')" DP-6
+eq "last pixel before it is still the left one" "$(co '1919, 900')" DP-5
+eq "rotated monitor is tall (y 1500 is on it)" "$(co '2000, 1500')" DP-6
+eq "ultrawide" "$(co '5000, 1000')" DP-7
+eq "scaled laptop uses its logical size (inside)" "$(co '8359, 2039')" eDP-1
+eq "scaled laptop: beyond its logical width is nowhere" "$(co '8400, 900')" ""
+eq "pointer in a gap between monitors: prints nothing" "$(co '100, 100')" ""
+fi
+
+# ======================================================================================
+if part window-switcher "window-switcher (fallback list)"; then
+ws_fresh() {
+    fresh; echo 1 > "$work/qs-rc"
+    printf 'ws 3     zzbar   first\0icon\037zzbar\t0xaaa\ndesk 2   zzfoo   second\0icon\037zzfoo\t0xbbb\nscratch  zzbaz   third\0icon\037zzbaz\t0xccc\n' > "$work/winlist"
+}
+ws_fresh; rm -f "$work/qs-rc"
+run "$bin/window-switcher"
+eq "Quickshell up: the launcher's window mode only" "$(C)" "qs ipc call launcher open w;"
+ws_fresh; echo 1 > "$work/pick"
+run "$bin/window-switcher"
+eq "picked line 1 (0-based): focuses the second window's address" "$(HC)" 'hyprctl dispatch hl.dsp.focus({ window = "address:0xbbb" })'";"
+has "  list asked for in switcher mode" "$(C)" "hypr-window-list switcher"
+has "  qs-pick gets --index and the placeholder" "$(C)" "qs-pick --index --prompt 󰖯   --placeholder Switch window"
+hasnt "  qs-pick never sees the addresses" "$(tr -d '\0' < "$work/pick-input")" "0xbbb"
+eq "  qs-pick gets one line per window" "$(wc -l < "$work/pick-input" | tr -d ' ')" 3
+ws_fresh; echo 0 > "$work/pick"
+run "$bin/window-switcher"
+has "picked 0: the first window" "$(HC)" "address:0xaaa"
+ws_fresh
+run "$bin/window-switcher"
+eq "cancelled: no dispatch" "$(HC)" ""
+ws_fresh; echo "zzbar" > "$work/pick"
+run "$bin/window-switcher"
+eq "a non-number from the picker: no dispatch" "$(HC)" ""
+ws_fresh; echo "-1" > "$work/pick"
+run "$bin/window-switcher"
+eq "a negative index: no dispatch" "$(HC)" ""
+ws_fresh; : > "$work/winlist"
+run "$bin/window-switcher"
+hasnt "no windows: no picker" "$(C)" "qs-pick"
+fi
+
+# ======================================================================================
+if part hypr-window-list "hypr-window-list"; then
+fresh
+printf '[Desktop Entry]\nType=Application\nName=Weird\nIcon=zz-weird-icon\nStartupWMClass=ZZWeirdClass\n' > "$H/.local/share/applications/zzweird.desktop"
+printf '[Desktop Entry]\nType=Application\nName=Bar\nIcon=zz-bar-icon\n' > "$H/.local/share/applications/zzbar.desktop"
+printf 'not a desktop file\n' > "$H/.local/share/applications/zzbroken.desktop"
+long=$(printf 'x%.0s' $(seq 120))
+setclients "$(cli 0xcur ZZWeirdClass 'Current   window' 22 22 0)" \
+           "$(cli 0xb2 org.example.zzbar 'Bar  on desk one' 11 11 1)" \
+           "$(cli 0xw3 zzbar 'plain ws' 3 3 2)" \
+           "$(cli 0xsp ZZNoIcon 'In scratch' -98 special:keymapp 3)" \
+           "$(cli 0xun zzbar 'unmapped' 12 12 4 false)" \
+           "$(cli 0xz0 zzbar 'ws zero' 0 0 5)" \
+           "$(cli 0xlg ZZNoIcon "$long" 21 21 6)"
+echo '{"id":22,"name":"22"}' > "$HS/activeworkspace.json"
+hwl() { run "$bin/hypr-window-list" "$@" | tr '\0\037\t' '|^>'; }
+out=$(hwl switcher)
+eq "switcher: most recent first, current window last; unmapped and workspace 0 left out" \
+   "$(sed 's/.*>//' <<< "$out" | tr '\n' ' ')" "0xb2 0xw3 0xsp 0xlg 0xcur "
+eq "switcher line: desk label, padded class, title, icon from the file name via the class's last part" \
+   "$(sed -n 1p <<< "$out")" "desk 1   org.example.zzbar  Bar on desk one|icon^zz-bar-icon>0xb2"
+has "workspace below 11 is 'ws N'" "$out" "ws 3     zzbar              plain ws|icon^zz-bar-icon>0xw3"
+has "special workspace is 'scratch'; unknown class: lower-case class as icon" "$out" "scratch  ZZNoIcon           In scratch|icon^zznoicon>0xsp"
+has "icon from StartupWMClass; title whitespace squeezed" "$out" "desk 2   ZZWeirdClass       Current window|icon^zz-weird-icon>0xcur"
+eq "titles cut at 90 characters" "$(grep 0xlg <<< "$out" | sed 's/^.\{28\}//; s/|.*//' | tr -d '\n' | wc -c)" 90
+out=$(hwl)
+eq "no argument means switcher" "$(sed 's/.*>//' <<< "$out" | tr '\n' ' ')" "0xb2 0xw3 0xsp 0xlg 0xcur "
+out=$(hwl overview)
+eq "overview: desks with windows, each followed by its windows in workspace order, then the next free desk" \
+   "$(sed 's/.*>//' <<< "$out" | tr '\n' ' ')" "desk 1 0xb2 desk 2 0xlg 0xcur desk 3 "
+has "overview: the current desk is marked" "$out" "Desktop 2  (2 windows)  ← you are here|icon^preferences-desktop-display>desk 2"
+has "overview: other desk not marked" "$out" "Desktop 1  (1 windows)|icon^preferences-desktop-display>desk 1"
+has "overview: window lines indented" "$out" "      org.example.zzbar  Bar on desk one|icon^zz-bar-icon>0xb2"
+has "overview: the free desk" "$out" "Desktop 3  (empty)|icon^list-add>desk 3"
+echo '{"id":3,"name":"3"}' > "$HS/activeworkspace.json"
+has "overview: on a plain workspace (<11), desk 1 is 'here'" "$(hwl overview)" "Desktop 1  (1 windows)  ← you are here"
+all=(); for n in 1 2 3 4 5 6 7 8 9 10; do all+=("$(cli "0xd$n" zzbar "w$n" "$((n * 10 + 1))" "$((n * 10 + 1))" "$n")"); done
+setclients "${all[@]}"
+hasnt "overview: all ten desks used: no empty one offered" "$(hwl overview)" "(empty)"
+fi
+
+# ======================================================================================
+if part logout-confirm "logout-confirm"; then
+lc() { run env LOGOUT_CMD="echo LOGOUT >> \"\$CALLS\"" "$bin/logout-confirm"; }
+stamp="$rt/logout-confirm.stamp"
+fresh; rm -f "$stamp"
+lc
+hasnt "first press: no log-out" "$(C)" "LOGOUT"
+has "  a critical notice that replaces itself" "$(C)" "notify-send -u critical -t 4000 -h string:x-canonical-private-synchronous:logout-confirm Log out? Press Super+Shift+E again to log out."
+{ [ -f "$stamp" ] && [ $(( $(date +%s) - $(cat "$stamp") )) -le 1 ]; }; check "  stamp holds the time" $?
+: > "$calls"; lc
+eq "second press within 4 s: logs out, no notice" "$(C)" "LOGOUT;"
+[ ! -e "$stamp" ]; check "  and clears the stamp (a third press starts over)" $?
+fresh; echo $(( $(date +%s) - 3 )) > "$stamp"; lc
+has "press 3 s after the first: logs out" "$(C)" "LOGOUT"
+fresh; echo $(( $(date +%s) - 6 )) > "$stamp"; lc
+hasnt "press 6 s after the first: only asks again" "$(C)" "LOGOUT"
+[ "$(cat "$stamp")" -ge $(( $(date +%s) - 1 )) ]; check "  with a fresh stamp" $?
+fresh; echo garbage > "$stamp"; lc
+hasnt "a garbled stamp counts as no press" "$(C)" "LOGOUT"
+fresh; rm -f "$stamp"; echo 1 > "$work/notify-rc"; lc
+has "no notification daemon: falls back to hyprctl notify" "$(C)" "hyprctl notify 1 4000 0 Log out? Press Super+Shift+E again"
+fresh; date +%s > "$stamp"
+run "$bin/logout-confirm"
+eq "real log-out: session-save --if-enabled, then uwsm stop" "$(C)" "session-save --if-enabled;uwsm stop;"
+fi
+
+# ======================================================================================
+if part lock-screen "lock-screen"; then
+QML="$H/.config/quickshell/lockscreen.qml"
+ls_fresh() { fresh; : > "$QML"; echo false > "$HS/locked"; rm -f "$rt/lock-screen.result" "$H/.nix-profile/bin/nixGLIntel"; }
+ls_fresh; echo unlocked > "$work/lock-result"
+run "$bin/lock-screen"
+eq "lock and unlock: clear a stale hyprlock, keys display off, the lock in software mode, pet greets" "$(grep -v '^logger' "$calls" | tr '\n' ';')" \
+   "pkill -x hyprlock;qs ipc call lecture keysoff;systemd-cat -t lock-screen $H/.nix-profile/bin/qs -p $QML --no-color;env QT_QUICK_BACKEND=software;qs -p $QML --no-color;qs ipc call pet greet;"
+has "  journal: locked" "$(C)" "logger -t lock-screen -- locked"
+has "  journal: unlocked after N s" "$(C)" "logger -t lock-screen -- unlocked after 0 s"
+! grep -q "^hyprlock" "$calls"; check "  no hyprlock" $? "$(C)"
+ls_fresh; echo unlocked > "$work/lock-result"
+cp "$lib/home-stubs/nixGLIntel" "$H/.nix-profile/bin/"
+run "$bin/lock-screen"
+has "with nixGLIntel: the lock runs under it" "$(C)" "systemd-cat -t lock-screen $H/.nix-profile/bin/nixGLIntel $H/.nix-profile/bin/qs -p $QML --no-color"
+hasnt "  and not in software mode" "$(C)" "QT_QUICK_BACKEND"
+ls_fresh; echo gave-up > "$work/lock-result"
+run "$bin/lock-screen"
+grep -q "^hyprlock" "$calls"; check "lock ends without 'unlocked' (three wrong passwords): hyprlock takes over" $? "$(C)"
+has "  with a warning naming the result" "$(C)" "logger -t lock-screen -p user.warning -- Quickshell lock ended with 'gave-up'; handing over to hyprlock"
+hasnt "  no greeting" "$(C)" "pet greet"
+ls_fresh; echo unlocked > "$rt/lock-screen.result"
+run "$bin/lock-screen"
+grep -q "^hyprlock" "$calls"; check "lock crashes (no result) with a stale 'unlocked' from last time: hyprlock" $? "$(C)"
+has "  'no result' in the journal" "$(C)" "ended with 'no result'"
+ls_fresh; rm -f "$QML"
+run "$bin/lock-screen"
+{ grep -q '^hyprlock' "$calls" && ! grep -q -- 'qs -p' "$calls"; }; check "no lockscreen.qml: straight to hyprlock" $? "$(C)"
+ls_fresh; mv "$H/.nix-profile/bin/qs" "$work/qs.away"
+run "$bin/lock-screen"; mv "$work/qs.away" "$H/.nix-profile/bin/qs"
+{ grep -q '^hyprlock' "$calls" && ! grep -q '^qs' "$calls"; }; check "no Quickshell: straight to hyprlock" $? "$(C)"
+ls_fresh; echo true > "$HS/locked"
+run "$bin/lock-screen"; rc=$?
+{ [ $rc = 0 ] && [ -z "$(grep -vE '^(logger)' "$calls")" ]; }; check "already locked (hyprctl locked): does nothing, leaves hyprlock alone" $? "rc=$rc $(C)"
+ls_fresh
+( exec 9>"$rt/lock-screen.pid"; flock 9; run "$bin/lock-screen" ); rc=$?
+{ [ $rc = 0 ] && [ ! -s "$calls" ]; }; check "already locking (lock file held): exits at once" $? "rc=$rc $(C)"
+fi
+
+# ======================================================================================
+if part anim-preset "anim-preset"; then
+for p in snappy calm stock; do
+    fresh; out=$(run "$bin/anim-preset" "$p")
+    eq "$p: Anim.use through hyprctl eval, and says so" "$(HC)|$out" "hyprctl eval Anim.use('$p', true);|animations: $p"
+done
+fresh
+eq "no argument, nothing saved: current is snappy" "$(run "$bin/anim-preset")" "current: snappy   choices: snappy calm stock"
+echo calm > "$state/anim-preset"
+eq "no argument: current from the state file" "$(run "$bin/anim-preset")" "current: calm   choices: snappy calm stock"
+rm -f "$state/anim-preset"
+run "$bin/anim-preset" bouncy >/dev/null 2>&1; rc=$?
+{ [ $rc = 2 ] && [ -z "$(HC)" ]; }; check "unknown preset: exit 2, Hyprland untouched" $? "rc=$rc $(C)"
+fresh; out=$(run env HYPRCTL_FAIL=1 "$bin/anim-preset" calm 2>/dev/null); rc=$?
+{ [ $rc != 0 ] && [ -z "$out" ]; }; check "hyprctl failing: non-zero, does not claim it switched" $? "rc=$rc out=$out"
+fi
+
+# ======================================================================================
+if part hyprland-log "hyprland-log"; then
+fresh; rm -rf "$rt/hypr" "$state/hyprland-logs"
+keep="$state/hyprland-logs"; mkdir -p "$keep" "$rt/hypr/abc_1700000000_111" "$rt/hypr/def_1700000500_222" "$rt/hypr/ghi_1700000900_333"
+printf 'DEBUG one\nWARN two\n' > "$rt/hypr/abc_1700000000_111/hyprland.log"
+printf 'second instance\n' > "$rt/hypr/def_1700000500_222/hyprland.log"
+: > "$rt/hypr/ghi_1700000900_333/hyprland.log"
+for i in 1 2 3 4 5 6 7 8; do echo old > "$keep/hyprland-16000000${i}0_9.log.gz"; touch -d "2026-01-0$i 12:00" "$keep/hyprland-16000000${i}0_9.log.gz"; done
+run "$bin/hyprland-log" save
+eq "save: each instance's log compressed under its time_pid" "$(gzip -dc "$keep/hyprland-1700000000_111.log.gz" | tr '\n' ';')|$(gzip -dc "$keep/hyprland-1700000500_222.log.gz")" "DEBUG one;WARN two;|second instance"
+[ ! -e "$keep/hyprland-1700000900_333.log.gz" ]; check "save: an empty log is skipped" $?
+eq "save: newest 6 kept (the two new, the four newest old)" "$(/bin/ls "$keep" | tr '\n' ' ')" \
+   "hyprland-1600000050_9.log.gz hyprland-1600000060_9.log.gz hyprland-1600000070_9.log.gz hyprland-1600000080_9.log.gz hyprland-1700000000_111.log.gz hyprland-1700000500_222.log.gz "
+[ -z "$(find "$keep" -name '.tmp.*')" ]; check "save: no temp file left" $?
+printf 'DEBUG one\nWARN two\nERR three\n' > "$rt/hypr/abc_1700000000_111/hyprland.log"
+run "$bin/hyprland-log" save
+eq "save again: the same file is refreshed, not duplicated" "$(gzip -dc "$keep/hyprland-1700000000_111.log.gz" | wc -l | tr -d ' ') $(/bin/ls "$keep" | wc -l | tr -d ' ')" "3 6"
+fresh; run "$bin/hyprland-log" follow 2>/dev/null; rc=$?
+{ [ $rc = 1 ] && [ ! -s "$calls" ]; }; check "follow outside Hyprland: exit 1" $? "rc=$rc"
+run env HYPRLAND_INSTANCE_SIGNATURE=nope_1_2 "$bin/hyprland-log" follow 2>/dev/null; rc=$?
+[ $rc = 1 ]; check "follow with no log file: exit 1" $? "rc=$rc"
+printf 'DEBUG [x] noise\nWARN something odd\nINFO hi\nERR broken\nCRIT dead\n  WARN not at the start\n' > "$rt/hypr/abc_1700000000_111/hyprland.log"
+run env HYPRLAND_INSTANCE_SIGNATURE=abc_1700000000_111 "$bin/hyprland-log" follow
+eq "follow: only WARN/ERR/CRIT lines, with journal priorities" "$(tr '\n' ';' < "$work/journal")" "<4>WARN something odd;<3>ERR broken;<2>CRIT dead;"
+has "  read with tail -n 0 -F (new lines only, across log rotation)" "$(C)" "tail -n 0 -F $rt/hypr/abc_1700000000_111/hyprland.log"
+has "  sent with the tag hyprland" "$(C)" "systemd-cat -t hyprland"
+run "$bin/hyprland-log" 2>/dev/null; [ $? = 2 ]; check "no mode: usage, exit 2" $?
+fi
+
+# ======================================================================================
+if part dock-monitor-layout "dock-monitor-layout"; then
+DESK="DP-5|DELL P2425HE|yes|normal|0|840
+DP-6|DELL P2214H|yes|rotate90|1920|0
+DP-7|S34J55x|yes|normal|3000|480
+eDP-1|0x683D|yes|normal|6440|840"
+kern() { mkdir -p "$work/drm/card1-$1"; echo "$2" > "$work/drm/card1-$1/status"; echo "$3" > "$work/drm/card1-$1/edid"; }
+desk_kernel() { kern DP-5 connected "DELL P2425HE"; kern DP-6 connected "DELL P2214H"; kern DP-7 connected S34J55x; kern eDP-1 connected 0x683D; kern DP-1 disconnected ""; }
+dml() { run env DOCK_DRM_SYSFS="$work/drm" "$bin/dock-monitor-layout"; }
+modes() { grep '^cosmic-randr mode' "$calls" | tr '\n' ';'; }
+fresh; echo "$DESK" > "$work/randr.tsv"; desk_kernel
+dml
+eq "everything already in place: no changes" "$(modes)" ""
+has "then waits for drm hotplug events" "$(C)" "udevadm monitor --udev --subsystem-match=drm"
+fresh; desk_kernel
+printf 'eDP-1|0x683D|yes|normal|6440|840\nDP-9|S34J55x|yes|normal|0|0\nDP-10|DELL P2425HE|yes|normal|3440|0\nDP-11|DELL P2214H|yes|normal|5360|0\n' > "$work/randr.tsv"
+dml
+eq "dock attached on other DP numbers: each monitor set by its model, laptop left alone" "$(modes)" \
+   "cosmic-randr mode DP-10 1920 1080 --refresh 60.000 --transform normal --pos-x 0 --pos-y 840;cosmic-randr mode DP-11 1920 1080 --refresh 60.000 --transform rotate90 --pos-x 1920 --pos-y 0;cosmic-randr mode DP-9 3440 1440 --refresh 59.973 --transform normal --pos-x 3000 --pos-y 480;"
+has "  one settling pass afterwards (sleep 1), which finds nothing to do" "$(cat "$work/sleeps")" "sleep 1"
+eq "  layout now as wanted" "$(sort "$work/randr.tsv" | tr '\n' ';')" "DP-10|DELL P2425HE|yes|normal|0|840;DP-11|DELL P2214H|yes|rotate90|1920|0;DP-9|S34J55x|yes|normal|3000|480;eDP-1|0x683D|yes|normal|6440|840;"
+fresh; desk_kernel; sed 's/^DP-6|DELL P2214H|yes/DP-6|DELL P2214H|no/; s/^eDP-1|0x683D|yes|normal|6440|840/eDP-1|0x683D|yes|normal|0|0/' <<< "$DESK" > "$work/randr.tsv"
+dml
+eq "a disabled desk monitor in place is enabled; a misplaced laptop panel is moved" "$(modes)" \
+   "cosmic-randr mode DP-6 1920 1080 --refresh 60.000 --transform rotate90 --pos-x 1920 --pos-y 0;cosmic-randr mode eDP-1 1920 1080 --refresh 60.049 --transform normal --pos-x 6440 --pos-y 840;"
+fresh; desk_kernel; sed 's/^DP-7|S34J55x|yes|normal|3000|480/DP-7|S34J55x|yes|normal|0|0/' <<< "$DESK" > "$work/randr.tsv"; : > "$work/randr-fail"
+dml
+eq "cosmic-randr refusing: one retry pass, no endless loop" "$(grep -c '^cosmic-randr mode DP-7' "$calls")" 2
+has "  and the failure is logged" "$(C)" "logger -t dock-monitor-layout failed to configure DP-7"
+fresh; kern DP-1 disconnected ""; kern eDP-1 connected 0x683D; echo 'eDP-1|0x683D|yes|normal|0|0' > "$work/randr.tsv"
+dml
+{ [ -z "$(modes)" ] && ! grep -qE '^(sudo|notify-send)' "$calls"; }; check "not at the desk: no changes, no re-plug, no popup" $? "$(C)"
+eq "  after waiting up to 15 s for the desk set" "$(grep -c 'sleep 1' "$work/sleeps")" 15
+fresh; desk_kernel; grep -v S34J55x <<< "$DESK" > "$work/randr.tsv"
+dml
+eq "kernel sees the ultrawide but COSMIC doesn't list it: re-plug just its connector" "$(grep '^sudo' "$calls" | tr '\n' ';')" "sudo -n /usr/local/sbin/drm-reprobe DP-7;"
+has "  and log the try" "$(C)" "re-plugging DP-7 (try 1/2)"
+eq "  nothing configured meanwhile" "$(modes)" ""
+fresh; desk_kernel; grep -v S34J55x <<< "$DESK" > "$work/randr.tsv"
+printf 'emit UDEV  [10.1] change   /devices/pci0000:00/0000:00:02.0/drm/card1 (drm)\npause 3.5\nemit UDEV  [14.1] change   /devices/pci0000:00/0000:00:02.0/drm/card1 (drm)\n' > "$work/udev-script"
+dml
+eq "still mis-registered after two re-plugs: no third, a popup instead" "$(grep -c '^sudo' "$calls") $(grep -c "^notify-send -a Monitors S34J55x isn't set up right" "$calls")" "2 1"
+has "  and the journal says to power-cycle it" "$(C)" "COSMIC still has S34J55x (DP-7) wrong after 2 re-plugs; power-cycle it by hand"
+fresh; desk_kernel; grep -v S34J55x <<< "$DESK" > "$work/randr.tsv"
+cat > "$work/udev-script" <<'EOF'
+run echo 'DP-7|S34J55x|yes|normal|3000|480' >> "$W/randr.tsv"
+emit UDEV  [10.1] change   /devices/pci0000:00/0000:00:02.0/drm/card1 (drm)
+pause 4.5
+run grep -v S34J55x "$W/randr.tsv" > "$W/randr.x"; mv "$W/randr.x" "$W/randr.tsv"
+emit UDEV  [20.1] change   /devices/pci0000:00/0000:00:02.0/drm/card1 (drm)
+EOF
+dml
+eq "a good layout in between resets the re-plug count" "$(grep -o 'try [0-9]/2' "$calls" | tr '\n' ' ')" "try 1/2 try 1/2 "
+fresh; desk_kernel; grep -v S34J55x <<< "$DESK" > "$work/randr.tsv"
+printf 'emit monitor will print the received events for:\nemit UDEV - the event which udev sends out after rule processing\nemit \n' > "$work/udev-script"
+dml
+eq "udevadm's header lines alone cause no layout pass (no second re-plug try)" "$(grep -c '^sudo' "$calls")" 1
+fi
+
+# ======================================================================================
+if part display-menu "display-menu (menu)"; then
+printf 'monitor({ output = "desc:DELL P2425HE", mode = "1920x1080" })\nmonitor({ output = "desc:S34J55x" })\n' > "$H/.config/hypr/hyprland.lua"
+LAP="$(mon eDP-1 "AU Optronics 0x683D" 1920 1080 1 0 0 0 true)"
+DSK="$(mon DP-5 "DELL P2425HE" 1920 1080 1 0 1920 0 false)"
+PRJ="$(mon HDMI-A-1 "Epson projector" 1920 1080 1 0 0 0 false)"
+dm() { fresh; setmons "$1"; [ -n "${2:-}" ] && echo "$2" > "$work/pick-grep"; [ "${3:-}" = presenting ] && : > "$rt/presenting"; [ "${3:-}" = presenting ] || rm -f "$rt/presenting"; run "$bin/display-menu"; }
+dm "$LAP,$DSK,$PRJ" Mirror
+has "Mirror: Display.set('mirror', projector)" "$(HC)" "hyprctl eval Display.set('mirror', 'HDMI-A-1')"
+eq "  starts presenting: flag, DND on, hypridle stopped (service and strays), bar refresh, notice" \
+   "$(grep -vE '^(hyprctl|qs-pick)' "$calls" | sed 's/ Notifications.*//' | tr '\n' ';')" \
+   "notif-dnd on;systemctl --user stop hypridle.service;pkill -x hypridle;bar-refresh 9;notify-send -u critical -a Displays Presenting;"
+[ -e "$rt/presenting" ]; check "  presenting flag set" $?
+has "  menu named the projector" "$(C)" "qs-pick --prompt 󰍹   --placeholder Displays — projector: HDMI-A-1"
+eq "  five choices with a projector" "$(wc -l < "$work/pick-input" | tr -d ' ')" 5
+dm "$LAP,$DSK,$PRJ" "Projector only"
+{ grep -qF "Display.set('projector', 'HDMI-A-1')" "$calls" && grep -q 'notif-dnd on' "$calls"; }; check "Projector only: set projector, present" $? "$(C)"
+dm "$LAP,$DSK,$PRJ" Extend presenting
+has "Extend: Display.set('extend', ...)" "$(HC)" "hyprctl eval Display.set('extend', 'HDMI-A-1')"
+eq "  ends presenting: lecture tools off, DND off, quiet resync, hypridle back, bar refresh" \
+   "$(grep -vE '^(hyprctl|qs-pick)' "$calls" | tr '\n' ';')" \
+   "qs ipc call lecture off;notif-dnd off;qs ipc call quiet resync;systemctl --user start hypridle.service;bar-refresh 9;"
+[ ! -e "$rt/presenting" ]; check "  presenting flag cleared" $?
+dm "$LAP,$DSK,$PRJ" "Laptop only" presenting
+{ grep -qF "Display.set('laptop', 'HDMI-A-1')" "$calls" && grep -q 'notif-dnd off' "$calls" && [ ! -e "$rt/presenting" ]; }; check "Laptop only: set laptop, unpresent" $? "$(C)"
+dm "$LAP,$DSK,$PRJ" "Laptop screen"
+eq "Laptop screen on/off: only the toggle" "$(grep -v '^qs-pick' "$calls" | tr '\n' ';')" "hyprctl eval Display.laptop_toggle();"
+dm "$LAP,$DSK"
+eq "no projector: one choice" "$(cat "$work/pick-input")" "󰶐  Laptop screen on/off"
+has "  placeholder without a projector" "$(C)" "--placeholder Displays"
+hasnt "  (no projector named)" "$(C)" "projector:"
+dm "$LAP,$DSK,$PRJ"
+eq "cancelled: nothing changes" "$(grep -v '^qs-pick' "$calls" | tr '\n' ';')" ""
+fi
+
+# ======================================================================================
+echo "RESULT pass $npass fail $nfail"
+[ "$nfail" = 0 ]

@@ -1,0 +1,8 @@
+#!/bin/sh
+# stub (hypr-scripts-test): keeps its input in $W/pick-input; answers the line matching $W/pick-grep,
+# or the contents of $W/pick, else cancels (exit 1)
+cat > "$W/pick-input"
+echo "qs-pick $*" >> "$CALLS"
+if [ -f "$W/pick-grep" ]; then grep -F -- "$(cat "$W/pick-grep")" "$W/pick-input" | head -1; exit 0; fi
+[ -f "$W/pick" ] && { cat "$W/pick"; exit 0; }
+exit 1

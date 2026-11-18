@@ -1,0 +1,47 @@
+#!/bin/sh
+# Fake pactl: sinks and cards follow the fake BlueZ state in $FAKE_DIR/bt (see bluetoothctl), plus
+# one built-in ALSA card/sink. $FAKE_DIR/bt/<mac>/props N pads the card's Properties to N lines
+# (a real bluez card lists ~30). State a2dp-nosink: the card still lists A2DP, active profile off, no sink.. set-card-profile fails when $FAKE_DIR/pactl-fail exists.
+F=${FAKE_DIR:?}
+echo "pactl $*" >> "$F/calls.log"
+cards() {  # mac state for every bluez card that exists
+    for dir in "$F"/bt/*/; do
+        [ -d "$dir" ] || continue
+        s=$(cat "$dir/state" 2>/dev/null || echo off)
+        case "$s" in off|nosink) continue ;; esac
+        echo "$(basename "$dir") $s"
+    done
+}
+case "$*" in
+    "list short sinks")
+        printf '148\talsa_output.pci-0000_00_1f.3.analog-stereo\tPipeWire\ts32le 2ch 48000Hz\tSUSPENDED\n'
+        n=200; cards | grep -v ' a2dp-nosink$' | while read -r m s; do
+            case "$s" in hfp|manual-hfp) fmt="s16le 1ch 16000Hz" ;; *) fmt="s24le 2ch 48000Hz" ;; esac
+            printf '%s\tbluez_output.%s.1\tPipeWire\t%s\tIDLE\n' "$n" "$m" "$fmt"; n=$((n + 1)); done ;;
+    "list short cards")
+        printf '50\talsa_card.pci-0000_00_1f.3\talsa\n'
+        n=90; cards | while read -r m s; do printf '%s\tbluez_card.%s\tmodule-bluez5-device.c\n' "$n" "$m"; n=$((n + 1)); done ;;
+    "list cards")
+        printf 'Card #50\n\tName: alsa_card.pci-0000_00_1f.3\n\tDriver: alsa\n\tOwner Module: n/a\n\tProperties:\n\t\tapi.alsa.card = "0"\n\tProfiles:\n\t\toff: Off (sinks: 0, sources: 0, priority: 0, available: yes)\n\t\toutput:analog-stereo: Analog Stereo Output (sinks: 1, sources: 0, priority: 6500, available: yes)\n\tActive Profile: output:analog-stereo\n\tPorts:\n\t\tanalog-output-speaker: Speakers (type: Speaker, priority: 10000, availability unknown)\n'
+        n=90; cards | while read -r m s; do
+            printf 'Card #%s\n\tName: bluez_card.%s\n\tDriver: module-bluez5-device.c\n\tOwner Module: n/a\n\tProperties:\n' "$n" "$m"
+            props=$(cat "$F/bt/$m/props" 2>/dev/null || echo 10)
+            printf '\t\tdevice.description = "%s"\n' "$(cat "$F/bt/$m/name" 2>/dev/null || echo 'MOMENTUM 4')"
+            printf '\t\tapi.bluez5.address = "%s"\n' "$(echo "$m" | tr _ :)"
+            i=2; while [ $i -lt "$props" ]; do printf '\t\tdevice.prop%s = "x"\n' $i; i=$((i + 1)); done
+            printf '\tProfiles:\n\t\toff: Off (sinks: 0, sources: 0, priority: 0, available: yes)\n'
+            case "$s" in
+                a2dp|manual-hfp|a2dp-nosink) printf '\t\ta2dp-sink-sbc: High Fidelity Playback (A2DP Sink, codec SBC) (sinks: 1, sources: 0, priority: 18, available: yes)\n\t\ta2dp-sink: High Fidelity Playback (A2DP Sink, codec aptX HD) (sinks: 1, sources: 0, priority: 19, available: yes)\n' ;;
+                a2dp-unavail) printf '\t\ta2dp-sink: High Fidelity Playback (A2DP Sink, codec aptX HD) (sinks: 1, sources: 0, priority: 19, available: no)\n' ;;
+            esac
+            printf '\t\theadset-head-unit-cvsd: Headset Head Unit (HSP/HFP, codec CVSD) (sinks: 1, sources: 1, priority: 1, available: yes)\n\t\theadset-head-unit: Headset Head Unit (HSP/HFP, codec mSBC) (sinks: 1, sources: 1, priority: 2, available: yes)\n'
+            case "$s" in hfp|manual-hfp) a=headset-head-unit ;; a2dp-nosink) a=off ;; *) a=a2dp-sink ;; esac
+            printf '\tActive Profile: %s\n\tPorts:\n\t\theadphone-output: Headphone (type: Headphones, priority: 0, latency offset: 0 usec, available)\n' "$a"
+            n=$((n + 1))
+        done ;;
+    set-card-profile*)
+        [ -e "$F/pactl-fail" ] && { echo "Failure: No such entity" >&2; exit 1; }
+        m=${2#bluez_card.}; dir="$F/bt/$m"; [ -d "$dir" ] || { echo "Failure: No such entity" >&2; exit 1; }
+        case "$3" in headset-head-unit*) echo manual-hfp > "$dir/state" ;; a2dp-sink*) echo a2dp > "$dir/state" ;; esac ;;
+esac
+exit 0

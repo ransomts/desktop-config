@@ -3,11 +3,13 @@
 # connection to $XDG_RUNTIME_DIR (tmpfs, so the password never hits disk) and
 # print the PNG path, then the password on a second line. Used by the Quickshell Wi-Fi popup. Exit 1 if not on Wi-Fi.
 set -eu
-con=$(nmcli -t -f NAME,TYPE connection show --active | awk -F: '$2 ~ /wireless/ {print $1; exit}')
+# -e no: values unescaped (nmcli -t/-g escape ':' and '\', which esc() below would double);
+# the name may hold colons, so match the type as a suffix
+con=$(nmcli -e no -t -f NAME,TYPE connection show --active | awk '/:[^:]*wireless$/ {sub(/:[^:]*$/, ""); print; exit}')
 [ -n "$con" ] || exit 1
-ssid=$(nmcli -s -g 802-11-wireless.ssid connection show "$con")
-km=$(nmcli -s -g 802-11-wireless-security.key-mgmt connection show "$con" 2>/dev/null || true)
-psk=$(nmcli -s -g 802-11-wireless-security.psk connection show "$con" 2>/dev/null || true)
+ssid=$(nmcli -e no -s -g 802-11-wireless.ssid connection show "$con")
+km=$(nmcli -e no -s -g 802-11-wireless-security.key-mgmt connection show "$con" 2>/dev/null || true)
+psk=$(nmcli -e no -s -g 802-11-wireless-security.psk connection show "$con" 2>/dev/null || true)
 esc() { printf '%s' "$1" | sed 's/[\\;,:"]/\\&/g'; }
 case "$km" in
   sae) t=SAE ;;

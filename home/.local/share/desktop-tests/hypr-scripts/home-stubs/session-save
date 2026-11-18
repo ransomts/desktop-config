@@ -1,0 +1,3 @@
+#!/bin/sh
+# stub (hypr-scripts-test)
+echo "session-save $*" >> "$CALLS"

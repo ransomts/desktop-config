@@ -1,0 +1,87 @@
+#!/bin/sh
+# Tests for bin/input-settings and the Settings > Input page (SettingsInput.qml).
+#
+#   input-test              run everything; ITEST PASS/FAIL lines and a summary; exit 1 on a failure
+#   input-test -v           also print everything Quickshell logged
+#   input-test -o DIR       save pictures of the page (dark and light) in DIR
+#   input-test -d DIR       test the config in DIR instead of ~/.config/quickshell
+#   input-test -b DIR       test the input-settings in DIR instead of ~/.local/bin
+#   input-test -k           keep the temporary directory (printed)
+#
+# Nothing here touches the live session: input-settings talks to a fake hyprctl (tests/input/hyprctl)
+# that logs every `eval` and applies it to a table of options seeded from real getoption captures
+# (tests/input/fixtures), the saved file is temporary, and the page is loaded offscreen in a plain
+# window. Part 1: input-settings on its own (cli_test.py). Part 2: the page, with a Moonlander and a
+# trackball "connected". Part 3: the page with neither.
+verbose=0; keep=0; out=""; src="$HOME/.config/quickshell"; bin="$HOME/.local/bin"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) verbose=1 ;;
+        -o) out="$2"; shift ;;
+        -d) src="$2"; shift ;;
+        -b) bin="$2"; shift ;;
+        -k) keep=1 ;;
+        *) echo "usage: input-test [-v] [-k] [-o DIR] [-d CONFIG_DIR] [-b BIN_DIR]" >&2; exit 2 ;;
+    esac
+    shift
+done
+qs="$HOME/.nix-profile/bin/qs"
+tests="$src/tests/input"
+[ -x "$qs" ] && [ -f "$tests/shell.qml" ] || { echo "input-test: no qs, or no $tests/shell.qml" >&2; exit 2; }
+[ -x "$bin/input-settings" ] || { echo "input-test: no $bin/input-settings" >&2; exit 2; }
+[ -n "$out" ] && { mkdir -p "$out" && out=$(cd "$out" && pwd) || exit 2; }
+work=$(mktemp -d) || exit 2
+[ "$keep" = 1 ] && echo "keeping $work" || trap 'rm -rf "$work"' EXIT
+ok=0
+
+echo "== part 1: input-settings"
+python3 "$tests/cli_test.py" "$bin/input-settings" "$tests" > "$work/cli.log" 2>&1
+code=$?
+[ "$verbose" = 1 ] && cat "$work/cli.log" || grep -v ' PASS ' "$work/cli.log" | sed 's/^ITEST //'
+[ $code -eq 0 ] || ok=1
+
+run_pass() {    # NAME [none]
+    p="$work/$1"; cfg="$p/cfg"; fake="$p/home"; sbin="$p/bin"; st="$p/fake"
+    mkdir -p "$cfg" "$p/state" "$sbin" "$st" "$fake/.config/cosmic/com.system76.CosmicTheme.Mode/v1" "$fake/.config/shell" "$fake/.local/share"
+    mkdir -m 700 "$p/run"
+    echo true > "$fake/.config/cosmic/com.system76.CosmicTheme.Mode/v1/is_dark"
+    [ -e "$HOME/.local/share/fonts" ] && ln -s "$HOME/.local/share/fonts" "$fake/.local/share/fonts"
+    for f in "$src"/SettingsInput.qml "$src"/SettingsPage.qml "$src"/SettingsRow.qml "$src"/SettingsCard.qml "$src"/SettingsChip.qml \
+             "$src"/SettingsChoice.qml "$src"/SettingsStepper.qml "$src"/SettingsSwitch.qml "$src"/SettingsInfo.qml "$src"/SettingsButton.qml \
+             "$src"/Theme.qml "$src"/Caption.qml; do
+        cp "$f" "$cfg/" || exit 2
+    done
+    cp "$tests/shell.qml" "$tests/Sys.qml" "$cfg/"
+    cp "$bin/input-settings" "$sbin/"
+    extra_k='[]'; extra_m='[]'
+    if [ "$2" != none ]; then
+        extra_k='[{"name":"zsa-technology-labs-moonlander-mark-i","layout":"us","active_keymap":"English (US)"},{"name":"zsa-technology-labs-moonlander-mark-i-keyboard","layout":"us","active_keymap":"English (US)"}]'
+        extra_m='[{"name":"kensington-expert-wireless-trackball","defaultSpeed":0.0,"scrollFactor":-1.0}]'
+    fi
+    log="$p/log"
+    env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u QT_QPA_PLATFORMTHEME -u QT_STYLE_OVERRIDE \
+        HOME="$fake" XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}" XDG_CONFIG_HOME="$fake/.config" \
+        QT_QPA_PLATFORM=offscreen XDG_RUNTIME_DIR="$p/run" XDG_STATE_HOME="$p/state" XDG_CACHE_HOME="$p/cache" \
+        INPUT_BIN="$sbin" INPUT_PASS="$2" INPUT_TEST_OUT="$([ "$2" = none ] || echo "$out")" \
+        HYPRCTL="$tests/hyprctl" FAKE_STATE="$st" FAKE_FIXTURES="$tests/fixtures" INPUT_SETTINGS_FILE="$fake/.config/shell/input.json" \
+        FAKE_EXTRA_KEYBOARDS="$extra_k" FAKE_EXTRA_MICE="$extra_m" \
+        dbus-run-session -- timeout 120 "$qs" -p "$cfg/shell.qml" --no-color > "$log" 2>&1
+    code=$?
+    [ "$verbose" = 1 ] && cat "$log"
+    grep -o 'ITEST \(FAIL\|RESULT\|picture\).*' "$log" | sed 's/^ITEST //'
+    if ! grep -q 'ITEST RESULT' "$log"; then
+        echo "input-test: the $1 run did not finish (exit $code). Last lines:" >&2
+        grep -vE 'dbus-daemon|portal' "$log" | tail -15 >&2
+        ok=1; return
+    fi
+    grep -q 'ITEST RESULT pass [0-9]* fail 0$' "$log" || ok=1
+    if grep -E '(Settings|Sys|shell)[A-Za-z]*\.qml.*(TypeError|ReferenceError|Binding loop|Unable to assign|Cannot assign|is not a type)' "$log" | grep -q .; then
+        echo "FAIL errors were logged ($1):"; grep -E '(TypeError|ReferenceError|Binding loop|Unable to assign|Cannot assign|is not a type)' "$log" | sort -u | head -12; ok=1
+    fi
+}
+echo "== part 2: the page, Moonlander and trackball connected"
+run_pass full
+echo "== part 3: the page, neither connected"
+run_pass none none
+[ -n "$out" ] && echo "pictures in $out"
+exit $ok

@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+# Fake hyprctl for input-test: getoption -j reads FAKE_STATE/opts.json (seeded from the real captures in
+# fixtures/), devices -j returns fixtures/devices.json (plus FAKE_EXTRA_DEVICES), and `eval` is logged to
+# FAKE_STATE/evals (one line per call) and applied to opts.json by reading the Lua tables, so what the
+# page shows after a change is what the call would have set. Anything else is refused.
+import json, os, re, sys
+st = os.environ["FAKE_STATE"]; fx = os.environ["FAKE_FIXTURES"]
+a = sys.argv[1:]
+open(os.path.join(st, "calls"), "a").write(" ".join(a[:3]) + "\n")
+if a and a[0] == "-j": a = a[1:]; j = True
+else: j = False
+optf = os.path.join(st, "opts.json")
+if not os.path.exists(optf):
+    o = {}
+    for f in os.listdir(fx):
+        if f == "devices.json": continue
+        d = json.load(open(os.path.join(fx, f)))
+        t = [k for k in ("bool", "int", "float", "str") if k in d][0]
+        o[d["option"]] = d[t]
+    json.dump(o, open(optf, "w"))
+opts = json.load(open(optf))
+if a[0] == "getoption":
+    n = a[1]
+    if n not in opts: print("no such option"); sys.exit(0)
+    v = opts[n]; t = "bool" if isinstance(v, bool) else "int" if isinstance(v, int) else "float" if isinstance(v, float) else "str"
+    print(json.dumps({"option": n, t: v, "set": True})); sys.exit(0)
+if a[0] == "devices":
+    d = json.load(open(os.path.join(fx, "devices.json")))
+    d["keyboards"] += json.loads(os.environ.get("FAKE_EXTRA_KEYBOARDS", "[]")); d["mice"] += json.loads(os.environ.get("FAKE_EXTRA_MICE", "[]"))
+    print(json.dumps(d)); sys.exit(0)
+if a[0] == "eval":
+    open(os.path.join(st, "evals"), "a").write(a[1] + "\n")
+    if os.path.exists(os.path.join(st, "fail")): print("error: lua: boom"); sys.exit(1)
+    for cfg in re.findall(r"hl\.config\((.*?)\)(?:;|$)", a[1]):
+        js = re.sub(r"(\w+)\s*=", r'"\1":', cfg)
+        def walk(t, pre):
+            for k, v in t.items():
+                if isinstance(v, dict): walk(v, pre + k + ":")
+                else: opts[pre + k] = v
+        walk(json.loads(js), "")
+    json.dump(opts, open(optf, "w"))
+    print("ok"); sys.exit(0)
+print("fake hyprctl: refused " + " ".join(a)); sys.exit(1)

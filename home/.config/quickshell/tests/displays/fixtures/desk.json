@@ -1,0 +1,118 @@
+[
+ {
+  "id": 0,
+  "name": "DP-5",
+  "description": "Dell Inc. DELL P2425HE 8BY1H14",
+  "make": "Dell Inc.",
+  "model": "DELL P2425HE",
+  "serial": "8BY1H14",
+  "width": 1920,
+  "height": 1080,
+  "refreshRate": 60.0,
+  "x": 0,
+  "y": 840,
+  "activeWorkspace": {
+   "id": 11,
+   "name": "11"
+  },
+  "scale": 1,
+  "transform": 0,
+  "focused": false,
+  "disabled": false,
+  "mirrorOf": "none",
+  "availableModes": [
+   "1920x1080@60.00Hz",
+   "1920x1080@59.94Hz",
+   "1920x1080@50.00Hz",
+   "1680x1050@59.95Hz",
+   "1280x1024@75.03Hz",
+   "1280x720@60.00Hz",
+   "1024x768@60.00Hz"
+  ]
+ },
+ {
+  "id": 1,
+  "name": "DP-6",
+  "description": "Dell Inc. DELL P2214H KW14V59N39RB",
+  "make": "Dell Inc.",
+  "model": "DELL P2214H",
+  "serial": "KW14V59N39RB",
+  "width": 1920,
+  "height": 1080,
+  "refreshRate": 60.0,
+  "x": 1920,
+  "y": 0,
+  "activeWorkspace": {
+   "id": 12,
+   "name": "12"
+  },
+  "scale": 1,
+  "transform": 1,
+  "focused": false,
+  "disabled": false,
+  "mirrorOf": "none",
+  "availableModes": [
+   "1920x1080@60.00Hz",
+   "1920x1080@50.00Hz",
+   "1600x900@60.00Hz",
+   "1280x1024@60.02Hz",
+   "1280x720@60.00Hz"
+  ]
+ },
+ {
+  "id": 2,
+  "name": "DP-7",
+  "description": "Samsung Electric Company S34J55x H4LR305255",
+  "make": "Samsung Electric Company",
+  "model": "S34J55x",
+  "serial": "H4LR305255",
+  "width": 3440,
+  "height": 1440,
+  "refreshRate": 59.973,
+  "x": 3000,
+  "y": 480,
+  "activeWorkspace": {
+   "id": 13,
+   "name": "13"
+  },
+  "scale": 1,
+  "transform": 0,
+  "focused": true,
+  "disabled": false,
+  "mirrorOf": "none",
+  "availableModes": [
+   "3440x1440@59.97Hz",
+   "3440x1440@49.99Hz",
+   "2560x1440@59.95Hz",
+   "2560x1080@60.00Hz",
+   "1920x1080@60.00Hz",
+   "1280x720@60.00Hz"
+  ]
+ },
+ {
+  "id": 3,
+  "name": "eDP-1",
+  "description": "AU Optronics 0x683D",
+  "make": "AU Optronics",
+  "model": "0x683D",
+  "serial": "",
+  "width": 1920,
+  "height": 1080,
+  "refreshRate": 60.049,
+  "x": 6440,
+  "y": 840,
+  "activeWorkspace": {
+   "id": 14,
+   "name": "14"
+  },
+  "scale": 1,
+  "transform": 0,
+  "focused": false,
+  "disabled": false,
+  "mirrorOf": "none",
+  "availableModes": [
+   "1920x1080@60.05Hz",
+   "1920x1080@48.04Hz"
+  ]
+ }
+]

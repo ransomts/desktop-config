@@ -23,7 +23,7 @@ outputs() {
 # with the model read straight from its EDID.
 kernel_outputs() {
     local s d model
-    for s in /sys/class/drm/card*-DP-*/status; do
+    for s in "${DOCK_DRM_SYSFS:-/sys/class/drm}"/card*-DP-*/status; do   # DOCK_DRM_SYSFS: tests (hypr-scripts-test)
         [[ $(< "$s") == connected ]] || continue
         d=${s%/status}
         model=$(edid-decode "$d/edid" 2>/dev/null \
@@ -101,7 +101,8 @@ apply_layout() {
 
 apply_layout
 udevadm monitor --udev --subsystem-match=drm | while read -r line; do
-    [[ $line == UDEV* ]] || continue
+    # Events only ("UDEV  [time] change ..."), not the "UDEV - the event which udev sends" header.
+    [[ $line =~ ^UDEV\ +\[ ]] || continue
     # A dock attach fires a burst of events; wait for it to go quiet.
     while read -r -t 3 _; do :; done
     apply_layout

@@ -1,0 +1,19 @@
+#!/bin/sh
+# Fake gdbus. `call` answers UPower's OnBattery from $FAKE_DIR/onbattery (true|false, anything else
+# fails); `monitor --dest X` plays $FAKE_DIR/monitor-X.script (see _play). Every call is logged.
+F=${FAKE_DIR:?}
+echo "gdbus $*" >> "$F/calls.log"
+case "$1" in
+    call)
+        echo call >> "$F/upower-calls"
+        v=$(cat "$F/onbattery" 2>/dev/null)
+        case "$v" in
+            true|false) echo "(<$v>,)" ;;
+            *) echo "Error: GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: The name is not activatable" >&2; exit 1 ;;
+        esac ;;
+    monitor)
+        dest=""
+        while [ $# -gt 0 ]; do [ "$1" = --dest ] && dest=$2; shift; done
+        exec "$(dirname "$0")/_play" "$F/monitor-$dest.script" ;;
+    *) exit 0 ;;
+esac

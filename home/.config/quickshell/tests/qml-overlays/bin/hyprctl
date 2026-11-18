@@ -1,0 +1,8 @@
+#!/bin/sh
+# Stand-in hyprctl (qml-overlays-test): answers from canned JSON in $QO_FIX, records every call.
+echo "hyprctl $*" >> "$QO_CALLS"
+case "$*" in
+    "clients -j"|"-j clients") cat "$QO_FIX/clients.json" 2>/dev/null || echo "[]" ;;
+    "-j devices"|"devices -j") cat "$QO_FIX/devices.json" 2>/dev/null || echo "{}" ;;
+    *) echo "ok" ;;
+esac

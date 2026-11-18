@@ -1,0 +1,5 @@
+#!/bin/sh
+# Fake journalctl: logs the call and plays $FAKE_DIR/journal.script (see _play) as `-f` output.
+F=${FAKE_DIR:?}
+echo "journalctl $*" >> "$F/calls.log"
+exec "$(dirname "$0")/_play" "$F/journal.script"

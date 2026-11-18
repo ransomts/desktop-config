@@ -1,0 +1,28 @@
+[
+ {
+  "id": 0,
+  "name": "eDP-1",
+  "description": "AU Optronics 0x683D",
+  "make": "AU Optronics",
+  "model": "0x683D",
+  "serial": "",
+  "width": 1920,
+  "height": 1080,
+  "refreshRate": 60.049,
+  "x": 6440,
+  "y": 840,
+  "activeWorkspace": {
+   "id": 11,
+   "name": "11"
+  },
+  "scale": 1,
+  "transform": 0,
+  "focused": true,
+  "disabled": false,
+  "mirrorOf": "none",
+  "availableModes": [
+   "1920x1080@60.05Hz",
+   "1920x1080@48.04Hz"
+  ]
+ }
+]

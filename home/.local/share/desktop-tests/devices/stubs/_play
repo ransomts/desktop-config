@@ -1,0 +1,28 @@
+#!/bin/sh
+# Play a script of monitor lines, then block until $FAKE_DIR/stop exists (like a long-running
+# `gdbus monitor` / `journalctl -f`). Directives, one per line:
+#   @sleep S          pause
+#   @touch FILE       create FILE (relative paths are under $FAKE_DIR)
+#   @wait FILE        wait (up to 20 s) until FILE exists
+#   @grep FILE RE     wait (up to 20 s) until FILE has a line matching RE
+#   @set KEY VALUE    write VALUE to $FAKE_DIR/KEY (fake device state)
+#   @calls N          wait until $FAKE_DIR/upower-calls has N lines (on-battery: apply() ran N times)
+# Anything else is printed as a monitor line.
+F=${FAKE_DIR:?}
+p() { case "$1" in /*) echo "$1" ;; *) echo "$F/$1" ;; esac; }
+waitfor() { i=0; while ! eval "$1"; do i=$((i + 1)); [ $i -gt 400 ] && { echo "_play: timed out on $1" >> "$F/play-errors"; return; }; sleep 0.05; done; }
+if [ -f "$1" ]; then
+    while IFS= read -r line; do
+        set -- $line
+        case "$1" in
+            @sleep) sleep "$2" ;;
+            @touch) : > "$(p "$2")" ;;
+            @wait) f=$(p "$2"); waitfor '[ -e "$f" ]' ;;
+            @grep) f=$(p "$2"); shift 2; re="$*"; waitfor 'grep -q -- "$re" "$f" 2>/dev/null' ;;
+            @set) k=$2; shift 2; mkdir -p "$(dirname "$F/$k")"; echo "$*" > "$F/$k" ;;
+            @calls) n=$2; waitfor '[ "$(wc -l < "$F/upower-calls" 2>/dev/null || echo 0)" -ge "$n" ]' ;;
+            *) printf '%s\n' "$line" ;;
+        esac
+    done < "$1"
+fi
+while [ ! -e "$F/stop" ]; do sleep 0.05; done

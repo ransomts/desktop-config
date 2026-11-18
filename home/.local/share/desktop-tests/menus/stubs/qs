@@ -1,0 +1,47 @@
+#!/bin/sh
+# Quickshell stand-in (menus-test), installed as $HOME/.nix-profile/bin/qs.
+#   $MT/qs-down          every IPC call fails (Quickshell not running)
+#   $MT/qs-picker-down   only picker calls fail (fallback to fuzzel)
+#   $MT/picks            queue, one line per list opened: a fixed string, the first item
+#                        containing it is chosen; CANCEL (or no match) answers -1
+#   $MT/answers          queue for picker ask: "ok:TEXT" or "cancel"
+#   $MT/wallpaper-status, $MT/dnd   answers to those status calls
+#   $MT/bar-up-after N   bar status fails for the first N calls
+#   qs -n ...            prints a few log lines like the real daemon and exits
+line=qs; for a in "$@"; do line="$line [$a]"; done
+printf '%s\n' "$line" >> "$MT/calls"
+pop() { [ -s "$1" ] || return 1; head -n 1 "$1"; sed -i 1d "$1"; }
+if [ "$1" = -n ]; then
+    printf '  INFO: config loaded\n  WARN qml: something odd\n  ERROR boom\nCRIT the end\nFATAL really\n'
+    exit 0
+fi
+[ "$1 $2" = "ipc call" ] || exit 0
+[ -e "$MT/qs-down" ] && exit 1
+case "$3.$4" in
+    picker.open|picker.openlive|picker.openranked)
+        [ -e "$MT/qs-picker-down" ] && exit 1
+        items=$5; out=$6
+        cp "$items" "$MT/picker-items"
+        want=$(pop "$MT/picks") || want=CANCEL
+        i=-1
+        if [ "$want" != CANCEL ]; then
+            n=$(grep -nF -- "$want" "$items" | head -n 1 | cut -d: -f1)
+            [ -n "$n" ] && i=$((n - 1))
+        fi
+        ( printf '%s\n' "$i" > "$out" ) &
+        exit 0 ;;
+    picker.ask)
+        [ -e "$MT/qs-picker-down" ] && exit 1
+        out=$5; a=$(pop "$MT/answers") || a=cancel
+        ( printf '%s\n' "$a" > "$out" ) &
+        exit 0 ;;
+    wallpaper.status) [ -f "$MT/wallpaper-status" ] || exit 1; cat "$MT/wallpaper-status" ;;
+    notif.dnd) cat "$MT/dnd" 2>/dev/null || echo off ;;
+    bar.status)
+        if [ -f "$MT/bar-up-after" ]; then
+            c=$(( $(cat "$MT/bar-count" 2>/dev/null || echo 0) + 1 )); echo "$c" > "$MT/bar-count"
+            [ "$c" -gt "$(cat "$MT/bar-up-after")" ] || exit 1
+        fi
+        echo shown ;;
+esac
+exit 0

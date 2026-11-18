@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+# Stand-in for hyprctl in the displays tests (bin/displays-test). Never talks to Hyprland.
+#   FAKE_MONITORS  JSON file: what `hyprctl -j monitors [all]` prints; an eval of hl.monitor(...)
+#                  changes it the way Hyprland would (mode, position, scale, transform)
+#   FAKE_LOG       every call is appended here, one line: the arguments joined by " | "
+#   FAKE_FAIL      "eval": every eval fails; "eval2": the second one fails
+import json, os, re, sys
+
+args = sys.argv[1:]
+log = os.environ.get("FAKE_LOG")
+if log:
+    with open(log, "a") as f:
+        f.write(" | ".join(args) + "\n")
+    with open(log + ".instance", "a") as f:       # which Hyprland it would have talked to
+        f.write(os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "") + "\n")
+path = os.environ["FAKE_MONITORS"]
+plain = [a for a in args if a != "-j"]
+if plain[:1] == ["monitors"]:
+    mons = json.load(open(path))
+    if "all" not in plain:
+        mons = [m for m in mons if not m.get("disabled")]
+    print(json.dumps(mons, indent=1))
+    sys.exit(0)
+if plain[:1] == ["eval"] and len(plain) == 2:
+    fail = os.environ.get("FAKE_FAIL", "")
+    count_file = path + ".evals"
+    n = int(open(count_file).read() or 0) + 1 if os.path.exists(count_file) else 1
+    open(count_file, "w").write(str(n))
+    if fail == "eval" or (fail == "eval2" and n == 2):
+        print("error: hl.monitor: something went wrong")
+        sys.exit(1)
+    code = plain[1]
+    m = re.fullmatch(r'hl\.monitor\(\{ (.*) \}\)', code)
+    if not m:
+        print("error: fake hyprctl only understands hl.monitor({...})")
+        sys.exit(1)
+    fields = dict(re.findall(r'(\w+) = ("(?:[^"\\]|\\.)*"|[-0-9.]+)', m.group(1)))
+    fields = {k: json.loads(v) if v.startswith('"') else float(v) for k, v in fields.items()}
+    mons = json.load(open(path))
+    out = fields.get("output", "")
+    hit = [x for x in mons if (out.startswith("desc:") and x["description"] == out[5:]) or x["name"] == out]
+    if not hit:
+        print("error: no such output " + out)
+        sys.exit(1)
+    x = hit[0]
+    if "mode" in fields:
+        w, h, r = re.fullmatch(r"(\d+)x(\d+)@([0-9.]+)", fields["mode"]).groups()
+        x["width"], x["height"], x["refreshRate"] = int(w), int(h), float(r)
+    if "position" in fields:
+        px, py = fields["position"].split("x")
+        x["x"], x["y"] = int(px), int(py)
+    if "scale" in fields:
+        x["scale"] = fields["scale"]
+    if "transform" in fields:
+        x["transform"] = int(fields["transform"])
+    json.dump(mons, open(path, "w"), indent=1)
+    print("ok")
+    sys.exit(0)
+print("fake hyprctl: not supported: " + " ".join(args))
+sys.exit(1)

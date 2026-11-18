@@ -1,0 +1,7 @@
+#!/bin/sh
+# Stand-in drop-preview (qml-overlays-test): plays $QO_FIX/drop.lines ("sleep N" pauses), then waits.
+echo "drop-preview $*" >> "$QO_CALLS"
+while IFS= read -r l; do
+    case "$l" in sleep\ *) sleep "${l#sleep }" ;; *) echo "$l" ;; esac
+done < "$QO_FIX/drop.lines"
+exec sleep 20

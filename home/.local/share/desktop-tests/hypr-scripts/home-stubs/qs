@@ -1,0 +1,6 @@
+#!/bin/sh
+# stub (hypr-scripts-test): record; exit with $W/qs-rc (default 0). `-p FILE` is the lock screen:
+# it writes $W/lock-result (if any) to $XDG_RUNTIME_DIR/lock-screen.result
+echo "qs $*" >> "$CALLS"
+if [ "$1" = -p ] && [ -f "$W/lock-result" ]; then cat "$W/lock-result" > "$XDG_RUNTIME_DIR/lock-screen.result"; fi
+exit "$(cat "$W/qs-rc" 2>/dev/null || echo 0)"

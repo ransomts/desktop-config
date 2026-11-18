@@ -1,0 +1,11 @@
+#!/bin/sh
+# data-test stub: answers from $DT_DIR/hypr/*.json (binds: $DT_BINDS); every call logged
+echo "hyprctl $*" >> "$DT_DIR/calls.log"
+[ -n "$HYPRCTL_FAIL" ] && exit 1
+case "$1 $2" in
+    "binds -j"|"-j binds") exec /bin/cat "${DT_BINDS:-$DT_DIR/hypr/binds.json}" ;;
+    "hyprsunset temperature") [ -f "$DT_DIR/hypr/hyprsunset" ] && exec /bin/cat "$DT_DIR/hypr/hyprsunset"; exit 1 ;;
+    dispatch*) echo ok; exit 0 ;;
+esac
+[ "$1" = -j ] && [ -f "$DT_DIR/hypr/$2.json" ] && exec /bin/cat "$DT_DIR/hypr/$2.json"
+exit 1

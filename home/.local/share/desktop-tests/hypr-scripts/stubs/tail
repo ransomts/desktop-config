@@ -1,0 +1,7 @@
+#!/bin/sh
+# stub (hypr-scripts-test): `tail ... -F FILE` records and prints FILE once (no following);
+# anything else is the real tail
+case " $* " in
+    *" -F "*) echo "tail $*" >> "$CALLS"; for a; do f=$a; done; cat "$f" ;;
+    *) exec /usr/bin/tail "$@" ;;
+esac

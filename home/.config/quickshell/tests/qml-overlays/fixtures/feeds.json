@@ -1,0 +1,79 @@
+{
+ "weather": {
+  "ok": true,
+  "glyph": "\u2600",
+  "temp": 64,
+  "words": "Clear sky",
+  "feels": 62,
+  "wind": 5,
+  "humidity": 40,
+  "sunrise": "07:12",
+  "sunset": "17:24",
+  "days": [
+   {
+    "name": "Wed",
+    "glyph": "\u2600",
+    "hi": 66,
+    "lo": 41,
+    "rain": 0
+   },
+   {
+    "name": "Thu",
+    "glyph": "\u2601",
+    "hi": 60,
+    "lo": 44,
+    "rain": 20
+   },
+   {
+    "name": "Fri",
+    "glyph": "\u2602",
+    "hi": 55,
+    "lo": 47,
+    "rain": 80
+   }
+  ]
+ },
+ "mail": {
+  "boxes": [
+   {
+    "name": "Clemson",
+    "unread": 3
+   },
+   {
+    "name": "Gmail",
+    "unread": 0
+   }
+  ],
+  "latest": [
+   {
+    "box": "Clemson",
+    "from": "Dean's Office",
+    "subject": "Spring schedule review"
+   },
+   {
+    "box": "Clemson",
+    "from": "Registrar",
+    "subject": "Grades due Dec 15"
+   },
+   {
+    "box": "Gmail",
+    "from": "Library",
+    "subject": "Book due"
+   }
+  ]
+ },
+ "tomorrow": {
+  "name": "Thursday",
+  "events": [
+   {
+    "start": "09:05",
+    "end": "09:55",
+    "title": "CPSC 1010 lecture"
+   },
+   {
+    "allday": true,
+    "title": "Reading day"
+   }
+  ]
+ }
+}

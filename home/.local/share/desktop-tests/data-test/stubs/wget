@@ -1,0 +1,4 @@
+#!/bin/sh
+# data-test recording stub: never reaches the real wget
+echo "wget $*" >> "$DT_DIR/calls.log"
+exit 0

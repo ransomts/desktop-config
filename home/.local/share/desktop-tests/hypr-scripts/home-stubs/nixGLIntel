@@ -1,0 +1,4 @@
+#!/bin/sh
+# stub (hypr-scripts-test): record and run the command
+echo "nixGLIntel $*" >> "$CALLS"
+exec "$@"

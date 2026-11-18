@@ -1,0 +1,5 @@
+#!/bin/sh
+# data-test stub: `tailscale status --json` prints $DT_DIR/tailscale.json; missing file = not running
+echo "tailscale $*" >> "$DT_DIR/calls.log"
+[ -f "$DT_DIR/tailscale.json" ] || { echo "failed to connect to local tailscaled" >&2; exit 1; }
+exec /bin/cat "$DT_DIR/tailscale.json"

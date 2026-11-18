@@ -1,0 +1,8 @@
+#!/bin/sh
+# setsid stand-in: logs (with QT_QUICK_BACKEND); runs the command only when $MT/setsid-run exists.
+line=setsid; for a in "$@"; do line="$line [$a]"; done
+printf '%s {QT_QUICK_BACKEND=%s}\n' "$line" "${QT_QUICK_BACKEND-}" >> "$MT/calls"
+[ -e "$MT/setsid-run" ] || exit 0
+[ "$1" = -f ] && shift
+"$@"
+exit 0

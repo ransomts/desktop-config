@@ -1,0 +1,21 @@
+{
+ "uptime": "3h 12m",
+ "load": "0.42",
+ "cpu": 0.37,
+ "temp": 61,
+ "mem": 0.55,
+ "mem_gb": 8.6,
+ "mem_total_gb": 15.5,
+ "disks": [
+  {
+   "name": "root",
+   "used": 0.48,
+   "free_gb": 240
+  },
+  {
+   "name": "home",
+   "used": 0.71,
+   "free_gb": 130
+  }
+ ]
+}

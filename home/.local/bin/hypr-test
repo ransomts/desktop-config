@@ -1,0 +1,290 @@
+#!/bin/bash
+# Tests for the Hyprland config itself (~/.config/hypr/hyprland.lua + layouts.lua): starts a nested
+# Hyprland on the REAL config, drives it with hyprctl, and checks what the window rules, Lua hooks and
+# desktop logic actually do. The other *-test suites only ever see a fake hyprctl.
+#
+#   hypr-test               run everything; PASS/FAIL lines and a RESULT line; exit 1 on a failure
+#   hypr-test -v            also print the nested Hyprland's log tail and the recorded commands
+#   hypr-test -d DIR        test the config in DIR instead of ~/.config/hypr
+#   hypr-test -k            keep the temporary directory (printed)
+#
+# Covered: config loads clean (no config errors, layouts.lua / Desk / SpecialOwners present, the
+# strict-resize plugin in); autostart commands; key bindings (essentials present, no key bound twice);
+# the special-workspace guard (stray windows leave special:keymapp; Keymapp and ncmpcpp still park);
+# switching desktops hides a shown special; dock / undock / redock with headless monitors (desktops
+# line up as 11/12/13, an undocked window folds onto the laptop and goes home on redock).
+#
+# Isolation. The nested instance shows up as a window on your current desktop for ~30 s; nothing else
+# should reach the live session:
+#  - HOME, XDG_RUNTIME_DIR, XDG_STATE_HOME are temporary (so Desk's hypr-desk-home and the layout and
+#    animation state files are not yours), and it runs on its own D-Bus session bus;
+#  - every hl.exec_cmd goes through a run-logged stub that records and never runs (no second
+#    Quickshell, no services), and systemctl / dbus-update-activation-environment / uwsm are
+#    recording stubs (0.57 exports its DISPLAY/WAYLAND_DISPLAY to systemd at start otherwise);
+#  - the live systemd environment and hypr-desk-home are compared before and after; a change FAILs.
+# Not parallel-safe with itself (headless monitor names); fine next to the other suites.
+set -u
+verbose=0; keep=0; src="$HOME/.config/hypr"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) verbose=1 ;;
+        -k) keep=1 ;;
+        -d) src="$2"; shift ;;
+        *) echo "usage: hypr-test [-v] [-k] [-d CONFIG_DIR]" >&2; exit 2 ;;
+    esac
+    shift
+done
+tests="$HOME/.config/hypr/tests"
+for need in Hyprland hyprctl jq dbus-daemon python3; do
+    command -v "$need" >/dev/null || { echo "hypr-test: needs $need" >&2; exit 2; }
+done
+[ -f "$src/hyprland.lua" ] || { echo "hypr-test: no $src/hyprland.lua" >&2; exit 2; }
+[ -x "$tests/client.py" ] && [ -d "$tests/stubs" ] || { echo "hypr-test: no $tests/client.py or stubs/" >&2; exit 2; }
+[ -n "${WAYLAND_DISPLAY:-}" ] && [ -n "${XDG_RUNTIME_DIR:-}" ] || { echo "hypr-test: needs a Wayland session to open the nested one in" >&2; exit 2; }
+case "$WAYLAND_DISPLAY" in /*) live_wl="$WAYLAND_DISPLAY" ;; *) live_wl="$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ;; esac
+
+live_env() { systemctl --user show-environment 2>/dev/null | grep -E '^(WAYLAND_DISPLAY|DISPLAY|HYPRLAND_INSTANCE_SIGNATURE|PATH)=' | sort; }
+live_home() { cat "$XDG_RUNTIME_DIR/hypr-desk-home" 2>/dev/null | md5sum; }
+env_before=$(live_env); home_before=$(live_home)
+
+work=$(mktemp -d) || exit 2
+H="$work/home"; R="$work/run"; LOG="$work/exec.log"
+mkdir -p "$H/.config" "$H/.local/bin" "$H/.local/lib/hyprland" "$H/.local/state" "$R" && chmod 700 "$R"
+cp -r "$src" "$H/.config/hypr"
+cp "$tests/stubs/run-logged" "$H/.local/bin/"
+[ -f "$HOME/.local/lib/hyprland/strict-resize.so" ] && ln -s "$HOME/.local/lib/hyprland/strict-resize.so" "$H/.local/lib/hyprland/"
+: > "$LOG"
+
+pids=()
+cleanup() {
+    for p in "${pids[@]}"; do kill -9 "$p" 2>/dev/null; done
+    [ -n "${hypr_pid:-}" ] && kill -9 "$hypr_pid" 2>/dev/null
+    [ -n "${bus_pid:-}" ] && kill "$bus_pid" 2>/dev/null
+    wait 2>/dev/null
+    if [ "$keep" = 1 ]; then echo "kept $work"; else rm -rf "$work"; fi
+}
+trap cleanup EXIT
+
+# Own session bus: nothing nested (Hyprland, GTK test windows) talks to yours.
+bus=$(dbus-daemon --session --fork --print-address=1 --print-pid=1 --nopidfile) || { echo "hypr-test: dbus-daemon failed" >&2; exit 2; }
+bus_addr=$(printf '%s\n' "$bus" | sed -n 1p); bus_pid=$(printf '%s\n' "$bus" | sed -n 2p)
+
+base_env=(HOME="$H" USER="$USER" LANG="${LANG:-C.UTF-8}" PATH="$tests/stubs:$PATH"
+    XDG_RUNTIME_DIR="$R" XDG_CONFIG_HOME="$H/.config" XDG_STATE_HOME="$H/.local/state"
+    XDG_DATA_HOME="$HOME/.local/share" XDG_DATA_DIRS="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+    DBUS_SESSION_BUS_ADDRESS="$bus_addr" HYPR_TEST_LOG="$LOG" NO_AT_BRIDGE=1 GTK_A11Y=none)
+
+env -i "${base_env[@]}" WAYLAND_DISPLAY="$live_wl" HYPRLAND_NO_SD_VARS=1 HYPRLAND_NO_SD_NOTIFY=1 \
+    Hyprland -c "$H/.config/hypr/hyprland.lua" > "$work/hyprland.out" 2>&1 &
+hypr_pid=$!
+
+ok=0; bad=0
+pass() { ok=$((ok+1)); echo "PASS $1"; }
+fail() { bad=$((bad+1)); echo "FAIL $1${2:+   [$2]}"; }
+check() { if [ "$2" = 0 ]; then pass "$1"; else fail "$1" "${3:-}"; fi; }
+
+sig=""
+for _ in $(seq 150); do
+    s=$(ls "$R/hypr" 2>/dev/null | head -1)
+    [ -n "$s" ] && [ -S "$R/hypr/$s/.socket.sock" ] && { sig=$s; break; }
+    kill -0 "$hypr_pid" 2>/dev/null || break
+    sleep 0.1
+done
+if [ -z "$sig" ]; then
+    echo "FAIL nested Hyprland did not come up"; tail -20 "$work/hyprland.out"; exit 1
+fi
+hc() { env XDG_RUNTIME_DIR="$R" HYPRLAND_INSTANCE_SIGNATURE="$sig" hyprctl "$@"; }
+for _ in $(seq 100); do hc version >/dev/null 2>&1 && break; sleep 0.1; done
+nested_wl=$(cd "$R" && ls wayland-* 2>/dev/null | grep -v '\.lock$' | head -1)
+
+# Poll until a jq expression over `hyprctl -j CMD` is true, up to $3 tenths of a second.
+until_jq() { local cmd=$1 expr=$2 n=${3:-50}; for _ in $(seq "$n"); do hc -j "$cmd" 2>/dev/null | jq -e "$expr" >/dev/null 2>&1 && return 0; sleep 0.1; done; return 1; }
+spawn() {   # spawn CLASS [TITLE]: open a test window; returns once it is mapped
+    env -i "${base_env[@]}" WAYLAND_DISPLAY="$nested_wl" GDK_BACKEND=wayland python3 "$tests/client.py" "$@" >/dev/null 2>&1 &
+    pids+=($!); pid_of[$1]=$!
+    until_jq clients "any(.[]; .class == \"$1\")" 80
+}
+declare -A pid_of
+close() {   # close CLASS...: end test windows and wait until they are gone
+    for c in "$@"; do kill "${pid_of[$c]:-0}" 2>/dev/null; done
+    for c in "$@"; do until_jq clients "all(.[]; .class != \"$c\")" 30; done
+}
+vkbd="$HOME/.local/share/hypr-strict-resize/tests/vkbd/vkbd"   # virtual keyboard client: d/u/t KEYCODE, s MS
+keys() { env -i "${base_env[@]}" WAYLAND_DISPLAY="$nested_wl" "$vkbd" "$@" >/dev/null 2>&1; }
+# tiled windows on workspace WS that overlap one another, or leave the monitor (empty = none)
+overlaps() {   # overlaps WS X Y W H: the monitor's logical box (a saved layout can put it anywhere)
+    hc -j clients | jq -r --argjson ws "$1" --argjson mx "$2" --argjson my "$3" --argjson mw "$4" --argjson mh "$5" '
+        [.[] | select(.workspace.id == $ws and (.floating | not))] as $w
+        | [range(0; $w|length) as $i | range($i+1; $w|length) as $j
+           | select($w[$i].at[0] < $w[$j].at[0] + $w[$j].size[0] and $w[$j].at[0] < $w[$i].at[0] + $w[$i].size[0]
+                and $w[$i].at[1] < $w[$j].at[1] + $w[$j].size[1] and $w[$j].at[1] < $w[$i].at[1] + $w[$i].size[1])
+           | "\($w[$i].class)x\($w[$j].class)"]
+        + [$w[] | select(.at[0] < $mx or .at[1] < $my or .at[0] + .size[0] > $mx + $mw or .at[1] + .size[1] > $my + $mh) | "\(.class) off-screen"]
+        | join(" ")'
+}
+win() { hc -j clients | jq -r --arg c "$1" 'first(.[] | select(.class == $c)) | '"$2"; }
+special() { hc -j monitors | jq -r --arg m "${1:-WAYLAND-1}" '.[] | select(.name == $m) | .specialWorkspace.name'; }
+active() { hc -j monitors | jq -r --arg m "${1:-WAYLAND-1}" '.[] | select(.name == $m) | .activeWorkspace.id'; }
+lua() { hc eval "$1" >/dev/null; }   # eval shows no value: probes write to $H/probe
+probe() { rm -f "$H/probe"; lua "local f = io.open(os.getenv('HOME') .. '/probe', 'w'); f:write(tostring($1)); f:close()"; sleep 0.1; cat "$H/probe" 2>/dev/null; }
+
+mon=$(hc -j monitors | jq -r '.[0].name')
+until_jq monitors '.[0].activeWorkspace.id == 11' 30
+
+# ---- loads clean ----
+errs=$(hc configerrors 2>&1 | sed '/^\s*$/d')
+[ -z "$errs" ]; check "config: no config errors" $? "$(printf '%s' "$errs" | head -3 | tr '\n' ' ')"
+[ "$(probe 'Desk ~= nil and Layouts ~= nil and SpecialOwners ~= nil')" = true ]; check "config: Desk, Layouts (layouts.lua) and SpecialOwners all loaded" $?
+if [ -f "$HOME/.local/lib/hyprland/strict-resize.so" ]; then
+    hc plugin list 2>&1 | grep -qi 'strict'; check "config: strict-resize plugin loaded (else run its build.sh)" $?
+fi
+[ "$(active "$mon")" = 11 ]; check "start: laptop screen on desktop 1 (workspace 11)" $? "$(active "$mon")"
+
+# ---- autostart: what hyprland.start asks for (recorded, not run) ----
+for c in quickshell-start "input-settings apply" "cliphist store" udiskie theme-by-time hyprpolkitagent; do
+    grep -q "^exec .*$c" "$LOG"; check "autostart: $c" $?
+done
+grep -q '^exec .*hypridle' "$LOG"; [ $? != 0 ]; check "autostart: hypridle not started here (its service does it)" $?
+
+# ---- key bindings ----
+binds=$(hc -j binds)
+nb=$(printf '%s' "$binds" | jq length)
+[ "${nb:-0}" -ge 60 ]; check "binds: $nb bound (expect 60+)" $?
+dups=$(printf '%s' "$binds" | jq -r 'group_by([.submap, .modmask, (.key|ascii_downcase), .keycode, .release, .mouse]) | map(select(length > 1)) | .[] | "\(.[0].modmask):\(.[0].key)"' | sort -u | tr '\n' ' ')
+[ -z "$dups" ]; check "binds: no key combination bound twice" $? "$dups"
+has_bind() { printf '%s' "$binds" | jq -e --argjson m "$1" --arg k "$2" 'any(.[]; .modmask == $m and (.key|ascii_downcase) == ($k|ascii_downcase))' >/dev/null; }
+for kb in "64 S" "64 D" "64 Return" "64 T" "64 L" "64 C" "64 grave" "64 1" "64 0" "65 1" "64 A" "64 W"; do
+    set -- $kb; has_bind "$1" "$2"; rc=$?; mods=Super; [ "$1" = 65 ] && mods=Super+Shift
+    check "binds: $mods+$2 bound" $rc
+done
+
+# ---- the special-workspace guard (SpecialOwners) ----
+lua 'hl.dispatch(hl.dsp.workspace.toggle_special("keymapp"))'
+until_jq monitors '.[0].specialWorkspace.name == "special:keymapp"' 20
+[ "$(special "$mon")" = special:keymapp ]; check "guard: special:keymapp can be shown (setup)" $?
+spawn test.stray Stray; check "guard: test window opened" $?
+sleep 0.3
+[ "$(win test.stray .workspace.name)" = 11 ]; check "guard: stray window opened over special:keymapp lands on 11" $? "$(win test.stray .workspace.name)"
+[ -z "$(special "$mon")" ]; check "guard: special:keymapp put away" $? "$(special "$mon")"
+[ "$(win test.stray .focusHistoryID)" = 0 ]; check "guard: stray window has focus" $?
+spawn keymapp Keymapp; sleep 0.3
+[ "$(win keymapp .workspace.name)" = special:keymapp ]; check "guard: Keymapp itself still parks on special:keymapp" $? "$(win keymapp .workspace.name)"
+[ -z "$(special "$mon")" ]; check "guard: ... silently (special stays hidden)" $?
+spawn org.tsr.ncmpcpp ncmpcpp; sleep 0.3
+[ "$(win org.tsr.ncmpcpp .workspace.name)" = special:music ]; check "guard: ncmpcpp still parks on special:music" $? "$(win org.tsr.ncmpcpp .workspace.name)"
+# Keymapp quits while its special is up (the 2026-11-18 case): a window opened next must not stick.
+lua 'hl.dispatch(hl.dsp.workspace.toggle_special("keymapp"))'
+until_jq monitors '.[0].specialWorkspace.name == "special:keymapp"' 20
+kill "${pids[1]}" 2>/dev/null                     # pids: 0 stray, 1 keymapp, 2 ncmpcpp
+until_jq clients 'all(.[]; .class != "keymapp")' 30
+spawn test.after After; sleep 0.3
+[ "$(win test.after .workspace.name)" = 11 ]; check "guard: after Keymapp quits with its special up, a new window lands on 11" $? "$(win test.after .workspace.name) special=$(special "$mon")"
+
+# ---- switching desktops hides a shown special ----
+lua 'hl.dispatch(hl.dsp.workspace.toggle_special("music"))'
+until_jq monitors '.[0].specialWorkspace.name == "special:music"' 20
+lua 'Desk.go(2)'
+until_jq monitors '.[0].activeWorkspace.id == 21' 20
+[ "$(active "$mon")" = 21 ]; check "desk: Desk.go(2) goes to workspace 21" $? "$(active "$mon")"
+[ -z "$(special "$mon")" ]; check "desk: switching desktops hides a shown special" $? "$(special "$mon")"
+lua 'Desk.go(1)'; until_jq monitors '.[0].activeWorkspace.id == 11' 20
+
+# ---- window rules ----
+spawn edu.clemson.tsranso.GvmLight Lights; sleep 0.3
+[ "$(win edu.clemson.tsranso.GvmLight .workspace.name)" = special:lights ] && [ "$(win edu.clemson.tsranso.GvmLight .floating)" = true ]
+check "rules: GVM lights park on special:lights, floating" $? "$(win edu.clemson.tsranso.GvmLight '.workspace.name, .floating' | tr '\n' ' ')"
+spawn emacs Music; sleep 0.3
+[ "$(win emacs .workspace.name)" = special:library ] && [ "$(win emacs .floating)" = true ]
+check "rules: the Emacs music library goes to special:library, floating" $? "$(win emacs '.workspace.name, .floating' | tr '\n' ' ')"
+[ "$(special "$mon")" = special:library ] && lua 'hl.dispatch(hl.dsp.workspace.toggle_special("library"))'   # not silent: it shows itself
+spawn test.dialog "Open File"; sleep 0.3
+[ "$(win test.dialog .floating)" = true ] && [ "$(win test.dialog '.size | join("x")')" = 960x640 ]
+check "rules: a file dialog floats at 960x640" $? "$(win test.dialog '.floating, (.size|join("x"))' | tr '\n' ' ')"
+spawn org.gnome.Calculator Calculator; sleep 0.3
+[ "$(win org.gnome.Calculator .floating)" = true ] && [ "$(win org.gnome.Calculator '.size | join("x")')" = 880x620 ]
+check "rules: tool windows (Calculator) float at 880x620" $? "$(win org.gnome.Calculator '.floating, (.size|join("x"))' | tr '\n' ' ')"
+spawn test.pip "Picture-in-Picture"; sleep 0.3
+[ "$(win test.pip .floating)" = true ] && [ "$(win test.pip .pinned)" = true ]
+check "rules: picture-in-picture floats and is pinned" $? "$(win test.pip '.floating, .pinned' | tr '\n' ' ')"
+[ "$(win test.stray .floating)" = false ]; check "rules: an ordinary window tiles" $?
+close edu.clemson.tsranso.GvmLight emacs test.dialog org.gnome.Calculator test.pip
+
+# ---- layouts (layouts.lua): every preset tiles 4 windows without overlap, on screen ----
+spawn test.t1 T1; spawn test.t2 T2
+mx=$(hc -j monitors | jq --arg m "$mon" '.[] | select(.name == $m) | .x')
+my=$(hc -j monitors | jq --arg m "$mon" '.[] | select(.name == $m) | .y')
+mw=$(hc -j monitors | jq --arg m "$mon" '.[] | select(.name == $m) | (.width / .scale | floor)')
+mh=$(hc -j monitors | jq --arg m "$mon" '.[] | select(.name == $m) | (.height / .scale | floor)')
+n=$(hc -j clients | jq '[.[] | select(.workspace.id == 11 and (.floating | not))] | length')
+[ "$n" -ge 4 ]; check "layouts: $n tiled windows on 11 (setup)" $?
+for p in dwindle main centre top grid columns threecol; do
+    lua "Layouts.choose('$p')"; sleep 0.7
+    got=$(probe 'Layouts.name()')
+    o=$(overlaps 11 "$mx" "$my" "$mw" "$mh")
+    [ -z "$o" ]; check "layouts: $p tiles without overlap, all on screen (menu says '$got')" $? "$o"
+done
+for p in monocle deck scroll; do   # one window in front / a strip: overlap is the point; just must not error
+    lua "Layouts.choose('$p')"; sleep 0.5
+    kill -0 "$hypr_pid" 2>/dev/null; check "layouts: $p applies" $?
+done
+lua "Layouts.choose('main')"; sleep 0.3
+grep -q . "$H/.local/state/hypr-layouts" 2>/dev/null; check "layouts: the choice is saved (hypr-layouts state file)" $?
+
+[ -n "${HYPR_TEST_PAUSE:-}" ] && { echo "paused ${HYPR_TEST_PAUSE}s: XDG_RUNTIME_DIR=$R HYPRLAND_INSTANCE_SIGNATURE=$sig WAYLAND_DISPLAY=$nested_wl"; sleep "$HYPR_TEST_PAUSE"; }   # debugging
+# ---- real key presses (vkbd: a virtual keyboard on the nested instance only) ----
+if [ -x "$vkbd" ]; then
+    keys d 125 t 3 u 125; until_jq monitors ".[] | select(.name == \"$mon\") | .activeWorkspace.id == 21" 20
+    [ "$(active "$mon")" = 21 ]; check "keys: Super+2 goes to desktop 2 (21)" $? "$(active "$mon")"
+    keys d 125 t 2 u 125; until_jq monitors ".[] | select(.name == \"$mon\") | .activeWorkspace.id == 11" 20
+    [ "$(active "$mon")" = 11 ]; check "keys: Super+1 comes back (11)" $? "$(active "$mon")"
+    addr=$(win test.t2 .address)
+    hc dispatch "hl.dsp.focus({ window = \"address:$addr\" })" >/dev/null
+    keys d 125 d 42 t 4 u 42 u 125; until_jq clients "any(.[]; .address == \"$addr\" and .workspace.id == 31)" 20
+    [ "$(win test.t2 .workspace.id)" = 31 ] && [ "$(active "$mon")" = 31 ]
+    check "keys: Super+Shift+3 sends the focused window to desktop 3 and follows" $? "win=$(win test.t2 .workspace.id) active=$(active "$mon")"
+    keys d 125 d 42 t 31 u 42 u 125; until_jq clients "any(.[]; .address == \"$addr\" and .workspace.name == \"special:magic\")" 20
+    [ "$(win test.t2 .workspace.name)" = special:magic ]; check "keys: Super+Shift+S sends it to the scratchpad" $? "$(win test.t2 .workspace.name)"
+    [ "$(special "$mon")" = special:magic ]; check "keys: ... and the scratchpad comes up with it" $? "$(special "$mon")"
+    keys d 125 t 31 u 125; until_jq monitors ".[] | select(.name == \"$mon\") | .specialWorkspace.name == \"\"" 20
+    [ -z "$(special "$mon")" ]; check "keys: Super+S hides the scratchpad" $? "$(special "$mon")"
+    keys d 125 t 31 u 125; until_jq monitors ".[] | select(.name == \"$mon\") | .specialWorkspace.name == \"special:magic\"" 20
+    [ "$(special "$mon")" = special:magic ]; check "keys: Super+S shows it again" $? "$(special "$mon")"
+    keys d 125 t 31 u 125; until_jq monitors ".[] | select(.name == \"$mon\") | .specialWorkspace.name == \"\"" 20
+    keys d 125 t 2 u 125; until_jq monitors ".[] | select(.name == \"$mon\") | .activeWorkspace.id == 11" 20
+else
+    echo "skip: no $vkbd (build it with ~/.local/share/hypr-strict-resize/tests/build.sh): key-press checks not run"
+fi
+close test.t1 test.t2
+
+# ---- dock / undock / redock ----
+hc output create headless HT-2 >/dev/null; hc output create headless HT-3 >/dev/null
+until_jq monitors 'length == 3' 30; sleep 1.2      # Desk.settle runs 700 ms after the last change
+[ "$(active HT-2)" = 12 ] && [ "$(active HT-3)" = 13 ]; check "dock: new screens line up on 12 and 13" $? "HT-2=$(active HT-2) HT-3=$(active HT-3)"
+addr=$(win test.stray .address)
+hc dispatch "hl.dsp.window.move({ workspace = 13, window = \"address:$addr\", follow = false })" >/dev/null
+until_jq clients "any(.[]; .address == \"$addr\" and .workspace.id == 13)" 20
+[ "$(win test.stray .workspace.id)" = 13 ]; check "dock: window moved to the third screen (setup)" $?
+hc output remove HT-3 >/dev/null; hc output remove HT-2 >/dev/null
+until_jq monitors 'length == 1' 30; sleep 1.2
+[ "$(win test.stray .workspace.id)" = 11 ]; check "undock: window from screen 3 folds onto the laptop (11)" $? "$(win test.stray .workspace.id)"
+[ "$(active "$mon")" = 11 ]; check "undock: laptop still on desktop 1" $? "$(active "$mon")"
+hc output create headless HT-2 >/dev/null; hc output create headless HT-3 >/dev/null
+until_jq monitors 'length == 3' 30; sleep 1.5
+[ "$(win test.stray .workspace.id)" = 13 ]; check "redock: window goes home to screen 3 (13)" $? "$(win test.stray .workspace.id)"
+[ "$(active HT-2)" = 12 ] && [ "$(active HT-3)" = 13 ]; check "redock: screens back on 12 and 13" $? "HT-2=$(active HT-2) HT-3=$(active HT-3)"
+hc output remove HT-3 >/dev/null; hc output remove HT-2 >/dev/null; sleep 0.3
+
+kill -0 "$hypr_pid" 2>/dev/null; check "nested Hyprland survived the run" $?
+
+# ---- the live session was not touched ----
+kill -9 "$hypr_pid" 2>/dev/null; wait "$hypr_pid" 2>/dev/null; hypr_pid=""
+[ "$(live_env)" = "$env_before" ]; check "isolation: live systemd environment unchanged" $? \
+    "CHANGED. Fix: systemctl --user set-environment with the live WAYLAND_DISPLAY/DISPLAY/HYPRLAND_INSTANCE_SIGNATURE, then dbus-update-activation-environment --systemd"
+[ "$(live_home)" = "$home_before" ]; check "isolation: live hypr-desk-home unchanged" $?
+
+if [ "$verbose" = 1 ]; then
+    echo "--- recorded commands"; cat "$LOG"
+    echo "--- nested log tail"; tail -30 "$R/hypr/$sig/hyprland.log" 2>/dev/null
+fi
+echo "RESULT pass $ok fail $bad"
+[ "$bad" = 0 ]

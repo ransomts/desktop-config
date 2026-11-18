@@ -1,0 +1,7 @@
+#!/bin/sh
+# Fake timeout: `timeout 1 tail -f /dev/null` (bt-bounce's one-second poll) returns at once;
+# anything else runs without a limit.
+echo "timeout $*" >> "${FAKE_DIR:?}/calls.log"
+shift
+[ "$1" = tail ] && exit 0
+exec "$@"

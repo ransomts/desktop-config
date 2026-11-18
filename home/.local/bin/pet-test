@@ -1,0 +1,62 @@
+#!/bin/sh
+# Pointer tests for the bar pet (Quickshell): clicks, drags, scrolls, hover and menu rows,
+# driven with synthetic mouse events in an offscreen copy of the pet. Nothing appears on
+# screen, the real cursor never moves, and no state under ~/.local/state is read or written.
+#
+#   pet-test                 run every case; prints PASS/FAIL lines and a summary; exit 1 on a failure
+#   pet-test -v              also print everything Quickshell logged
+#   pet-test -o FILE.png     save a picture of the test window as it ended
+#   pet-test -l              run in the light theme (over the purple the light wallpaper puts behind the bar)
+#   pet-test -p              no checks: just pose a scene and save the picture (use with -o, and -l for light)
+#   pet-test -d DIR          test the config in DIR instead of ~/.config/quickshell
+#                            (a working copy; its tests/pet is used if it has one)
+#
+# The cases are in ~/.config/quickshell/tests/pet/shell.qml, with stand-ins for Sys, Notif
+# and WallState beside it. The real Pet*.qml files are copied in fresh on every run.
+verbose=0; out=""; light=0; pose=""; src="$HOME/.config/quickshell"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) verbose=1 ;;
+        -l) light=1 ;;
+        -p) pose=1 ;;
+        -o) out="$2"; shift ;;
+        -d) src="$2"; shift ;;
+        *) echo "usage: pet-test [-v] [-l] [-p] [-o FILE.png] [-d CONFIG_DIR]" >&2; exit 2 ;;
+    esac
+    shift
+done
+qs="$HOME/.nix-profile/bin/qs"
+tests="$src/tests/pet"
+[ -d "$tests" ] || tests="$HOME/.config/quickshell/tests/pet"
+[ -x "$qs" ] && [ -f "$tests/shell.qml" ] || { echo "pet-test: no qs, or no $tests/shell.qml" >&2; exit 2; }
+
+work=$(mktemp -d) || exit 2
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/cfg/assets" "$work/state"
+# the real pet, and the small pieces it is built from
+for f in "$src"/Pet*.qml "$src/MenuRow.qml" "$src/Caption.qml" "$src/Pill.qml" "$src/Theme.qml" "$src/Icons.qml"; do
+    [ -f "$f" ] && cp "$f" "$work/cfg/"
+done
+cp "$src"/assets/pet-*.png "$src"/assets/hat-*.png "$src"/assets/pet-anchors.js "$work/cfg/assets/" 2>/dev/null
+[ -d "$src/assets/sounds" ] && cp -r "$src/assets/sounds" "$work/cfg/assets/"
+# the stand-ins and the cases go in last, so they win over anything of the same name
+cp "$tests"/*.qml "$work/cfg/"
+# -l: the theme stays light whatever the desktop is in (Theme.qml reads COSMIC's is_dark file)
+[ "$light" = 1 ] && sed -i 's|property bool dark: true|property bool dark: false|; s|/.config/cosmic/|/.config/no-such-cosmic/|' "$work/cfg/Theme.qml"
+
+log="$work/log"
+# No Wayland, no X, no Hyprland socket, no GTK platform theme (it wants a display), a
+# private session bus and a private state folder: the user's session cannot be touched.
+env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u QT_QPA_PLATFORMTHEME -u QT_STYLE_OVERRIDE \
+    QT_QPA_PLATFORM=offscreen XDG_STATE_HOME="$work/state" PET_TEST_OUT="$out" PET_TEST_POSE="$pose" \
+    dbus-run-session -- timeout 300 "$qs" -p "$work/cfg/shell.qml" --no-color > "$log" 2>&1
+code=$?
+
+[ "$verbose" = 1 ] && cat "$log"
+grep -o 'PETTEST \(PASS\|FAIL\|case:\|RESULT\).*' "$log" | sed 's/^PETTEST //'
+if ! grep -q 'PETTEST RESULT' "$log"; then
+    echo "pet-test: the run did not finish (exit $code). Last lines:" >&2
+    grep -vE 'dbus-daemon|portal' "$log" | tail -15 >&2
+    exit 2
+fi
+grep -q 'PETTEST RESULT pass [0-9]* fail 0$' "$log"

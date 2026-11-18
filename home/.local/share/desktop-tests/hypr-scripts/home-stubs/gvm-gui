@@ -1,0 +1,4 @@
+#!/bin/sh
+# stub (hypr-scripts-test): record; the GVM window appears on special:lights unless $W/no-window
+echo "gvm-gui $*" >> "$CALLS"
+[ -e "$W/no-window" ] || python3 -I "$FAKEHYPR" add-client edu.clemson.tsranso.GvmLight "GVM Light" special:lights

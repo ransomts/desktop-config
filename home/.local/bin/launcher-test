@@ -1,0 +1,262 @@
+#!/bin/sh
+# Tests for the launcher with modes (Quickshell Launcher.qml + LaunchView.qml) and the pick
+# list's ranked search after it moved to rank.js.
+#
+#   launcher-test               run everything; PASS/FAIL lines and a summary; exit 1 on a failure
+#   launcher-test -v            also print everything Quickshell logged
+#   launcher-test -o DIR        save pictures (apps, clipboard, emoji, calculator, mail, notes, tabs, pinned
+#                               clipboard, QR code; dark and light) in DIR
+#   launcher-test -d DIR        test the config in DIR instead of ~/.config/quickshell
+#   launcher-test -k            keep the temporary directory (printed) for a look afterwards
+#   launcher-test -b DIR        test the scripts in DIR instead of ~/.local/bin
+#
+# The real Launcher.qml and Picker.qml are loaded offscreen as plain windows (the layer-shell
+# lines are taken out on the way, there is no compositor), next to the stub Sys in
+# tests/launcher (records run/launch, starts nothing) and a fake command runner (qalc,
+# cliphist, fd, hyprctl answers are made up). tests/launcher/ref holds the launcher and pick
+# list as they were before the modes, as the reference for "ranking unchanged".
+# Nothing is launched, no window appears, no key reaches the desktop; the home, state and
+# cache directories are temporary ones (the emoji list is copied in if you have one).
+# The new modes (mail, notes, tabs, clipboard pins, QR, providers) are cases in tests/launcher/shell.qml
+# with made-up answers; the scripts they call (launcher-roam-index, clip-pin, tabs-list, qr) are run for
+# real near the end, with stand-ins on PATH for what they would touch.
+# Then the four scripts that now open the launcher (clip-menu, emoji-picker, window-switcher,
+# keybind-help) run with stand-ins for qs, qs-pick, cliphist, hyprctl, wl-copy and wtype that
+# only record their arguments: the launcher first, their old list when that fails.
+verbose=0; keep=0; out=""; src="$HOME/.config/quickshell"; bin="$HOME/.local/bin"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) verbose=1 ;;
+        -o) out="$2"; shift ;;
+        -d) src="$2"; shift ;;
+        -k) keep=1 ;;
+        -b) bin="$2"; shift ;;
+        *) echo "usage: launcher-test [-v] [-k] [-o DIR] [-d CONFIG_DIR] [-b BIN_DIR]" >&2; exit 2 ;;
+    esac
+    shift
+done
+qs="$HOME/.nix-profile/bin/qs"
+tests="$src/tests/launcher"
+[ -x "$qs" ] && [ -f "$tests/shell.qml" ] || { echo "launcher-test: no qs, or no $tests/shell.qml" >&2; exit 2; }
+[ -n "$out" ] && { mkdir -p "$out" && out=$(cd "$out" && pwd) || exit 2; }
+
+work=$(mktemp -d) || exit 2
+[ "$keep" = 1 ] && echo "keeping $work" || trap 'rm -rf "$work"' EXIT
+cfg="$work/cfg"; fake="$work/home"
+mkdir -p "$cfg" "$work/state/clip-pins" "$work/cache/launcher-clip" "$fake/.config/cosmic/com.system76.CosmicTheme.Mode/v1"
+echo true > "$fake/.config/cosmic/com.system76.CosmicTheme.Mode/v1/is_dark"
+mkdir -p "$fake/.local/share"           # your fonts (a read-only link); theme icons do not load offscreen
+[ -e "$HOME/.local/share/fonts" ] && ln -s "$HOME/.local/share/fonts" "$fake/.local/share/fonts"
+mkdir -m 700 "$work/run"
+cp "$src/LaunchView.qml" "$src/LaunchCmd.qml" "$src/Theme.qml" "$src/Caption.qml" "$src/rank.js" "$src/fuzzy.js" "$cfg/" || exit 2
+cp "$tests"/*.qml "$cfg/"
+
+# PanelWindow -> FloatingWindow, without the layer-shell, screen and focus-grab parts
+unpanel() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import re, sys
+src, dst, ref = sys.argv[1], sys.argv[2], sys.argv[3] == "ref"
+s = open(src, encoding="utf-8").read()
+s = s.replace("PanelWindow {", "FloatingWindow {", 1)
+s = re.sub(r"\n    screen: \{\n.*?\n    \}\n", "\n", s, flags=re.S)
+s = re.sub(r"\n    HyprlandFocusGrab \{\n.*?\n    \}\n", "\n", s, flags=re.S)
+s = "\n".join(l for l in s.split("\n") if "WlrLayershell." not in l and "exclusionMode" not in l)
+if ref:   # the reference launcher may be handed the same made-up apps
+    a = 'readonly property var all: DesktopEntries.applications.values.filter(e => !e.noDisplay && e.name !== "")'
+    if a in s:
+        s = s.replace(a, "property var fakeApps: null\n    " + a.replace("all: ", "all: fakeApps || "))
+open(dst, "w", encoding="utf-8").write(s)
+PY
+}
+unpanel "$src/Launcher.qml" "$cfg/Launcher.qml" new
+unpanel "$src/Picker.qml" "$cfg/Picker.qml" new
+unpanel "$tests/ref/Launcher.qml" "$cfg/RefLauncher.qml" ref
+unpanel "$tests/ref/Picker.qml" "$cfg/RefPicker.qml" ref
+
+# the emoji list: yours if there is one, else a few lines in the same format
+list="${XDG_CACHE_HOME:-$HOME/.cache}/emoji-picker.txt"
+if [ -s "$list" ]; then cp "$list" "$work/cache/emoji-picker.txt"
+else printf '%s\n' "❤️  red heart   love" "👍  thumbs up   +1 hand like yes" "😀  grinning face   face grin" "🎉  party popper   celebration party tada" \
+        "🐱  cat face   cat pet" "😺  grinning cat   cat face open smile" "🇺🇸  flag: United States   us usa america" "α  greek small letter alpha" \
+        "←  leftwards arrow" "💩  pile of poo   poop dung" > "$work/cache/emoji-picker.txt"; fi
+grep -m1 '🎉' "$work/cache/emoji-picker.txt" > "$work/state/emoji-recent"
+
+log="$work/log"
+env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u QT_QPA_PLATFORMTHEME -u QT_STYLE_OVERRIDE \
+    HOME="$fake" XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}" XDG_CONFIG_HOME="$fake/.config" \
+    QT_QPA_PLATFORM=offscreen XDG_RUNTIME_DIR="$work/run" XDG_STATE_HOME="$work/state" XDG_CACHE_HOME="$work/cache" LAUNCHER_TEST_OUT="$out" \
+    dbus-run-session -- timeout 90 "$qs" -p "$cfg/shell.qml" --no-color > "$log" 2>&1
+code=$?
+[ "$verbose" = 1 ] && cat "$log"
+grep -o 'LTEST \(PASS\|FAIL\|case:\|RESULT\).*' "$log" | sed 's/^LTEST //'
+if ! grep -q 'LTEST RESULT' "$log"; then
+    echo "launcher-test: the run did not finish (exit $code). Last lines:" >&2
+    grep -vE 'dbus-daemon|portal' "$log" | tail -15 >&2
+    exit 2
+fi
+ok=0; grep -q 'LTEST RESULT pass [0-9]* fail 0$' "$log" || ok=1
+if grep -E '(Launch|Picker|rank|Launcher|shell)[A-Za-z]*\.(qml|js).*(TypeError|ReferenceError|Binding loop|Unable to assign)' "$log" | grep -q .; then
+    echo "FAIL errors were logged:"; grep -E '(TypeError|ReferenceError|Binding loop|Unable to assign)' "$log" | sort -u | head -8; ok=1
+fi
+
+# The Org capture argument, read back by a real Emacs Lisp reader (emacs -Q --batch, not the
+# running Emacs): the string it reads must be exactly the text that was typed.
+if command -v emacs >/dev/null 2>&1; then
+    echo "case: org capture argument read by Emacs"
+    grep -o 'LTEST ORGARG .*' "$log" | sed 's/^LTEST ORGARG //' | while IFS= read -r line; do
+        want=$(printf '%s' "$line" | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())[0], end="")')
+        expr=$(printf '%s' "$line" | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())[1], end="")')
+        got=$(timeout 20 emacs -Q --batch --eval '(let ((f (read (decode-coding-string (car command-line-args-left) (quote utf-8))))) (setq command-line-args-left nil) (princ (concat (nth 1 f) "|" (nth 2 f))))' "$expr" 2>/dev/null)
+        if [ "$got" = "$want" ]; then echo "PASS emacs reads $(printf '%s' "$want" | head -c 40 | tr '\n' '~')"
+        else echo "FAIL emacs reads [$got] want [$want]"; echo x >> "$work/orgfail"; fi
+    done
+    [ -f "$work/orgfail" ] && ok=1
+fi
+
+echo "case: scripts open the launcher, else their old list"
+sh_home="$work/scripts"; stubs="$sh_home/stubs"; calls="$sh_home/calls"
+mkdir -p "$stubs" "$sh_home/.nix-profile/bin" "$sh_home/.local/bin" "$sh_home/cache" "$sh_home/state"
+for c in cliphist hyprctl wl-copy wtype notify-send; do
+    printf '#!/bin/sh\necho "%s $*" >> "%s"\n[ "$1 $2" = "binds -j" ] && echo "[]"\ncat >/dev/null 2>&1 </dev/null\nexit 0\n' "$c" "$calls" > "$stubs/$c"
+done
+# qs: answers the IPC call with $QS_EXIT; qs-pick: reads its list and cancels
+printf '#!/bin/sh\necho "qs $*" >> "%s"\nexit "${QS_EXIT:-0}"\n' "$calls" > "$sh_home/.nix-profile/bin/qs"
+printf '#!/bin/sh\ncat > /dev/null\necho "qs-pick $*" >> "%s"\nexit 1\n' "$calls" > "$sh_home/.local/bin/qs-pick"
+printf '#!/bin/sh\nexit 0\n' > "$sh_home/.local/bin/hypr-window-list"
+chmod +x "$stubs"/* "$sh_home/.nix-profile/bin/qs" "$sh_home/.local/bin/"*
+cp "$work/cache/emoji-picker.txt" "$sh_home/cache/"
+run_script() {      # NAME QS_EXIT [ARGS]: the calls it made, on one line
+    : > "$calls"; n=$1; e=$2; shift 2
+    env HOME="$sh_home" PATH="$stubs:$PATH" XDG_CACHE_HOME="$sh_home/cache" XDG_STATE_HOME="$sh_home/state" QS_EXIT="$e" \
+        timeout 20 sh "$bin/$n" "$@" >/dev/null 2>&1
+    tr '\n' ';' < "$calls"
+}
+expect() {          # WHAT GOT WANT-GLOB
+    case "$2" in $3) echo "PASS $1" ;; *) echo "FAIL $1   [$2]"; ok=1 ;; esac
+}
+for pair in "clip-menu:v" "emoji-picker::" "window-switcher:w" "keybind-help:?"; do
+    n=${pair%%:*}; p=${pair#*:}
+    expect "$n opens the launcher" "$(run_script "$n" 0)" "qs ipc call launcher open $p;"
+    got=$(run_script "$n" 1)
+    expect "$n falls back to its list when that fails" "$got" "qs ipc call launcher open $p;*"
+done
+expect "clip-menu fallback lists the history into qs-pick" "$(run_script clip-menu 1)" "*cliphist list;qs-pick*Clipboard history*"
+expect "emoji-picker fallback ranks its list in qs-pick" "$(run_script emoji-picker 1)" "*qs-pick --rank*"
+expect "keybind-help fallback reads hyprctl binds" "$(run_script keybind-help 1)" "*hyprctl binds -j;qs-pick*"
+expect "clip-menu clear still clears, no launcher" "$(run_script clip-menu 0 clear)" "cliphist wipe;notify-send*"
+
+# nothing the new modes show may reach the log (subjects and senders of the made-up mail)
+if grep -qE 'Quarterly budget|Lab 5 grades|ada@example|grace@example|bob@example' "$log"; then echo "FAIL mail subjects or senders reached the log"; ok=1
+else echo "PASS mail subjects and senders are not logged"; fi
+
+echo "case: launcher-roam-index"
+rt="$work/roam"; mkdir -p "$rt/r/sub" "$rt/c"
+printf '#+title: Alpha note\ntext\n' > "$rt/r/a.org"
+printf ':PROPERTIES:\n:ID: x\n:END:\n#+TITLE:   Beta   thing  \n' > "$rt/r/sub/b.org"
+printf 'no title here\n' > "$rt/r/c.org"
+printf '#+title: Not org\n' > "$rt/r/d.txt"
+sh "$bin/launcher-roam-index" "$rt/r" "$rt/c/idx.tsv"
+expect "index has one line per titled note" "$(cut -f2 "$rt/c/idx.tsv" | sort | tr '\n' ';')" "Alpha note;Beta   thing;"
+expect "with path and an epoch time" "$(awk -F'\t' '$1 ~ /\.org$/ && $3 ~ /^[0-9]+$/' "$rt/c/idx.tsv" | wc -l | tr -d ' ')" "2"
+printf '#+title: Gamma\n' > "$rt/r/g.org"
+sh "$bin/launcher-roam-index" "$rt/r" "$rt/c/idx.tsv"
+expect "a fresh index (under 10 min) is left alone" "$(wc -l < "$rt/c/idx.tsv" | tr -d ' ')" "2"
+touch -d '11 minutes ago' "$rt/c/idx.tsv"
+sh "$bin/launcher-roam-index" "$rt/r" "$rt/c/idx.tsv"
+expect "an index older than 10 min is rebuilt" "$(wc -l < "$rt/c/idx.tsv" | tr -d ' ')" "3"
+expect "and the rebuilt file is new" "$(find "$rt/c/idx.tsv" -mmin -1 | wc -l | tr -d ' ')" "1"
+touch -d '30 minutes ago' "$rt/c/idx.tsv"
+ROAM_INDEX_MAX_MIN=60 sh "$bin/launcher-roam-index" "$rt/r" "$rt/c/idx.tsv"
+expect "the age limit can be changed" "$(find "$rt/c/idx.tsv" -mmin -1 | wc -l | tr -d ' ')" "0"
+mkdir -p "$rt/norg"; touch -d '30 minutes ago' "$rt/c/idx.tsv"
+PATH="$rt/norg:/usr/bin:/bin" sh "$bin/launcher-roam-index" "$rt/r" "$rt/c/idx.tsv" 2>/dev/null
+expect "no leftovers beside the index" "$(ls "$rt/c" | tr '\n' ';')" "idx.tsv;"
+sh "$bin/launcher-roam-index" "$rt/nodir" "$rt/c/x.tsv" 2>/dev/null; expect "a missing directory is an error, no file" "$?:$(ls "$rt/c" | wc -l | tr -d ' ')" "2:1"
+
+echo "case: clip-pin"
+cp_="$work/pin"; mkdir -p "$cp_/stubs" "$cp_/d"
+cat > "$cp_/stubs/cliphist" <<'STUB'
+#!/bin/sh
+# decode: the entry whose id is on stdin; ids: 1 text, 2 big text, 3 png, 4 jpeg-ish
+read -r line; id=${line%%	*}
+case "$id" in
+    1) printf 'pinned text\nsecond line\n' ;;
+    2) head -c 70000 /dev/zero | tr '\0' 'x' ;;
+    3) printf '\211PNG\r\n\032\nrest-of-png' ;;
+    4) printf '\377\330\377jpegdata' ;;
+    *) exit 1 ;;
+esac
+STUB
+chmod +x "$cp_/stubs/cliphist"
+pin() { PATH="$cp_/stubs:$PATH" sh "$bin/clip-pin" "$cp_/d" "$@" >/dev/null 2>&1; echo $?; }
+expect "text pin is stored" "$(pin 100.txt 1 text) $(cat "$cp_/d/100.txt")" "0 pinned text
+second line"
+expect "text over 64 KB is refused, nothing left" "$(pin 101.txt 2 text) $(ls "$cp_/d" | tr '\n' ' ')" "3 100.txt "
+expect "a png is kept as it is" "$(pin 102.png 3 image) $(head -c 4 "$cp_/d/102.png" | tail -c 3)" "0 PNG"
+mkdir -p "$cp_/bare"; for t in mkdir head od tr wc mv rm cat; do ln -sf "$(command -v $t)" "$cp_/bare/$t"; done
+expect "not a png and no converter: refused" "$(PATH="$cp_/stubs:$cp_/bare" /bin/sh "$bin/clip-pin" "$cp_/d" 103.png 4 image >/dev/null 2>&1; echo $?) $(ls "$cp_/d" | tr '\n' ' ')" "4 100.txt 102.png "
+if command -v convert >/dev/null 2>&1 || command -v magick >/dev/null 2>&1; then
+    printf 'P1\n1 1\n1\n' > "$cp_/stubs/pbm"
+    sed -i 's|4) printf .*|4) cat "'"$cp_"'/stubs/pbm" ;;|' "$cp_/stubs/cliphist"
+    expect "another image type is converted to png" "$(pin 106.png 4 image) $(head -c 4 "$cp_/d/106.png" | tail -c 3)" "0 PNG"
+    rm -f "$cp_/d/106.png"
+fi
+expect "a bad file name or id is refused" "$(pin ../x.txt 1 text) $(pin 104.txt 1x text) $(pin 105.txt 99 text) $(ls "$cp_/d" | wc -l | tr -d ' ')" "1 1 1 2"
+expect "clip-menu clear leaves pins alone (never mentions them)" "$(grep -c 'clip-pins\|clip-pin' "$bin/clip-menu")" "0"
+
+echo "case: tabs-list"
+tb="$work/tabs"; mkdir -p "$tb/p/sessionstore-backups"
+python3 - "$tb" <<'PY'
+import json, sys
+try:
+    import lz4.block
+except ImportError:
+    sys.exit(3)
+s = {"windows": [{"selected": 2, "tabs": [{"entries": [{"url": "https://example.org/a", "title": "Example A"}], "index": 1},
+                                           {"entries": [{"url": "https://www.docs.test/x", "title": "Docs X"}], "index": 1, "pinned": True}]},
+                 {"selected": 1, "tabs": [{"entries": [{"url": "about:newtab"}]}, {"entries": [{"url": "https://news.test/", "title": ""}]}]}]}
+open(sys.argv[1] + "/p/sessionstore-backups/recovery.jsonlz4", "wb").write(b"mozLz40\0" + lz4.block.compress(json.dumps(s).encode()))
+PY
+if [ $? = 3 ]; then echo "PASS tabs-list skipped (no lz4 module)"
+else
+    got=$(python3 "$bin/tabs-list" --profile "$tb/p" 2>&1 | python3 -c 'import json,sys; print(";".join("%s|%s|%s|%s" % (t["title"], t["host"], t["active"], t["pinned"]) for t in json.load(sys.stdin)))')
+    expect "tabs-list: title, host, active, pinned (about: pages left out, www. dropped)" "$got" "Example A|example.org|False|False;Docs X|docs.test|True|True;|news.test|False|False"
+    expect "tabs-list refuses odd arguments" "$(python3 "$bin/tabs-list" --bogus >/dev/null 2>&1; echo $?)" "1"
+fi
+
+echo "case: qr"
+qd="$work/qr"; mkdir -p "$qd/stubs" "$qd/run"; qc="$qd/calls"
+for c in grim wl-copy xdg-open qrencode; do
+    printf '#!/bin/sh\necho "%s $*" >> "%s"\n[ "%s" = grim ] && for a; do f=$a; done && : > "$f"\ncat >/dev/null 2>&1 </dev/null\nexit 0\n' "$c" "$qc" "$c" > "$qd/stubs/$c"
+done
+printf '#!/bin/sh\necho "slurp" >> "%s"\n[ -n "$QR_CANCEL" ] && exit 1\necho "10,20 300x300"\n' "$qc" > "$qd/stubs/slurp"
+printf '#!/bin/sh\n[ -n "$QR_NONE" ] && exit 1\necho "$QR_TEXT"\n' > "$qd/stubs/zbarimg"
+cat > "$qd/stubs/notify-send" <<'STUB'
+#!/bin/sh
+echo "notify-send $*" >> "$QR_CALLS"
+case "$1 $*" in *--help*) echo "  -A, --action=[NAME=]Text...  actions"; exit 0 ;; esac
+[ -n "$QR_CLICK" ] && echo open
+exit 0
+STUB
+chmod +x "$qd/stubs"/*
+qr_run() { : > "$qc"; env PATH="$qd/stubs:$PATH" XDG_RUNTIME_DIR="$qd/run" QR_CALLS="$qc" "$@" timeout 20 sh "$bin/qr" read >"$qd/out" 2>&1; echo $?; }
+expect "qr read: grim gets the slurp region" "$(qr_run QR_TEXT='plain words')" "0"
+expect "  region captured, text copied and printed" "$(grep -c '^grim -g 10,20 300x300 ' "$qc") $(grep -c '^wl-copy' "$qc") $(cat "$qd/out")" "1 1 plain words"
+expect "  a plain text gets a notification without an Open button" "$(grep -c 'notify-send.* -A ' "$qc")" "0"
+qr_run QR_TEXT='https://example.org/page' >/dev/null
+expect "  a web address: the notification has an Open action, not clicked" "$(grep -c 'notify-send -a QR -A open=Open' "$qc") $(grep -c '^xdg-open' "$qc")" "1 0"
+qr_run QR_TEXT='https://example.org/page' QR_CLICK=1 >/dev/null
+expect "  clicking Open opens it" "$(grep '^xdg-open' "$qc")" "xdg-open https://example.org/page"
+qr_run QR_NONE=1 >/dev/null
+expect "  no code in the picture: says so, nothing copied" "$(grep -c 'No QR code found' "$qc") $(grep -c '^wl-copy' "$qc")" "1 0"
+expect "  Esc in slurp: quiet exit, no grim" "$(qr_run QR_CANCEL=1) $(grep -c '^grim' "$qc") $(grep -c notify-send "$qc")" "0 0 0"
+expect "  no picture left in the runtime directory" "$(ls "$qd/run" | wc -l | tr -d ' ')" "0"
+: > "$qc"; env PATH="$qd/stubs:$PATH" XDG_RUNTIME_DIR="$qd/run" QR_CALLS="$qc" sh "$bin/qr" png "hello" "$qd/x.png"
+expect "qr png: qrencode with the text after --" "$(cat "$qc")" "qrencode -o $qd/x.png -s 8 -m 2 -- hello"
+: > "$qc"; env PATH="$qd/stubs:$PATH" XDG_RUNTIME_DIR="$qd/run" QR_CALLS="$qc" sh "$bin/qr" show "some text" >/dev/null 2>&1
+expect "qr show: draws it under XDG_RUNTIME_DIR, then a viewer" "$(grep -c "^qrencode -o $qd/run/qr-show.png -s 10 -m 3 -- some text" "$qc")" "1"
+expect "qr: unknown command is a usage error" "$(sh "$bin/qr" nope >/dev/null 2>&1; echo $?)" "2"
+
+
+[ -n "$out" ] && echo "pictures in $out"
+exit $ok

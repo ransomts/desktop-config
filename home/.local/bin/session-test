@@ -1,0 +1,84 @@
+#!/bin/sh
+# Tests for opt-in session restore: session-save, session-restore, and the Quickshell side (Session.qml).
+#
+#   session-test               run everything; PASS/FAIL lines and a summary; exit 1 on a failure
+#   session-test -v            also print everything Quickshell logged
+#   session-test -d DIR        test the config in DIR instead of ~/.config/quickshell
+#   session-test -b DIR        take session-save, session-restore and session_lib.py from DIR
+#                              (default: next to this script, else ~/.local/bin)
+#
+# Two parts:
+#  - scripts: tests/session/script-test.py. Canned `hyprctl -j clients|monitors` JSON through a fake
+#    hyprctl (and a fake uwsm) on PATH, a fake applications directory and a fake /proc; the fakes
+#    only record. Special workspaces, dialogs, unknown classes, two monitors in different orders,
+#    terminal working directories, skip and allow lists, already-running detection, exact commands
+#    (move and exec modes), the login marker, and that no window title reaches a file.
+#  - qml: the real Session.qml with a stub Sys, offscreen, driving the real scripts against the same
+#    kind of fake hyprctl in a temporary XDG_STATE_HOME / XDG_CONFIG_HOME / XDG_RUNTIME_DIR.
+# Nothing real is read (no live windows, no ~/.config, no /proc), nothing is started or moved.
+verbose=0; src="$HOME/.config/quickshell"; bindir=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) verbose=1 ;;
+        -d) src="$2"; shift ;;
+        -b) bindir="$2"; shift ;;
+        *) echo "usage: session-test [-v] [-d CONFIG_DIR] [-b BIN_DIR]" >&2; exit 2 ;;
+    esac
+    shift
+done
+if [ -z "$bindir" ]; then
+    bindir=$(dirname "$0"); [ -f "$bindir/session-save" ] || bindir="$HOME/.local/bin"
+fi
+bindir=$(cd "$bindir" && pwd)
+qs="$HOME/.nix-profile/bin/qs"
+tests="$src/tests/session"
+[ -x "$qs" ] && [ -f "$tests/shell.qml" ] && [ -f "$bindir/session-save" ] || { echo "session-test: no qs, session-save or $tests/shell.qml" >&2; exit 2; }
+
+ok=0
+echo "case: scripts (fake hyprctl, uwsm, applications dir, /proc)"
+python3 -I "$tests/script-test.py" "$bindir" || ok=1
+
+work=$(mktemp -d) || exit 2
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/cfg" "$work/state/session" "$work/conf/shell" "$work/rt" "$work/fake" "$work/fakebin" "$work/apps"
+chmod 700 "$work/rt"
+cp "$src/Session.qml" "$work/cfg/"
+cp "$tests"/*.qml "$work/cfg/"
+cat > "$work/fakebin/hyprctl" <<'EOS'
+#!/bin/sh
+[ "$1" = "-j" ] && { cat "$FAKE_DIR/$2.json"; exit 0; }
+exit 0
+EOS
+chmod +x "$work/fakebin/hyprctl"
+printf '[Desktop Entry]\nType=Application\nName=Files\nExec=x\n' > "$work/apps/org.gnome.Nautilus.desktop"
+printf '[Desktop Entry]\nType=Application\nName=Zathura\nExec=x\n' > "$work/apps/zathura.desktop"
+printf '[Desktop Entry]\nType=Application\nName=Firefox\nExec=x\n' > "$work/apps/firefox.desktop"
+printf '[{"id":0,"name":"A","x":0,"y":0}]\n' > "$work/fake/monitors.json"
+printf '[{"address":"0x1","mapped":true,"class":"org.gnome.Nautilus","title":"t","pid":1,"floating":false,"size":[1,1],"monitor":0,"workspace":{"id":11,"name":"11","type":"normal"}}]\n' > "$work/fake/clients.json"
+cat > "$work/state/session/last.json" <<'EOS'
+{"version":1,"saved":"2026-11-13T17:00:00-0500","monitors":1,"entries":[
+ {"app":"firefox","class":"firefox","desktop":1,"slot":1,"floating":false},
+ {"app":"org.gnome.Nautilus","class":"org.gnome.Nautilus","desktop":1,"slot":1,"floating":false},
+ {"app":"zathura","class":"zathura","desktop":2,"slot":1,"floating":false},
+ {"app":"zathura","class":"zathura","desktop":2,"slot":1,"floating":false}]}
+EOS
+
+echo "case: qml (Session.qml with the real scripts)"
+log="$work/log"
+env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u QT_QPA_PLATFORMTHEME -u QT_STYLE_OVERRIDE \
+    QT_QPA_PLATFORM=offscreen SESSION_HARNESS=1 SESSION_BIN="$bindir" SESSION_APP_DIRS="$work/apps" FAKE_DIR="$work/fake" \
+    PATH="$work/fakebin:$PATH" XDG_STATE_HOME="$work/state" XDG_CONFIG_HOME="$work/conf" XDG_RUNTIME_DIR="$work/rt" \
+    dbus-run-session -- timeout 60 "$qs" -p "$work/cfg/shell.qml" --no-color > "$log" 2>&1
+code=$?
+[ "$verbose" = 1 ] && cat "$log"
+grep -o 'SESSIONQML \(PASS\|FAIL\|case:\|RESULT\).*' "$log" | sed 's/^SESSIONQML //'
+if ! grep -q 'SESSIONQML RESULT' "$log"; then
+    echo "session-test: the qml run did not finish (exit $code). Last lines:" >&2
+    grep -vE 'dbus-daemon|portal' "$log" | tail -15 >&2
+    exit 2
+fi
+grep -q 'SESSIONQML RESULT pass [0-9]* fail 0$' "$log" || ok=1
+if grep -q 'Session[A-Za-z]*\.qml.*\(TypeError\|ReferenceError\|Binding loop\|Cannot assign\)' "$log"; then
+    echo "FAIL Session.qml logged errors:"; grep 'Session[A-Za-z]*\.qml' "$log" | sort -u | head -8; ok=1
+fi
+exit $ok

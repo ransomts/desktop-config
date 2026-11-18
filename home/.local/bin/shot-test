@@ -1,0 +1,198 @@
+#!/bin/sh
+# Tests for the screenshot editor (Quickshell Shot*.qml) and the screen-share picker
+# (SharePick*.qml, ~/.local/bin/qs-share-pick), plus the script ends of both.
+#
+#   shot-test               run everything; PASS/FAIL lines and a summary; exit 1 on a failure
+#   shot-test -v            also print everything Quickshell logged
+#   shot-test -o PREFIX     save pictures: PREFIX-annotate-dark.png, -annotate-light.png,
+#                           -export-1x.png, -export-2x.png, -share-windows.png, -share-region.png,
+#                           -share-screens-light.png
+#   shot-test -d DIR        test the config in DIR instead of ~/.config/quickshell
+#   shot-test -b DIR        test the scripts in DIR instead of ~/.local/bin
+#
+# Parts:
+#  - qml: the real ShotEditor/ShotSelect/ShotMarks/SharePickView offscreen, driven with synthetic
+#    mouse and keys (cases in tests/shot/shell.qml; stub Sys and a stand-in Ink.qml beside it).
+#    The frame is a made-up 2560x1600 picture. Nothing is launched; the real cursor never moves.
+#  - share-pick: qs-share-pick's parser on realistic xdph lists, and its round trip with a stub
+#    `qs` on PATH: a selection, a cancel, Quickshell failing, Quickshell hanging (2 s fallback to
+#    a stub stock picker, which must get the same arguments and environment).
+#  - screenshot: `screenshot done` and `done --copy` with stub wl-copy/notify-send/qs and a
+#    private Pictures folder; `screenshot edit` falling back to region when qs fails.
+verbose=0; out=""; src="$HOME/.config/quickshell"; bin="$HOME/.local/bin"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) verbose=1 ;;
+        -o) out="$2"; shift ;;
+        -d) src="$2"; shift ;;
+        -b) bin="$2"; shift ;;
+        *) echo "usage: shot-test [-v] [-o PREFIX] [-d CONFIG_DIR] [-b BIN_DIR]" >&2; exit 2 ;;
+    esac
+    shift
+done
+qs="$HOME/.nix-profile/bin/qs"
+tests="$src/tests/shot"
+[ -x "$qs" ] && [ -f "$tests/shell.qml" ] || { echo "shot-test: no qs, or no $tests/shell.qml" >&2; exit 2; }
+
+work=$(mktemp -d) || exit 2
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/cfg" "$work/state" "$work/tmp"
+cp "$src"/Shot*.qml "$src"/SharePick*.qml "$src/shot.js" "$work/cfg/"
+# Theme.qml, reading its dark/light switch from a file that is not there (the cases set it)
+sed 's|Quickshell.env("HOME") + "/.config/cosmic/com.system76.CosmicTheme.Mode/v1/is_dark"|Quickshell.env("SHOT_TEST_DARKFILE")|' "$src/Theme.qml" > "$work/cfg/Theme.qml"
+grep -q SHOT_TEST_DARKFILE "$work/cfg/Theme.qml" || echo "shot-test: note: Theme.qml's mode file line changed; the live mode may flip the pictures" >&2
+cp "$tests"/*.qml "$work/cfg/"
+
+# the frame: 2560x1600 (a 1280x800 screen at 2x) with text small enough to show the resolution
+python3 -I - "$work/frame.png" <<'EOF'
+import sys
+from PIL import Image, ImageDraw, ImageFont
+W, H = 2560, 1600
+im = Image.new("RGB", (W, H))
+d = ImageDraw.Draw(im)
+for y in range(H):
+    d.line([(0, y), (W, y)], fill=(30 + y * 40 // H, 40 + y * 60 // H, 70 + y * 90 // H))
+for x in range(0, W, 160):
+    d.line([(x, 0), (x, H)], fill=(80, 90, 120), width=2)
+for y in range(0, H, 160):
+    d.line([(0, y), (W, y)], fill=(80, 90, 120), width=2)
+try:
+    f = ImageFont.truetype("DejaVuSans.ttf", 36); fs = ImageFont.truetype("DejaVuSans.ttf", 18)
+except OSError:
+    f = fs = ImageFont.load_default()
+d.rectangle([420, 320, 1980, 1280], fill=(235, 235, 240))
+d.rectangle([420, 320, 1980, 390], fill=(60, 60, 70))
+d.text((450, 335), "A window  -  secret-token: 8f1c-22aa-93b0", font=f, fill=(255, 255, 255))
+for i in range(18):
+    d.text((470, 420 + i * 46), f"line {i:02d}: the quick brown fox jumps over the lazy dog 0123456789", font=fs if i % 2 else f, fill=(20, 20, 30))
+d.ellipse([2100, 200, 2400, 500], fill=(80, 170, 90))
+im.save(sys.argv[1])
+EOF
+
+log="$work/log"
+env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u QT_QPA_PLATFORMTHEME -u QT_STYLE_OVERRIDE \
+    QT_QPA_PLATFORM=offscreen XDG_STATE_HOME="$work/state" SHOT_TEST_OUT="$out" SHOT_TEST_TMP="$work/tmp" \
+    SHOT_TEST_FRAME="$work/frame.png" SHOT_TEST_DARKFILE="$work/no-such-file" \
+    dbus-run-session -- timeout 90 "$qs" -p "$work/cfg/shell.qml" --no-color > "$log" 2>&1
+code=$?
+[ "$verbose" = 1 ] && cat "$log"
+grep -o 'SHOTTEST \(PASS\|FAIL\|case:\|RESULT\).*' "$log" | sed 's/^SHOTTEST //'
+ok=0
+if ! grep -q 'SHOTTEST RESULT' "$log"; then
+    echo "shot-test: the qml run did not finish (exit $code). Last lines:" >&2
+    grep -vE 'dbus-daemon|portal|xdph|Gtk-WARNING' "$log" | tail -15 >&2
+    ok=1
+fi
+grep -q 'SHOTTEST RESULT pass [0-9]* fail 0$' "$log" || ok=1
+if grep -v 'SHOTTEST' "$log" | grep -q '\(Shot\|SharePick\)[A-Za-z]*\.qml.*\(TypeError\|ReferenceError\|Binding loop\|Unable to assign\|is not a\)'; then
+    echo "FAIL the qml logged errors:"; grep '\(Shot\|SharePick\)[A-Za-z]*\.qml' "$log" | sort -u | head -8; ok=1
+fi
+if [ -n "$out" ]; then
+    [ -f "$work/tmp/out1.png" ] && cp "$work/tmp/out1.png" "$out-export-1x.png"
+    [ -f "$work/tmp/out2.png" ] && cp "$work/tmp/out2.png" "$out-export-2x.png"
+fi
+
+pass() { echo "PASS $1"; }
+fail() { echo "FAIL $1${2:+   [$2]}"; ok=1; }
+
+# ---------------------------------------------------------------- share-pick
+echo "case: share-pick parses xdph's lists"
+sp="$bin/qs-share-pick"
+# built from xdph 1.5.0's buildWindowList / buildOutputList / buildWorkspaceList
+WL='2216345678[HC>]firefox[HT>]Mozilla Firefox — Zoom   meeting[HE>]94812345678912[HA>]77[HC>]com.mitchellh.ghostty[HT>]~/Scratch: vim  shot.qml[HE>]0[HA>]bad[HC>]x[HT>]skipped[HE>]1[HA>]'
+OL='5:eDP-1:0:0:1440:900;4:DP-9:1440:-500:1080:1920;10:HDMI-A-1:x:0:0:0:1;'
+WS3='3[HN>]2:11[HM>]1:5:eDP-1[HE>]4[HN>]6:a:b[c][HM>]2:5:eDP-14:DP-9[HE>]'
+got=$(XDPH_WINDOW_SHARING_LIST="$WL" XDPH_OUTPUT_SHARING_LIST="$OL" XDPH_WORKSPACE_SHARING_LIST_V3="$WS3" "$sp" --parse --allow-token)
+printf '%s' "$got" | python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)
+checks = [
+    ("allow-token", d["allowToken"] is True),
+    ("two outputs, the bad one skipped", [o["name"] for o in d["outputs"]] == ["eDP-1", "DP-9"]),
+    ("negative y and portrait size", d["outputs"][1] == {"name": "DP-9", "x": 1440, "y": -500, "w": 1080, "h": 1920}),
+    ("windows: handle, class, title (non-ASCII kept)", d["windows"][0] == {"id": 2216345678, "cls": "firefox", "title": "Mozilla Firefox — Zoom   meeting", "address": "0x563b382f3c40"}),
+    ("address 0 means unknown", d["windows"][1]["address"] == "" and d["windows"][1]["title"] == "~/Scratch: vim  shot.qml"),
+    ("bad handle skipped", len(d["windows"]) == 2),
+    ("workspaces with byte lengths", [(w["id"], w["name"], w["outputs"]) for w in d["workspaces"]] == [(3, "11", ["eDP-1"]), (4, "a:b[c]", ["eDP-1", "DP-9"])]),
+]
+for name, good in checks:
+    print(("PASS " if good else "FAIL ") + name + ("" if good else "   [" + json.dumps(d) + "]"))
+sys.exit(0 if all(g for _, g in checks) else 1)' || ok=1
+empty=$(env -u XDPH_WINDOW_SHARING_LIST -u XDPH_OUTPUT_SHARING_LIST "$sp" --parse)
+[ "$empty" = '{"allowToken": false, "outputs": [], "windows": [], "workspaces": []}' ] && pass "no lists: empty JSON" || fail "no lists: empty JSON" "$empty"
+
+echo "case: share-pick round trip (stub qs)"
+mkdir -p "$work/stub" "$work/home"
+cat > "$work/stub/qs" <<'EOF'
+#!/bin/sh
+# stub: qs ipc call sharepick open LIST FIFO; behaviour from $STUB_MODE
+[ "$1 $2 $3 $4" = "ipc call sharepick open" ] || exit 9
+cp "$5" "$STUB_DIR/list.json"
+case "$STUB_MODE" in
+    screen) (sleep 0.2; python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print("[SELECTION]" + ("r" if d["allowToken"] else "") + "/screen:" + d["outputs"][0]["name"])' "$5" > "$6") & ;;
+    region) (sleep 0.2; echo "[SELECTION]/region:DP-9@10,20,300,400" > "$6") & ;;
+    cancel) (sleep 0.2; echo cancel > "$6") & ;;
+    fail) echo "no running instances" >&2; exit 1 ;;
+    hang) sleep 10 ;;
+esac
+exit 0
+EOF
+cat > "$work/stub/stock-picker" <<'EOF'
+#!/bin/sh
+echo "STOCK args=[$*] list=[$XDPH_OUTPUT_SHARING_LIST] qpa=[$QT_QPA_PLATFORM]"
+EOF
+chmod +x "$work/stub/qs" "$work/stub/stock-picker"
+run_sp() { STUB_MODE="$1" STUB_DIR="$work" PATH="$work/stub:$PATH" HOME="$work/home" XDPH_STOCK_PICKER="$work/stub/stock-picker" \
+    QT_QPA_PLATFORM=wayland XDPH_OUTPUT_SHARING_LIST="$OL" XDPH_WINDOW_SHARING_LIST="$WL" "$sp" $2; }
+r=$(run_sp screen --allow-token); c=$?
+[ "$r" = "[SELECTION]r/screen:eDP-1" ] && [ $c = 0 ] && pass "screen choice printed, token flag carried" || fail "screen choice" "$r / exit $c"
+grep -q '"name": "DP-9"' "$work/list.json" && pass "Quickshell got the parsed lists" || fail "Quickshell got the parsed lists"
+r=$(run_sp region); [ "$r" = "[SELECTION]/region:DP-9@10,20,300,400" ] && pass "region choice printed" || fail "region choice" "$r"
+r=$(run_sp cancel); c=$?
+[ -z "$r" ] && [ $c = 0 ] && pass "cancel: nothing printed, exit 0 (as the stock picker)" || fail "cancel" "[$r] exit $c"
+r=$(run_sp fail --allow-token)
+[ "$r" = "STOCK args=[--allow-token] list=[$OL] qpa=[wayland]" ] && pass "qs fails: stock picker, same args and environment" || fail "qs fails: fallback" "$r"
+t0=$(date +%s.%N); r=$(run_sp hang --allow-token); t1=$(date +%s.%N)
+el=$(python3 -c "print(round($t1 - $t0, 1))")
+case "$r" in "STOCK args=[--allow-token]"*) python3 -c "import sys; sys.exit(0 if 1.8 <= $el <= 3.5 else 1)" && pass "qs hangs: stock picker after ${el}s" || fail "qs hangs: timing" "${el}s" ;;
+             *) fail "qs hangs: fallback" "$r" ;; esac
+
+# ---------------------------------------------------------------- screenshot
+echo "case: screenshot done / edit (stubs)"
+mkdir -p "$work/home/.nix-profile/bin" "$work/pics" "$work/stub2"
+cat > "$work/home/.nix-profile/bin/qs" <<'EOF'
+#!/bin/sh
+echo "qs $*" >> "$STUB_LOG"
+[ "$3" = shot ] && exit 1
+exit 0
+EOF
+for s in wl-copy notify-send slurp grim hyprctl; do
+    printf '#!/bin/sh\necho "%s $*" >> "$STUB_LOG"\n[ %s = wl-copy ] && cat > "$STUB_LOG.clip"\n[ %s = slurp ] && exit 1\nexit 0\n' "$s" "$s" "$s" > "$work/stub2/$s"
+    chmod +x "$work/stub2/$s"
+done
+chmod +x "$work/home/.nix-profile/bin/qs"
+shot() { STUB_LOG="$work/shot.log" PATH="$work/stub2:$PATH" HOME="$work/home" XDG_PICTURES_DIR="$work/pics" sh "$bin/screenshot" "$@"; }
+: > "$work/shot.log"
+cp "$work/frame.png" "$work/tmp/qs-shot-x.png"
+shot done "$work/tmp/qs-shot-x.png"; c=$?
+saved=$(ls "$work/pics/Screenshots" 2>/dev/null)
+case "$saved" in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]_[0-9][0-9]-[0-9][0-9]-[0-9][0-9].png) pass "done: moved in as $saved" ;; *) fail "done: file name" "$saved" ;; esac
+[ ! -e "$work/tmp/qs-shot-x.png" ] && [ $c = 0 ] && pass "done: temp file gone" || fail "done: temp file gone"
+cmp -s "$work/shot.log.clip" "$work/frame.png" && pass "done: the PNG went to wl-copy" || fail "done: wl-copy"
+grep -q "^wl-copy --type image/png" "$work/shot.log" && grep -q "^qs ipc call sound play camera-shutter" "$work/shot.log" &&
+    grep -q "^notify-send -a Screenshot -h boolean:suppress-sound:true -i $work/pics/Screenshots/$saved Screenshot saved $saved — also on the clipboard" "$work/shot.log" &&
+    pass "done: copy, shutter, the usual notification" || { fail "done: calls"; cat "$work/shot.log"; }
+: > "$work/shot.log"; rm -f "$work/shot.log.clip"
+cp "$work/frame.png" "$work/tmp/qs-shot-y.png"
+shot done --copy "$work/tmp/qs-shot-y.png"
+[ ! -e "$work/tmp/qs-shot-y.png" ] && [ "$(ls "$work/pics/Screenshots" | wc -l)" = 1 ] && cmp -s "$work/shot.log.clip" "$work/frame.png" &&
+    grep -q "^notify-send .*Screenshot copied" "$work/shot.log" && pass "done --copy: clipboard only, no file" || { fail "done --copy"; cat "$work/shot.log"; }
+: > "$work/shot.log"
+shot done "$work/tmp/missing.png"; c=$?
+[ $c = 1 ] && grep -q "^notify-send -a Screenshot -u critical Screenshot failed" "$work/shot.log" && pass "done: no file, the failure note" || fail "done: missing file" "exit $c"
+: > "$work/shot.log"
+shot edit; c=$?
+grep -q "^qs ipc call shot edit" "$work/shot.log" && grep -q "^slurp" "$work/shot.log" && [ $c = 0 ] &&
+    pass "edit: qs fails, falls back to region (slurp)" || { fail "edit fallback" "exit $c"; cat "$work/shot.log"; }
+
+exit $ok

@@ -11,7 +11,13 @@ Chrome from a generated HTML page.
 """
 import datetime, html, json, os, shutil, subprocess, sys, tempfile
 
-MODS = {64: "Super", 65: "Super Shift", 68: "Super Ctrl", 72: "Super Alt", 0: "", 1: "Shift", 4: "Ctrl", 8: "Alt"}
+# Modifier names from the mask bits, Super first then Shift, Ctrl, Alt ("Super Shift"), so every
+# combination is named (Alt+Shift is 9, Super+Shift+Ctrl 69), never shown as a bare number.
+MODBITS = [(64, "Super"), (1, "Shift"), (4, "Ctrl"), (8, "Alt")]
+
+
+def modnames(mask):
+    return " ".join(n for bit, n in MODBITS if mask & bit)
 KEYNAMES = {"Return": "Enter", "period": ".", "slash": "/", "bracketleft": "[", "bracketright": "]",
             "left": "←", "right": "→", "up": "↑", "down": "↓", "mouse_down": "scroll", "mouse_up": "scroll",
             "mouse:272": "left-drag", "mouse:273": "right-drag", "Print": "PrtSc", "Space": "Space", "Tab": "Tab"}
@@ -112,7 +118,7 @@ def keycaps(mods, keys):
 def main():
     out = os.path.expanduser(sys.argv[1] if len(sys.argv) > 1 else "~/Scratch/hyprland-keybindings.pdf")
     binds = json.loads(subprocess.check_output(["hyprctl", "binds", "-j"]))
-    live = {f"{MODS.get(b['modmask'], str(b['modmask']))}|{b['key']}": (b.get("description") or "") for b in binds}
+    live = {f"{modnames(b['modmask'])}|{b['key']}": (b.get("description") or "") for b in binds}
     used, blocks = set(), []
     for title, rows in SECTIONS:
         lines = []

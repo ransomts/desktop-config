@@ -1007,6 +1007,45 @@ hl.window_rule({ name = "keymapp",
     match = { class = "^keymapp$" },
     workspace = "special:keymapp silent",
     float = true, center = true, size = "(monitor_w*0.62) (monitor_h*0.72)" })
+-- Guard for the parking-lot special workspaces above (2026-11-18). With one of them shown, a
+-- window opened by anything else lands on it (focus sits there), and because a shown special
+-- overlays every desktop that window then "follows" each workspace switch. Seen when Keymapp
+-- quit at undock with special:keymapp still up: Firefox and Emacs opened onto it. Such a
+-- window goes to the desktop underneath instead, and the special is put away so you see it.
+-- Owners are matched on class (and title for the Emacs library frame); their own dialogs share
+-- the class, so they stay. special:magic (Super+S scratchpad) is yours to fill: not guarded.
+SpecialOwners = {
+    keymapp = function(w) return w.class == "keymapp" end,
+    music   = function(w) return w.class == "org.tsr.ncmpcpp" end,
+    library = function(w) return w.class == "emacs" and w.title == "Music" end,
+    lights  = function(w) return w.class == "edu.clemson.tsranso.GvmLight" end,
+}
+function SpecialOwners.stray(w)
+    local ws = w and w.workspace
+    if not (ws and ws.special and ws.name) then return nil end
+    local key = ws.name:gsub("^special:", "")
+    local owns = SpecialOwners[key]
+    if type(owns) ~= "function" or owns(w) then return nil end
+    return key
+end
+hl.on("window.open", function(w)
+    local ok, err = pcall(function()
+        local key = SpecialOwners.stray(w)
+        if not key then return end
+        local mon = w.monitor or hl.get_active_monitor()
+        local under = mon and mon.active_workspace
+        if not (under and under.id) then return end
+        hl.dispatch(hl.dsp.window.move({ workspace = under.id, window = w, follow = false }))
+        local shown = hl.get_active_special_workspace(mon)
+        if shown and shown.name == "special:" .. key then
+            hl.dispatch(hl.dsp.workspace.toggle_special(key))
+        end
+        hl.dispatch(hl.dsp.focus({ window = "address:" .. w.address }))
+    end)
+    if not ok then hl.notification.create({ text = "SpecialOwners: " .. tostring(err), duration = 8000 }) end
+end)
+-- And switching desktops puts any shown special away, so nothing on one can ride along.
+hl.config({ binds = { hide_special_on_workspace_change = true } })
 hl.window_rule({ name = "dialog-file",
     match = { title = "^(Open|Save|Select|Choose|Export|Import|Upload)( [A-Za-z]+)? (File|Files|Folder|Folders|Directory|As|Image|Document).*$" },
     float = true, center = true, size = "960 640", dim_around = true })

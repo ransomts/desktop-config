@@ -1,0 +1,7 @@
+#!/bin/sh
+# data-test stub: `dconf read KEY` prints $DT_DIR/dconf/plain, or .../cosmic under DCONF_PROFILE
+echo "dconf $* profile=${DCONF_PROFILE:-}" >> "$DT_DIR/calls.log"
+[ -e "$DT_DIR/dconf/fail" ] && exit 1
+if [ -n "$DCONF_PROFILE" ]; then f="$DT_DIR/dconf/cosmic"; else f="$DT_DIR/dconf/plain"; fi
+[ -f "$f" ] && /bin/cat "$f"
+exit 0

@@ -1,0 +1,128 @@
+#!/bin/sh
+# Tests for Settings > Displays: display-layout (the only thing that changes monitors) and the page
+# (SettingsDisplays.qml, DisplaysMap/Picker/Confirm/Identify.qml, displays.js).
+#
+#   displays-test               run everything; PASS/FAIL lines and a summary; exit 1 on a failure
+#   displays-test -v            also print every display-layout call and everything Quickshell logged
+#   displays-test -o DIR        save pictures (four-screen desk and laptop alone, dark and light,
+#                               the Keep-this-layout dialog, a portrait screen) in DIR
+#   displays-test -d DIR        test the config in DIR instead of ~/.config/quickshell
+#   displays-test -b DIR        test the scripts in DIR instead of ~/.local/bin
+#   displays-test -k            keep the temporary directory (printed)
+#
+# Nothing reaches Hyprland: display-layout runs with HYPRCTL=tests/displays/fake-hyprctl, which
+# answers `-j monitors all` from canned JSON (tests/displays/fixtures: laptop, desk, projector) and
+# records every eval (and applies it to the canned JSON, the way Hyprland would). Home, runtime and
+# state directories are temporary. Part 1 is display-layout on its own (tests/displays/cli-test.py),
+# including `Hyprland --verify-config` on the Lua it writes (in an empty runtime dir: it never sees
+# the live session). Part 2 is the real settings window offscreen (Settings.qml as a plain window,
+# the stubs of tests/settings), with the Displays page added the way the coordinator's hooks add it.
+verbose=0; keep=0; out=""; src="$HOME/.config/quickshell"; bin="$HOME/.local/bin"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) verbose=1 ;;
+        -o) out="$2"; shift ;;
+        -d) src="$2"; shift ;;
+        -b) bin="$2"; shift ;;
+        -k) keep=1 ;;
+        *) echo "usage: displays-test [-v] [-k] [-o DIR] [-d CONFIG_DIR] [-b BIN_DIR]" >&2; exit 2 ;;
+    esac
+    shift
+done
+qs="$HOME/.nix-profile/bin/qs"
+tests="$src/tests/displays"
+[ -x "$qs" ] && [ -f "$tests/shell.qml" ] || { echo "displays-test: no qs, or no $tests/shell.qml" >&2; exit 2; }
+[ -x "$bin/display-layout" ] || { echo "displays-test: no $bin/display-layout" >&2; exit 2; }
+[ -n "$out" ] && { mkdir -p "$out" && out=$(cd "$out" && pwd) || exit 2; }
+src=$(cd "$src" && pwd); bin=$(cd "$bin" && pwd); tests="$src/tests/displays"
+
+work=$(mktemp -d) || exit 2
+[ "$keep" = 1 ] && echo "keeping $work" || trap 'rm -rf "$work"' EXIT
+ok=0
+
+echo "== part 1: display-layout"
+mkdir -p "$work/cli"
+python3 -I "$tests/cli-test.py" "$bin/display-layout" "$tests" "$work/cli" $([ "$verbose" = 1 ] && echo -v) || ok=1
+
+# PanelWindow -> FloatingWindow, without the layer-shell, screen and anchor lines (as settings-test),
+# plus the hooks the coordinator adds: the page in Settings.qml's list and SettingsBody's stack, and
+# Settings's `identify` property. Already there (after the merge): left alone.
+prepare() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import re, sys
+src, cfg, which = sys.argv[1:4]
+s = open(src + "/Settings.qml", encoding="utf-8").read()
+s = s.replace("PanelWindow {", "FloatingWindow {", 1)
+s = re.sub(r"\n    screen: \{\n.*?\n    \}\n", "\n", s, flags=re.S)
+s = "\n".join(l for l in s.split("\n") if "WlrLayershell." not in l and "exclusionMode" not in l
+              and not l.strip().startswith("anchors { top: true;"))
+if '"displays"' not in s:
+    s = s.replace('        { id: "power", title: "Power", glyph: "󰁹" },\n',
+                  '        { id: "power", title: "Power", glyph: "󰁹" },\n        { id: "displays", title: "Displays", glyph: "󰍺" },\n', 1)
+if "property var identify" not in s:
+    s = s.replace("    property var dropPreview: null\n", "    property var dropPreview: null\n    property var identify: null\n", 1)
+open(cfg + "/Settings.qml", "w", encoding="utf-8").write(s)
+b = open(src + "/SettingsBody.qml", encoding="utf-8").read()
+if "SettingsDisplays" not in b:
+    b = b.replace("                SettingsPower { win: body.win }\n", "                SettingsPower { win: body.win }\n                SettingsDisplays { win: body.win }\n", 1)
+open(cfg + "/SettingsBody.qml", "w", encoding="utf-8").write(b)
+# DisplaysIdentify: its per-screen PanelWindow as a plain window
+d = open(src + "/DisplaysIdentify.qml", encoding="utf-8").read()
+d = d.replace("PanelWindow {", "FloatingWindow {", 1)
+d = "\n".join(l for l in d.split("\n") if not re.match(r"\s*(WlrLayershell\.|exclusionMode|anchors \{ top|margins \{|mask:|screen:)", l))
+open(cfg + "/DisplaysIdentify.qml", "w", encoding="utf-8").write(d)
+PY
+}
+
+run_pass() {    # NAME FIXTURE
+    p="$work/$1"; cfg="$p/cfg"; fake="$p/home"; sbin="$p/bin"
+    mkdir -p "$cfg" "$p/state" "$sbin" "$fake/.config/cosmic/com.system76.CosmicTheme.Mode/v1" "$fake/.config/shell" "$fake/.config/hypr" "$fake/.local/share"
+    mkdir -m 700 "$p/run"
+    echo true > "$fake/.config/cosmic/com.system76.CosmicTheme.Mode/v1/is_dark"
+    [ -e "$HOME/.local/share/fonts" ] && ln -s "$HOME/.local/share/fonts" "$fake/.local/share/fonts"
+    for f in "$src"/Settings*.qml "$src"/Displays*.qml "$src/displays.js" "$src/JsonFile.qml" "$src/Profiles.qml" "$src/ProfilesCore.qml" \
+             "$src/FocusRow.qml" "$src/Clocks.qml" "$src/ClocksCore.qml" "$src/clocks.js" "$src/Theme.qml" "$src/Caption.qml" "$src/Slider.qml" "$src/quiet.js"; do
+        cp "$f" "$cfg/" || exit 2
+    done
+    for f in "$src"/tests/settings/*.qml; do [ "$(basename "$f")" = shell.qml ] || cp "$f" "$cfg/"; done
+    cp "$tests/shell.qml" "$cfg/"
+    prepare "$src" "$cfg" "$1"
+    cp "$tests/fixtures/$2.json" "$p/monitors.json"
+    : > "$p/calls"
+    cp "$bin/display-layout" "$sbin/"
+    [ -x "$bin/sunset-times" ] && cp "$bin/sunset-times" "$sbin/"
+    printf 'profile {\n    time = 7:00\n    identity = true\n}\n' > "$p/hyprsunset.conf"
+    printf '#!/bin/sh\ncase "$1" in list) echo "* clemson  primary #f56600  secondary #522d80  x" ;; esac\n' > "$sbin/palette"
+    printf '#!/bin/sh\ntrue\n' > "$sbin/anim-preset"
+    chmod +x "$sbin"/*
+    log="$p/log"
+    env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u QT_QPA_PLATFORMTHEME -u QT_STYLE_OVERRIDE \
+        HOME="$fake" XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}" XDG_CONFIG_HOME="$fake/.config" \
+        QT_QPA_PLATFORM=offscreen XDG_RUNTIME_DIR="$p/run" XDG_STATE_HOME="$p/state" XDG_CACHE_HOME="$p/cache" \
+        SETTINGS_BIN="$sbin" SUNSET_CONF="$p/hyprsunset.conf" SUNSET_RESTART="" \
+        HYPRCTL="$tests/fake-hyprctl" FAKE_MONITORS="$p/monitors.json" FAKE_LOG="$p/calls" HYPRLAND_INSTANCE_SIGNATURE=test \
+        DISPLAY_LAYOUT_SAVED="$fake/.config/shell/displays.json" DISPLAY_LAYOUT_LUA="$fake/.config/hypr/monitors.lua" \
+        DISPLAY_LAYOUT_WATCHDOG=0 DISPLAY_LAYOUT_VERIFY=0 DISPLAYS_CASE="$1" DISPLAYS_TEST_OUT="$out" \
+        dbus-run-session -- timeout 150 "$qs" -p "$cfg/shell.qml" --no-color > "$log" 2>&1
+    code=$?
+    [ "$verbose" = 1 ] && cat "$log"
+    grep -o 'DTEST \(PASS\|FAIL\|case:\|RESULT\).*' "$log" | sed 's/^DTEST //'
+    if ! grep -q 'DTEST RESULT' "$log"; then
+        echo "displays-test: the $1 run did not finish (exit $code). Last lines:" >&2
+        grep -vE 'dbus-daemon|portal' "$log" | tail -15 >&2
+        ok=1; return
+    fi
+    grep -q 'DTEST RESULT pass [0-9]* fail 0$' "$log" || ok=1
+    if grep -E '(Settings|Displays|JsonFile|shell)[A-Za-z]*\.qml.*(TypeError|ReferenceError|Binding loop|Unable to assign|Cannot assign|is not a type)' "$log" | grep -q .; then
+        echo "FAIL errors were logged ($1):"; grep -E '(TypeError|ReferenceError|Binding loop|Unable to assign|Cannot assign|is not a type)' "$log" | sort -u | head -12; ok=1
+    fi
+    if grep -qE 'disabled|mirror|reload|dispatch' "$p/calls"; then echo "FAIL ($1) hyprctl got more than monitor reads and hl.monitor evals:"; cat "$p/calls"; ok=1; fi
+}
+
+echo "== part 2: the page, four-screen desk"
+run_pass desk desk
+echo "== part 3: the page, laptop alone"
+run_pass laptop laptop
+
+[ -n "$out" ] && echo "pictures in $out"
+exit $ok

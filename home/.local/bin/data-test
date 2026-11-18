@@ -1,0 +1,65 @@
+#!/bin/sh
+# Tests for the Python data sources and stats tools behind the Quickshell bar and dashboard:
+# dashboard-data, shell-status, shell-log, teams-unread, gameday, pet-score, keystats, mousestats,
+# cursor-shake, drop-preview and keybind-sheet. (join-meeting is covered by dayflow-test.)
+#
+#   data-test                run everything; PASS/FAIL lines and a summary; exit 1 on a failure
+#   data-test -v             also print whatever the parts wrote to stderr
+#   data-test -k             keep the temporary directory (its path is printed)
+#   data-test -b DIR         take the scripts from DIR instead of ~/.local/bin (e.g. a mutated copy)
+#   data-test -p PART        run only that part (repeatable): dashboard shellstatus shelllog teams
+#                            gameday petscore keystats mousestats cursorshake droppreview keybind
+#
+# The cases live in ~/.local/share/desktop-tests/data-test/harness.py, one part per process, the
+# parts in parallel. The key property for every feed: whatever the input (missing tools, network
+# down, garbage), it prints JSON in the shape its QML consumer reads (Dashboard.qml, PetSay.qml,
+# Sys.qml/ScriptSource, TeamsList.qml, WallState.qml, PetSecrets.qml) and exits as that expects.
+# Isolation: each part gets its own temporary HOME, XDG_RUNTIME_DIR (700), XDG_STATE/CONFIG/CACHE
+# and an `env -i` environment (no WAYLAND_DISPLAY, DISPLAY or HYPRLAND_INSTANCE_SIGNATURE); recording
+# stubs (hyprctl, mu, dconf, tailscale, emacsclient, xdg-open, curl, ...) come first on PATH. HTTP is
+# replaced in-process (urllib.urlopen), or goes to a loopback server on port 0 (teams-unread), and
+# name resolution of anything but loopback is refused. Hyprland sockets, evdev devices, select and
+# the clock are faked in-process for keystats, mousestats, cursor-shake and drop-preview.
+# keybind-sheet prints one real PDF with headless Chrome behind a dead proxy (no network), from
+# fixtures/binds.json (captured read-only from `hyprctl -j binds`).
+verbose=0; keep=0; bin="$HOME/.local/bin"; parts=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) verbose=1 ;;
+        -k) keep=1 ;;
+        -b) bin="$2"; shift ;;
+        -p) parts="$parts $2"; shift ;;
+        *) echo "usage: data-test [-v] [-k] [-b BIN_DIR] [-p PART]..." >&2; exit 2 ;;
+    esac
+    shift
+done
+[ -n "$parts" ] || parts="dashboard shellstatus shelllog teams gameday petscore keystats mousestats cursorshake droppreview keybind"
+share="$HOME/.local/share/desktop-tests/data-test"
+py=/usr/bin/python3
+[ -x "$py" ] && [ -f "$share/harness.py" ] || { echo "data-test: no $py or no $share/harness.py" >&2; exit 2; }
+"$py" -I -c 'import evdev' 2>/dev/null || { echo "data-test: python3-evdev missing" >&2; exit 2; }
+bin=$(cd "$bin" && pwd) || exit 2
+work=$(mktemp -d /tmp/data-test.XXXXXX) || exit 2
+if [ "$keep" = 1 ]; then echo "data-test: keeping $work"; else trap 'rm -rf "$work"' EXIT; fi
+
+for p in $parts; do
+    pd="$work/$p"
+    mkdir -p "$pd/home" "$pd/run" "$pd/state" "$pd/config" "$pd/cache"
+    chmod 700 "$pd/run"
+    : > "$pd/calls.log"
+    env -i HOME="$pd/home" XDG_RUNTIME_DIR="$pd/run" XDG_STATE_HOME="$pd/state" XDG_CONFIG_HOME="$pd/config" \
+        XDG_CACHE_HOME="$pd/cache" PATH="$share/stubs:/usr/bin:/bin" TZ=America/New_York LANG=C.UTF-8 \
+        DT_BIN="$bin" DT_DIR="$pd" DT_FIX="$share/fixtures" DT_STUBS="$share/stubs" \
+        timeout 110 "$py" -I "$share/harness.py" "$p" > "$work/$p.out" 2> "$work/$p.err" < /dev/null &
+done
+wait
+
+for p in $parts; do
+    cat "$work/$p.out"
+    [ -s "$work/$p.out" ] || echo "FAIL $p: no output (timed out or did not start)   [$(tail -c 300 "$work/$p.err" | tr '\n' ' ')]"
+    if [ "$verbose" = 1 ] && [ -s "$work/$p.err" ]; then sed "s/^/  $p stderr: /" "$work/$p.err"; fi
+done > "$work/all.out"
+cat "$work/all.out"
+pass=$(grep -c '^PASS ' "$work/all.out"); fail=$(grep -c '^FAIL ' "$work/all.out")
+echo "RESULT pass $pass fail $fail"
+[ "$fail" -eq 0 ]
