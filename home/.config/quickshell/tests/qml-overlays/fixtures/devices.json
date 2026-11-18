@@ -1,0 +1,9 @@
+{
+ "keyboards": [
+  {
+   "name": "at-translated-set-2-keyboard",
+   "capsLock": true,
+   "main": true
+  }
+ ]
+}

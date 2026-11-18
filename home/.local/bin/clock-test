@@ -1,0 +1,66 @@
+#!/bin/sh
+# Tests for the clock tools: Clocks.qml (ClocksCore.qml, clocks.js), bin/tz-now, the calendar popup's
+# ClockPanel.qml and SettingsClock.qml.
+#
+#   clock-test               run everything; PASS/FAIL lines and a summary; exit 1 on a failure
+#   clock-test -v            also print everything Quickshell logged
+#   clock-test -o DIR        save pictures (ClockPanel collapsed and open, the settings page; dark and light) in DIR
+#   clock-test -d DIR        test the config in DIR instead of ~/.config/quickshell
+#   clock-test -b DIR        test the scripts in DIR instead of ~/.local/bin (needs tz-now)
+#
+# The real files are loaded offscreen next to stubs (Sys, Notif) in tests/clock that record every command and
+# sound: nothing is run, played or sent. Time is a fake clock, the zone is America/New_York, and home, state
+# and config are temporary. A shell reload is a second ClocksCore over the same state file. The world clock
+# cases run the real bin/tz-now (Python zoneinfo) with --at set to the DST boundaries.
+verbose=0; out=""; src="$HOME/.config/quickshell"; bin="$HOME/.local/bin"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) verbose=1 ;;
+        -o) out="$2"; shift ;;
+        -d) src="$2"; shift ;;
+        -b) bin="$2"; shift ;;
+        *) echo "usage: clock-test [-v] [-o DIR] [-d CONFIG_DIR] [-b BIN_DIR]" >&2; exit 2 ;;
+    esac
+    shift
+done
+qs="$HOME/.nix-profile/bin/qs"
+tests="$src/tests/clock"
+[ -x "$qs" ] && [ -f "$tests/shell.qml" ] || { echo "clock-test: no qs, or no $tests/shell.qml" >&2; exit 2; }
+[ -x "$bin/tz-now" ] || { echo "clock-test: no $bin/tz-now" >&2; exit 2; }
+[ -n "$out" ] && { mkdir -p "$out" && out=$(cd "$out" && pwd) || exit 2; }
+
+work=$(mktemp -d) || exit 2
+trap 'rm -rf "$work"' EXIT
+cfg="$work/cfg"; fake="$work/home"
+mkdir -p "$cfg" "$work/state" "$work/run" "$fake/.config/cosmic/com.system76.CosmicTheme.Mode/v1" "$fake/.config/shell" "$fake/.local/share"
+chmod 700 "$work/run"
+echo true > "$fake/.config/cosmic/com.system76.CosmicTheme.Mode/v1/is_dark"
+[ -e "$HOME/.local/share/fonts" ] && ln -s "$HOME/.local/share/fonts" "$fake/.local/share/fonts"
+for f in ClocksCore Clocks ClockPanel SettingsClock SettingsPage SettingsCard SettingsRow SettingsSwitch SettingsStepper SettingsText \
+         SettingsChips SettingsButton SettingsInfo SettingsChip JsonFile Theme Icons Caption Calendar; do
+    cp "$src/$f.qml" "$cfg/" || exit 2
+done
+cp "$src/clocks.js" "$cfg/" || exit 2
+cp "$tests"/*.qml "$cfg/"
+
+log="$work/log"
+env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u QT_QPA_PLATFORMTHEME -u QT_STYLE_OVERRIDE \
+    HOME="$fake" XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}" XDG_CONFIG_HOME="$fake/.config" TZ=America/New_York \
+    QT_QPA_PLATFORM=offscreen XDG_RUNTIME_DIR="$work/run" XDG_STATE_HOME="$work/state" XDG_CACHE_HOME="$work/cache" \
+    CLOCK_BIN="$bin" CLOCKS_CONFIG="$fake/.config/shell/clocks.json" CLOCK_TEST_OUT="$out" \
+    dbus-run-session -- timeout 150 "$qs" -p "$cfg/shell.qml" --no-color > "$log" 2>&1
+code=$?
+[ "$verbose" = 1 ] && cat "$log"
+grep -o 'CTEST \(PASS\|FAIL\|case:\|RESULT\).*' "$log" | sed 's/^CTEST //'
+if ! grep -q 'CTEST RESULT' "$log"; then
+    echo "clock-test: the run did not finish (exit $code). Last lines:" >&2
+    grep -vE 'dbus-daemon|portal' "$log" | tail -15 >&2
+    exit 2
+fi
+ok=0
+grep -q 'CTEST RESULT pass [0-9]* fail 0$' "$log" || ok=1
+if grep -E '(Clock|Settings|JsonFile|Calendar|shell)[A-Za-z]*\.qml.*(TypeError|ReferenceError|Binding loop|Unable to assign|Cannot assign|is not a type|not installed)' "$log" | grep -q .; then
+    echo "FAIL errors were logged:"; grep -E '(TypeError|ReferenceError|Binding loop|Unable to assign|Cannot assign|is not a type)' "$log" | sort -u | head -12; ok=1
+fi
+[ -n "$out" ] && echo "pictures in $out"
+exit $ok

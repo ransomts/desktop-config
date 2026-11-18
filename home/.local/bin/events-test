@@ -1,0 +1,86 @@
+#!/bin/sh
+# Tests for the quick "add event" feature: bin/quick-event, the launcher's "event ..." row (Quickshell
+# EventQuick.qml), Launcher.openWith and the calendar popup's "+ Add event" line (Calendar.qml).
+#
+#   events-test               run everything; PASS/FAIL lines and a summary; exit 1 on a failure
+#   events-test -v            also print everything Quickshell logged
+#   events-test -o DIR        save pictures (launcher row, problem row, calendar; dark and light) in DIR
+#   events-test -d DIR        test the Quickshell config in DIR instead of ~/.config/quickshell
+#   events-test -b DIR        test quick-event in DIR instead of ~/.local/bin
+#
+# Part 1 (python, tests/events/test_quick_event.py): the parser on 100+ lines with a fixed "now"
+# (QUICK_EVENT_NOW), and `add` with a FAKE exchange tool (QUICK_EVENT_TOOL), a fake notify-send and a fake
+# systemctl on PATH. The real ~/.emacs.d/scripts/exchange-rules.py is never run and nothing reaches the
+# calendar; no notification is shown.
+# Part 2 (qs, tests/events/shell.qml, offscreen like launcher-test): the real LaunchView, Launcher,
+# EventQuick and Calendar with a stub Sys; `quick-event parse` is faked, except in two cases that run the
+# real script (still with the fixed "now"). Nothing is launched.
+verbose=0; out=""; src="$HOME/.config/quickshell"; bin="$HOME/.local/bin"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) verbose=1 ;;
+        -o) out="$2"; shift ;;
+        -d) src="$2"; shift ;;
+        -b) bin="$2"; shift ;;
+        *) echo "usage: events-test [-v] [-o DIR] [-d CONFIG_DIR] [-b BIN_DIR]" >&2; exit 2 ;;
+    esac
+    shift
+done
+qs="$HOME/.nix-profile/bin/qs"
+tests="$src/tests/events"
+[ -x "$bin/quick-event" ] || { echo "events-test: no $bin/quick-event" >&2; exit 2; }
+[ -x "$qs" ] && [ -f "$tests/shell.qml" ] || { echo "events-test: no qs, or no $tests/shell.qml" >&2; exit 2; }
+[ -n "$out" ] && { mkdir -p "$out" && out=$(cd "$out" && pwd) || exit 2; }
+bin=$(cd "$bin" && pwd)
+
+ok=0
+echo "case: parser and add (fake tool)"
+python3 "$tests/test_quick_event.py" "$bin/quick-event" > "${TMPDIR:-/tmp}/events-test-py.$$" 2>&1; pcode=$?
+grep -v '^RESULT' "${TMPDIR:-/tmp}/events-test-py.$$" | { [ "$verbose" = 1 ] && cat || grep '^FAIL'; }
+pres=$(grep '^RESULT' "${TMPDIR:-/tmp}/events-test-py.$$"); rm -f "${TMPDIR:-/tmp}/events-test-py.$$"
+echo "python: ${pres:-no result}"
+[ "$pcode" = 0 ] || ok=1
+
+work=$(mktemp -d) || exit 2
+trap 'rm -rf "$work"' EXIT
+cfg="$work/cfg"; fake="$work/home"
+mkdir -p "$cfg" "$work/state" "$work/cache" "$fake/.config/cosmic/com.system76.CosmicTheme.Mode/v1" "$fake/.local/share"
+echo true > "$fake/.config/cosmic/com.system76.CosmicTheme.Mode/v1/is_dark"
+[ -e "$HOME/.local/share/fonts" ] && ln -s "$HOME/.local/share/fonts" "$fake/.local/share/fonts"
+mkdir -m 700 "$work/run"
+cp "$src/LaunchView.qml" "$src/LaunchCmd.qml" "$src/EventQuick.qml" "$src/Calendar.qml" "$src/ClockPanel.qml" "$src/Clocks.qml" "$src/ClocksCore.qml" "$src/clocks.js" "$src/JsonFile.qml" "$src/Theme.qml" "$src/Caption.qml" \
+   "$src/rank.js" "$src/fuzzy.js" "$cfg/" || exit 2
+cp "$tests"/*.qml "$cfg/"
+
+# Launcher: PanelWindow -> FloatingWindow, without the layer-shell, screen and focus-grab parts
+python3 - "$src/Launcher.qml" "$cfg/Launcher.qml" <<'PY'
+import re, sys
+s = open(sys.argv[1], encoding="utf-8").read()
+s = s.replace("PanelWindow {", "FloatingWindow {", 1)
+s = re.sub(r"\n    screen: \{\n.*?\n    \}\n", "\n", s, flags=re.S)
+s = re.sub(r"\n    HyprlandFocusGrab \{\n.*?\n    \}\n", "\n", s, flags=re.S)
+s = "\n".join(l for l in s.split("\n") if "WlrLayershell." not in l and "exclusionMode" not in l)
+open(sys.argv[2], "w", encoding="utf-8").write(s)
+PY
+
+log="$work/log"
+env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u QT_QPA_PLATFORMTHEME -u QT_STYLE_OVERRIDE \
+    HOME="$fake" XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}" XDG_CONFIG_HOME="$fake/.config" \
+    QT_QPA_PLATFORM=offscreen XDG_RUNTIME_DIR="$work/run" XDG_STATE_HOME="$work/state" XDG_CACHE_HOME="$work/cache" \
+    EVENTS_TEST_OUT="$out" EVENTS_TEST_BIN="$bin" QUICK_EVENT_NOW="2026-11-14T10:36" \
+    dbus-run-session -- timeout 90 "$qs" -p "$cfg/shell.qml" --no-color > "$log" 2>&1
+code=$?
+[ "$verbose" = 1 ] && cat "$log"
+echo "case: launcher row, openWith, calendar line (qs)"
+grep -o 'ETEST \(PASS\|FAIL\|case:\|RESULT\).*' "$log" | sed 's/^ETEST //' | { [ "$verbose" = 1 ] && cat || grep -v '^PASS\|^case:'; }
+if ! grep -q 'ETEST RESULT' "$log"; then
+    echo "events-test: the run did not finish (exit $code). Last lines:" >&2
+    grep -vE 'dbus-daemon|portal' "$log" | tail -15 >&2
+    exit 2
+fi
+grep 'ETEST RESULT' "$log" | sed 's/^ETEST /qs: /'
+grep -q 'ETEST RESULT pass [0-9]* fail 0$' "$log" || ok=1
+if grep -E '(Launch|EventQuick|Calendar|Launcher|shell)[A-Za-z]*\.(qml|js).*(TypeError|ReferenceError|Binding loop|Unable to assign)' "$log" | grep -q .; then
+    echo "FAIL errors were logged:"; grep -E '(TypeError|ReferenceError|Binding loop|Unable to assign)' "$log" | sort -u | head -8; ok=1
+fi
+exit $ok

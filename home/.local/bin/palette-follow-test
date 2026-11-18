@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""Tests for `palette follow` (the plan chosen by the wallpaper scene or the time of day).
+
+  palette-follow-test [-p PALETTE] [-c CONFIG] [-k]
+
+Runs the palette tool ONLY against a throwaway home: a copy of the palette config (masters,
+plans, files.json) in a temporary HOME, with every themed live file made from its master.
+HOME, XDG_STATE_HOME point there, HYPRLAND_INSTANCE_SIGNATURE is dropped, and the tool itself
+refuses to reload anything when HOME is not your home. Nothing under the real ~ is touched.
+
+  -p PALETTE   the palette script to test (default: ~/.local/bin/palette)
+  -c CONFIG    palette config to copy (default: ~/.config/palette)
+  -d DIR       where to build the throwaway home (default: a new temporary directory)
+  -k           keep the throwaway home afterwards
+Lines: PASS/FAIL ..., then "RESULT pass N fail M"; exit 1 on a failure.
+"""
+import argparse, hashlib, json, os, shutil, subprocess, sys, tempfile
+
+ap = argparse.ArgumentParser()
+ap.add_argument("-p", default=os.path.expanduser("~/.local/bin/palette"))
+ap.add_argument("-c", default=os.path.expanduser("~/.config/palette"))
+ap.add_argument("-d")
+ap.add_argument("-k", action="store_true")
+a = ap.parse_args()
+
+real_home = os.path.realpath(os.path.expanduser("~"))
+home = os.path.realpath(a.d) if a.d else tempfile.mkdtemp(prefix="palette-follow-")
+assert not (home + "/").startswith(real_home + "/.config") and home != real_home, "refusing to use the real home"
+if os.path.exists(home): shutil.rmtree(home)
+root = os.path.join(home, ".config/palette")
+shutil.copytree(a.c, root, ignore=shutil.ignore_patterns("*.png", "*.tar.gz", "follow.json", "follow-mode"))
+manifest = json.load(open(os.path.join(root, "files.json")))
+for f in manifest:                                  # live files = their masters (the clemson plan)
+    src = os.path.join(root, "masters", f["path"])
+    if os.path.exists(src):
+        os.makedirs(os.path.dirname(os.path.join(home, f["path"])), exist_ok=True)
+        shutil.copy(src, os.path.join(home, f["path"]))
+st = {"plan": "clemson", "written": {}}
+for f in manifest:
+    p = os.path.join(home, f["path"])
+    if os.path.exists(p): st["written"][f["path"]] = hashlib.sha256(open(p, encoding="utf-8").read().encode()).hexdigest()
+json.dump(st, open(os.path.join(root, "state.json"), "w"), indent=1, sort_keys=True)
+os.makedirs(os.path.join(home, ".local/state"), exist_ok=True)
+os.makedirs(os.path.join(home, ".config/quickshell"), exist_ok=True)
+
+env = {k: v for k, v in os.environ.items() if k not in ("HYPRLAND_INSTANCE_SIGNATURE", "WAYLAND_DISPLAY", "DISPLAY")}
+env.update(HOME=home, XDG_STATE_HOME=os.path.join(home, ".local/state"), XDG_CONFIG_HOME=os.path.join(home, ".config"))
+
+def pal(*args):
+    r = subprocess.run([sys.executable, a.p, *args], env=env, capture_output=True, text=True, timeout=120)
+    return r.returncode, r.stdout + r.stderr
+
+def tree():
+    """sha of every file in the throwaway home (the snapshot a no-op must leave alone)"""
+    out = {}
+    for d, _, fs in os.walk(home):
+        for n in fs:
+            p = os.path.join(d, n)
+            out[os.path.relpath(p, home)] = hashlib.sha256(open(p, "rb").read()).hexdigest()
+    return out
+
+def changed(before, after):
+    return sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k))
+
+def state(): return json.load(open(os.path.join(root, "state.json")))
+def table(): return json.load(open(os.path.join(root, "follow.json")))
+def wall(scene): json.dump({"scene": scene}, open(os.path.join(home, ".local/state/wallpaper.json"), "w"))
+
+passed = failed = 0
+def check(what, ok, detail=""):
+    global passed, failed
+    if ok: passed += 1
+    else: failed += 1
+    print(("PASS " if ok else "FAIL ") + what + ("" if ok or not detail else "   [" + str(detail).strip().replace("\n", " | ")[:400] + "]"))
+
+theme = os.path.join(home, ".config/quickshell/Theme.qml")
+theme0 = open(theme).read()
+plans = sorted(n[:-5] for n in os.listdir(os.path.join(root, "plans")) if n.endswith(".json"))
+other = plans[0] if plans else None
+check("a generated plan to test with", other is not None, plans)
+
+print("case: defaults")
+c, out = pal("follow", "status")
+check("status runs", c == 0, out)
+check("follow is off by default", "follow: off" in out, out)
+t0 = tree()
+c, out = pal("follow", "apply")
+check("apply while off does nothing", c == 0 and "off" in out and not changed(t0, tree()), out + str(changed(t0, tree())))
+
+print("case: modes")
+c, out = pal("follow", "scene")
+check("follow scene", c == 0 and state().get("follow") == "scene", out)
+check("follow-mode file says scene", open(os.path.join(root, "follow-mode")).read().strip() == "scene")
+c, out = pal("follow", "bogus")
+check("unknown mode refused", c != 0 and state().get("follow") == "scene", out)
+
+print("case: default table changes nothing")
+wall("contours")
+t0 = tree()
+c, out = pal("follow", "apply")
+check("every scene -> clemson: already live", c == 0 and "already live" in out, out)
+check("tree byte-identical", not changed(t0, tree()), changed(t0, tree()))
+for s in ("silk", "sky", "depths"):
+    c, out = pal("follow", "apply", "--scene", s)
+    check("scene %s -> clemson, no change" % s, c == 0 and not changed(t0, tree()), out)
+
+print("case: set")
+c, out = pal("follow", "set", "ripples", other)
+check("set ripples -> " + other, c == 0 and table()["scenes"]["ripples"] == other, out)
+check("the rest stay clemson", all(v == "clemson" for k, v in table()["scenes"].items() if k != "ripples"), table())
+t1 = tree()
+c, out = pal("follow", "set", "silk", "no-such-plan")
+check("unknown plan refused", c != 0 and "no plan" in out, out)
+check("unknown plan changes nothing", not changed(t1, tree()), changed(t1, tree()))
+c, out = pal("follow", "set", "nosuchscene", "clemson")
+check("unknown scene refused, nothing changed", c != 0 and not changed(t1, tree()), out)
+
+print("case: apply --dry-run")
+c, out = pal("follow", "apply", "--scene", "ripples", "--dry-run")
+check("dry run names the switch", c == 0 and ("clemson -> " + other) in out and "would rewrite" in out, out)
+check("dry run writes nothing", not changed(t1, tree()), changed(t1, tree()))
+
+print("case: apply from wallpaper.json")
+wall("ripples")
+c, out = pal("follow", "apply")
+check("ripples -> " + other + " used", c == 0 and state()["plan"] == other, out)
+check("Theme.qml recoloured", open(theme).read() != theme0)
+check("no reload outside the real home", "no reload" in out, out)
+t2 = tree()
+c, out = pal("follow", "apply")
+check("second apply: already live", c == 0 and "already live" in out, out)
+check("second apply leaves every file byte-identical", not changed(t2, tree()), changed(t2, tree()))
+c, out = pal("use", other)
+check("use of the live plan rewrites no file", c == 0 and "0 files rewritten" in out, out)
+check("...and live files are byte-identical", [k for k in changed(t2, tree()) if not k.endswith("state.json")] == [], changed(t2, tree()))
+
+print("case: a broken table changes nothing")
+tb = table(); tb["scenes"]["field"] = "gone"; json.dump(tb, open(os.path.join(root, "follow.json"), "w"))
+t3 = tree()
+c, out = pal("follow", "apply", "--scene", "field")
+check("plan named in follow.json but missing: error", c != 0 and "no such plan" in out, out)
+check("...nothing changed", not changed(t3, tree()), changed(t3, tree()))
+open(os.path.join(root, "follow.json"), "w").write("{not json")
+c, out = pal("follow", "apply", "--scene", "silk")
+check("unreadable follow.json: error, nothing changed", c != 0 and changed(t3, tree()) == [os.path.join(".config/palette", "follow.json")], out)
+tb["scenes"]["field"] = "clemson"; json.dump(tb, open(os.path.join(root, "follow.json"), "w"))
+
+print("case: time mode")
+c, out = pal("follow", "time")
+check("follow time", c == 0 and state()["follow"] == "time" and open(os.path.join(root, "follow-mode")).read().strip() == "time", out)
+c1, _ = pal("follow", "set", "06:00", "clemson")
+c2, _ = pal("follow", "set", "18:30", other)
+c3, _ = pal("follow", "set", "0:00", "clemson")
+check("times set", c1 == c2 == c3 == 0 and table()["times"] == [["00:00", "clemson"], ["06:00", "clemson"], ["18:30", other]], table()["times"])
+c, out = pal("follow", "set", "25:00", "clemson")
+check("bad time refused", c != 0, out)
+pal("use", "clemson")
+t4 = tree()
+for at, want in (("07:15", "clemson"), ("18:29", "clemson"), ("18:30", other), ("23:59", other)):
+    c, out = pal("follow", "apply", "--at", at, "--dry-run")
+    ok = ("already live" in out) if want == "clemson" else ("-> " + want) in out
+    check("at %s -> %s" % (at, want), c == 0 and ok, out)
+check("time dry runs change nothing", not changed(t4, tree()), changed(t4, tree()))
+c, out = pal("follow", "unset", "00:00")
+check("unset 00:00", c == 0 and [x[0] for x in table()["times"]] == ["06:00", "18:30"], table()["times"])
+c, out = pal("follow", "apply", "--at", "03:00", "--dry-run")
+check("before the first time: last night's plan (" + other + ")", c == 0 and ("-> " + other) in out, out)
+
+print("case: off and back to clemson")
+c, out = pal("follow", "off")
+check("follow off", c == 0 and state()["follow"] == "off" and open(os.path.join(root, "follow-mode")).read().strip() == "off", out)
+c, out = pal("use", "clemson")
+check("use clemson", c == 0 and state()["plan"] == "clemson", out)
+check("round trip: Theme.qml byte-identical to its master", open(theme).read() == theme0)
+masters_same = all(open(os.path.join(home, f["path"]), "rb").read() == open(os.path.join(root, "masters", f["path"]), "rb").read()
+                   for f in manifest if os.path.exists(os.path.join(root, "masters", f["path"])))
+check("round trip: every live file equals its master", masters_same)
+
+print("RESULT pass %d fail %d" % (passed, failed))
+if not a.k: shutil.rmtree(home, ignore_errors=True)
+sys.exit(1 if failed else 0)

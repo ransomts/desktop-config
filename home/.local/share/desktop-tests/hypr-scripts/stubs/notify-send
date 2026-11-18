@@ -1,0 +1,4 @@
+#!/bin/sh
+# stub (hypr-scripts-test): record; exit with the code in $W/notify-rc (default 0)
+echo "notify-send $*" >> "$CALLS"
+exit "$(cat "$W/notify-rc" 2>/dev/null || echo 0)"

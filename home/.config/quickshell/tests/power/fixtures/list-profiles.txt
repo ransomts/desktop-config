@@ -1,0 +1,15 @@
+full_charge
+  Title: Full Charge
+  Description: Battery is charged to its full capacity for the longest possible use on battery power. Charging resumes when the battery falls below 96% charge.
+  Start: 90
+  End: 100
+balanced
+  Title: Balanced
+  Description: Use this threshold when you unplug frequently but don't need the full battery capacity. Charging stops when the battery reaches 90% capacity and resumes when the battery falls below 85%.
+  Start: 86
+  End: 90
+max_lifespan
+  Title: Maximum Lifespan
+  Description: Use this threshold if you rarely use the system on battery for extended periods. Charging stops when the battery reaches 60% capacity and resumes when the battery falls below 50%.
+  Start: 50
+  End: 60

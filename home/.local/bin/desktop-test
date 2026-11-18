@@ -1,0 +1,103 @@
+#!/bin/bash
+# Run every desktop test suite (~/.local/bin/*-test: the Quickshell/script suites and hypr-test) and
+# summarise. Suites run in parallel: each one already works in its own temporary HOME / runtime
+# directory with stub commands, and hypr-test runs its nested Hyprland on its own bus and sockets.
+#
+#   desktop-test                 run all suites, 10 at a time; one line per suite, then the failures
+#   desktop-test -j N            N at a time (1 = one after another)
+#   desktop-test -v              print each failing suite's whole log, not just its FAIL lines
+#   desktop-test -l              list the suites and exit
+#   desktop-test SUITE...        run only these (names with or without -test: hypr clock power)
+#
+# Logs: ~/.local/state/desktop-test/latest/SUITE.log (the previous run is moved to previous/).
+# Exit 0 when every suite passed, 1 when any failed, timed out (10 min) or could not start.
+set -u
+jobs=10; verbose=0; list=0; only=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -j) jobs="$2"; shift ;;
+        -j*) jobs="${1#-j}" ;;
+        -v) verbose=1 ;;
+        -l) list=1 ;;
+        -h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -*) echo "usage: desktop-test [-j N] [-v] [-l] [SUITE...]" >&2; exit 2 ;;
+        *) only+=("${1%-test}-test") ;;
+    esac
+    shift
+done
+bin=$(dirname "$(readlink -f "$0")")
+all=()
+for f in "$bin"/*-test; do
+    n=$(basename "$f"); [ "$n" = desktop-test ] && continue
+    [ -x "$f" ] && all+=("$n")
+done
+if [ "$list" = 1 ]; then printf '%s\n' "${all[@]}"; exit 0; fi
+suites=("${all[@]}")
+if [ ${#only[@]} -gt 0 ]; then
+    suites=()
+    for s in "${only[@]}"; do
+        [ -x "$bin/$s" ] || { echo "desktop-test: no suite $s" >&2; exit 2; }
+        suites+=("$s")
+    done
+fi
+
+state="${XDG_STATE_HOME:-$HOME/.local/state}/desktop-test"
+mkdir -p "$state"
+rm -rf "$state/previous"; [ -d "$state/latest" ] && mv "$state/latest" "$state/previous"
+logs="$state/latest"; mkdir -p "$logs"
+
+# Run one suite: log to SUITE.log, then one status line to SUITE.status (rc seconds).
+run_one() {
+    local s=$1 t0=$(date +%s) rc
+    timeout --kill-after=10 600 "$bin/$s" > "$logs/$s.log" 2>&1 < /dev/null; rc=$?
+    echo "$rc $(( $(date +%s) - t0 ))" > "$logs/$s.status"
+}
+
+t_start=$(date +%s)
+running=0
+# Slowest first, by the last run's times, so a long suite doesn't start last.
+order=$(for s in "${suites[@]}"; do
+    secs=$(cut -d' ' -f2 "$state/previous/$s.status" 2>/dev/null || echo 999)
+    echo "$secs $s"; done | sort -rn | cut -d' ' -f2)
+for s in $order; do
+    while [ "$running" -ge "$jobs" ]; do wait -n; running=$((running - 1)); done
+    run_one "$s" &
+    running=$((running + 1))
+done
+wait
+
+# Counts: the sum of every RESULT line (some suites run in parts and print one per part), else the
+# PASS/FAIL lines. A suite is ok only when it exits 0 AND no part reported a failure.
+failed=0; tp=0; tf=0
+printf '%-22s %-6s %6s  %s\n' SUITE STATUS SECS CHECKS
+for s in "${suites[@]}"; do
+    read -r rc secs < "$logs/$s.status"
+    log="$logs/$s.log"
+    res=$(grep -E '^(python: )?RESULT pass [0-9]+ fail [0-9]+' "$log")
+    if [ -n "$res" ]; then
+        p=$(echo "$res" | awk '{for(i=1;i<=NF;i++) if($i=="pass") s+=$(i+1)} END {print s+0}')
+        f=$(echo "$res" | awk '{for(i=1;i<=NF;i++) if($i=="fail") s+=$(i+1)} END {print s+0}')
+    else p=$(grep -cE '^[A-Z]* ?PASS\b' "$log"); f=$(grep -cE '^[A-Z]* ?FAIL\b' "$log"); fi
+    tp=$((tp + p)); tf=$((tf + f))
+    [ "$rc" = 0 ] && [ "$f" -gt 0 ] && rc=1 && echo "1 $secs" > "$logs/$s.status"
+    case "$rc" in
+        0) st=ok ;;
+        124|137) st=TIMEOUT ;;
+        *) st=FAIL ;;
+    esac
+    [ "$rc" = 0 ] || failed=$((failed + 1))
+    printf '%-22s %-6s %6s  %s pass, %s fail\n' "$s" "$st" "$secs" "$p" "$f"
+done
+echo "-- ${#suites[@]} suites, $tp checks passed, $tf failed, $failed suite(s) not ok, $(( $(date +%s) - t_start ))s wall at -j $jobs"
+
+for s in "${suites[@]}"; do
+    read -r rc _ < "$logs/$s.status"
+    [ "$rc" = 0 ] && continue
+    echo; echo "== $s (exit $rc) — $logs/$s.log"
+    if [ "$verbose" = 1 ]; then cat "$logs/$s.log"
+    else
+        lines=$(grep -E '\bFAIL\b' "$logs/$s.log" | head -15)
+        [ -n "$lines" ] && echo "$lines" || tail -8 "$logs/$s.log"
+    fi
+done
+[ "$failed" = 0 ]

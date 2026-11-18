@@ -1,0 +1,451 @@
+#!/bin/bash
+# Tests for the picker menus and the small glue scripts in ~/.local/bin:
+#   layout-menu, wallpaper-menu, wifi-menu, wifi-qr, pet-rename (menus, through the real qs-pick);
+#   color-pick, ocr-region, quickshell-start, run-logged, bar-refresh, osd, dnd-toggle, notif-dnd;
+#   theme-by-time, gtk-theme-follows-cosmic, wallpaper-follows-theme, hypr-theme-apply.
+# (lecture-menu, clip-menu and polkit-agent-start are covered by lecture-test, launcher-test and
+# auth-test, so they are not repeated here.)
+#
+#   menus-test               run everything; PASS/FAIL lines and RESULT; exit 1 on a failure
+#   menus-test -v            also print the stub call log of every failing check
+#   menus-test -k            keep the temporary directory (its path is printed)
+#   menus-test -b DIR        test the scripts in DIR instead of ~/.local/bin
+#
+# Isolation: every script runs under `env -i` with a temporary HOME, XDG_RUNTIME_DIR (0700),
+# XDG_STATE_HOME, XDG_CONFIG_HOME, XDG_CACHE_HOME and TMPDIR, no WAYLAND_DISPLAY / DISPLAY /
+# HYPRLAND_INSTANCE_SIGNATURE, and a PATH of only stand-ins plus a few coreutils (so a command
+# nobody faked fails instead of reaching the system). The stand-ins live in
+# ~/.local/share/desktop-tests/menus/stubs: qs (installed as $HOME/.nix-profile/bin/qs; answers
+# picker calls from a queue of choices), fuzzel (same queue, for the fallback), nmcli (canned
+# networks and profiles, escaping terse output like the real one), date (a fixed clock), setsid /
+# uwsm / nixGLIntel, and `rec`, a recorder linked as hyprctl, notify-send, gsettings, logger,
+# systemd-cat, pgrep, pkill, sleep, wpctl, brightnessctl, rfkill, inotifywait, qrencode, slurp,
+# grim, tesseract, wl-copy, hyprpicker, nm-connection-editor, cosmic-theme-toggle. Each check reads
+# the call log ($MT/calls). The real qs-pick runs between each menu and the stand-ins, so both the
+# Quickshell picker path and the fuzzel fallback are exercised. Nothing is started or left running.
+verbose=0; keep=0; bin="$HOME/.local/bin"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) verbose=1 ;;
+        -k) keep=1 ;;
+        -b) bin="$2"; shift ;;
+        *) echo "usage: menus-test [-v] [-k] [-b BIN_DIR]" >&2; exit 2 ;;
+    esac
+    shift
+done
+bin=$(cd "$bin" 2>/dev/null && pwd) || { echo "menus-test: no directory $bin" >&2; exit 2; }
+share="$HOME/.local/share/desktop-tests/menus"
+[ -x "$share/stubs/rec" ] || { echo "menus-test: missing $share/stubs" >&2; exit 2; }
+scripts="layout-menu wallpaper-menu wifi-menu wifi-qr pet-rename color-pick ocr-region quickshell-start
+run-logged bar-refresh osd dnd-toggle notif-dnd theme-by-time gtk-theme-follows-cosmic
+wallpaper-follows-theme hypr-theme-apply qs-pick"
+for s in $scripts; do [ -f "$bin/$s" ] || { echo "menus-test: no $bin/$s" >&2; exit 2; }; done
+
+work=$(mktemp -d) || exit 2
+if [ "$keep" = 1 ]; then echo "keeping $work"; else trap 'rm -rf "$work"' EXIT; fi
+pass=0; fail=0
+check() {   # check NAME COND-EXIT [DETAIL]
+    if [ "$2" = 0 ]; then pass=$((pass + 1)); echo "PASS $1"
+    else fail=$((fail + 1)); echo "FAIL $1${3:+   [$3]}"
+         [ "$verbose" = 1 ] && sed 's/^/    | /' "$MT/calls"; fi
+}
+
+# ---------------- the fake world ----------------
+S="$work/stubs"; TOOLS="$work/tools"; H="$work/home"; MT="$work/t"
+mkdir -p "$S" "$TOOLS" "$H/.local/bin" "$H/.nix-profile/bin" "$H/.config" "$work/rt" "$work/state" "$work/cache" "$work/tmp"
+chmod 700 "$work/rt"
+for t in sh awk sed grep cat cut sort head tail tr wc mkdir mktemp mkfifo rm timeout dirname basename ln chmod cp mv env readlink true false; do
+    p=$(command -v "$t") && ln -s "$p" "$TOOLS/$t"
+done
+for n in hyprctl notify-send gsettings logger systemd-cat pgrep pkill sleep wpctl brightnessctl rfkill inotifywait \
+         qrencode slurp grim tesseract wl-copy hyprpicker nm-connection-editor; do ln -s "$share/stubs/rec" "$S/$n"; done
+for n in setsid uwsm date fuzzel nmcli; do ln -s "$share/stubs/$n" "$S/$n"; done
+for s in $scripts; do cp "$bin/$s" "$H/.local/bin/$s"; chmod +x "$H/.local/bin/$s"; done
+ln -s "$share/stubs/rec" "$H/.local/bin/cosmic-theme-toggle"
+QS="$H/.nix-profile/bin/qs"; GL="$H/.nix-profile/bin/nixGLIntel"
+install_qs() { cp "$share/stubs/qs" "$QS"; chmod +x "$QS"; }
+install_qs
+
+reset() {   # a fresh call log and control directory
+    rm -rf "$MT"; mkdir -p "$MT/out" "$MT/rc" "$MT/nm"; : > "$MT/calls"
+}
+run() {     # run [VAR=VALUE...] SCRIPT ARGS...: the copy in the fake HOME, isolated; stdout to $MT/stdout
+    env -i HOME="$H" PATH="$S:$TOOLS" MT="$MT" LANG=C.UTF-8 XDG_RUNTIME_DIR="$work/rt" \
+        XDG_STATE_HOME="$work/state" XDG_CONFIG_HOME="$H/.config" XDG_CACHE_HOME="$work/cache" \
+        TMPDIR="$work/tmp" "$@" < /dev/null > "$MT/stdout" 2> "$MT/stderr"
+}
+sx() {      # sx [VAR=VALUE...] SCRIPT ARGS...: run one script (the fake HOME's copy), set $rc
+    local pre=() s
+    while [[ $1 == *=* ]]; do pre+=("$1"); shift; done
+    s=$1; shift
+    run "${pre[@]}" timeout 20 sh "$H/.local/bin/$s" "$@"; rc=$?
+}
+has() { grep -qF -- "$1" "$MT/calls"; }
+count() { grep -cF -- "$1" "$MT/calls"; }
+calls() { tr '\n' ';' < "$MT/calls" | cut -c1-400; }
+pick() { printf '%s\n' "$@" > "$MT/picks"; }
+answer() { printf '%s\n' "$@" > "$MT/answers"; }
+
+# ================= layout-menu =================
+echo "case: layout-menu"
+ws_json() { printf '{\n    "id": %s,\n    "name": "%s",\n    "monitor": "eDP-1",\n    "windows": 2\n}\n' "$1" "$1" > "$MT/out/hyprctl.activeworkspace"; }
+reset; ws_json 12; echo "12 grid" > "$work/state/hypr-layouts"; echo "13 deck" >> "$work/state/hypr-layouts"; pick "monocle"
+sx layout-menu
+has "hyprctl [eval] [Layouts.keep(12, 'monocle')]"; check "layout-menu: chosen line keeps that layout on this desktop" $? "$(calls)"
+grep -q "qs \[ipc\] \[call\] \[picker\] \[openlive\] .*\[Arrange this desktop\] \[LAYOUT_WS=12 $H/.local/bin/layout-menu --preview\] \[7\]" "$MT/calls"
+check "layout-menu: opens live with the preview command and starts on the remembered layout (grid = 7)" $? "$(calls)"
+[ "$(wc -l < "$MT/picker-items")" = 11 ] && head -n 1 "$MT/picker-items" | grep -q '^default '; check "layout-menu: lists the 11 layouts, default first" $? "$(head -n 2 "$MT/picker-items" | tr '\n' ';')"
+reset; ws_json 14; pick CANCEL
+sx layout-menu
+has "hyprctl [eval] [Layouts.apply(14)]" && ! has "Layouts.keep"; check "layout-menu: cancel puts back what was there" $? "$(calls)"
+grep -q '\[openlive\].*\] \[0\]$' "$MT/calls"; check "layout-menu: no remembered layout starts on default (0)" $? "$(calls)"
+reset; ws_json 3; pick monocle
+sx layout-menu
+! has picker && ! has eval; check "layout-menu: does nothing on desktops below 11" $? "$(calls)"
+reset; ws_json -98; pick monocle
+sx layout-menu
+! has picker && ! has eval; check "layout-menu: does nothing on a special workspace" $? "$(calls)"
+reset
+sx LAYOUT_WS=12 layout-menu --preview 3
+has "hyprctl [eval] [Layouts.preview(12, 'top')]"; check "layout-menu --preview 3 previews 'top'" $? "$(calls)"
+reset
+sx layout-menu --preview 3
+! has eval; check "layout-menu --preview without LAYOUT_WS does nothing" $? "$(calls)"
+reset; ws_json 12; touch "$MT/qs-down"; pick "columns    one"
+sx layout-menu
+has "fuzzel [--dmenu]" && has "Layouts.keep(12, 'columns')"; check "layout-menu: fuzzel fallback when Quickshell is down" $? "$(calls)"
+[ -z "$(/bin/ls -A "$work/tmp")" ]; check "qs-pick: the fuzzel fallback leaves no temp dir (with the list in it) behind" $? "left: $(/bin/ls -A "$work/tmp" | tr '\n' ' ')"
+rm -rf "$work/tmp"/*
+
+# ================= wallpaper-menu =================
+echo "case: wallpaper-menu"
+wst() { echo "on scene=ink speed=0.012 fps=30 daylight=on music=off weather=off pointer=on agenda=off desks=off rest=on sharp=off heat=off weather:auto rain=0.00 fog=0.00 snow=0.00 sun=12.0deg" > "$MT/wallpaper-status"; }
+wp() { reset; wst; pick "$1"; sx wallpaper-menu; }
+wp "aurora"
+has "qs [ipc] [call] [wallpaper] [scene] [aurora]"; check "wallpaper-menu: a scene sets it" $? "$(calls)"
+grep -qx 'scene   ink   (current)' "$MT/picker-items" && grep -q '^effect  daylight  on ' "$MT/picker-items" && grep -q '^effect  music     off ' "$MT/picker-items"
+check "wallpaper-menu: marks the current scene and each effect's state" $? "$(grep -E 'ink|daylight|music' "$MT/picker-items" | tr '\n' ';')"
+wp "effect  daylight"
+has "[wallpaper] [effect] [daylight] [false]"; check "wallpaper-menu: an effect that is on turns off" $? "$(calls)"
+wp "effect  music"
+has "[wallpaper] [effect] [music] [true]"; check "wallpaper-menu: an effect that is off turns on" $? "$(calls)"
+wp "try     real weather"
+has "[wallpaper] [weather] [auto]" && ! has "[weather] [real]"; check "wallpaper-menu: 'real weather' goes back to auto" $? "$(calls)"
+wp "try     fog"
+has "[wallpaper] [weather] [fog]"; check "wallpaper-menu: try fog" $? "$(calls)"
+wp "turn    hide"
+has "[call] [wallpaper] [hide]"; check "wallpaper-menu: turn hide" $? "$(calls)"
+wp CANCEL
+[ "$rc" = 0 ] && [ "$(count '[wallpaper]')" = 1 ]; check "wallpaper-menu: cancel only asked for the status" $? "rc=$rc $(calls)"
+reset; touch "$MT/qs-down"; sx wallpaper-menu
+[ "$rc" = 1 ] && has "notify-send [Wallpaper] [Quickshell is not running]" && ! has fuzzel; check "wallpaper-menu: Quickshell down says so and stops" $? "rc=$rc $(calls)"
+reset; wst; touch "$MT/qs-picker-down"; pick "scene   silk"; sx wallpaper-menu
+has fuzzel && has "[wallpaper] [scene] [silk]"; check "wallpaper-menu: picker fails, fuzzel fallback still sets the scene" $? "$(calls)"
+
+# ================= pet-rename =================
+echo "case: pet-rename"
+reset; answer "ok:Sir Biscuit"; sx pet-rename
+has "qs [ipc] [call] [picker] [ask]" && has "[Name the pet] [false]" && has "qs [ipc] [call] [pet] [name] [Sir Biscuit]"; check "pet-rename: asks in Quickshell and sets the name (spaces kept)" $? "$(calls)"
+reset; answer cancel; sx pet-rename
+! has "[pet] [name]"; check "pet-rename: cancel sets nothing" $? "$(calls)"
+reset; answer "ok:"; sx pet-rename
+! has "[pet] [name]"; check "pet-rename: an empty name sets nothing" $? "$(calls)"
+reset; touch "$MT/qs-picker-down"; answer "ok:Rex"; sx pet-rename
+has "fuzzel [--dmenu] [--lines] [0]" && has "[--prompt-only] [Name the pet: ]" && has "[pet] [name] [Rex]"; check "pet-rename: fuzzel fallback asks and sets" $? "$(calls)"
+
+# ================= wifi-menu =================
+echo "case: wifi-menu"
+T=$(printf '\t')
+wifi_world() {   # wifi_world ACTIVE-CONNECTION
+    echo "wlp0s20f3:wifi" > "$MT/nm/devices"; printf 'tailscale0:tun\nlo:loopback\n' >> "$MT/nm/devices"
+    echo enabled > "$MT/nm/radio"
+    printf '%s\n' "$1" > "$MT/nm/active"
+    cat > "$MT/nm/profiles" <<EOF
+HomeNet${T}HomeNet${T}wpa-psk${T}hunter2${T}802-11-wireless
+Lab${T}Lab-5G${T}wpa-psk${T}labpass${T}802-11-wireless
+Cafe:Free${T}Cafe:Free${T}wpa-psk${T}latte${T}802-11-wireless
+Wired 1${T}${T}${T}${T}802-3-ethernet
+EOF
+    cat > "$MT/nm/scan" <<'EOF'
+*:72:WPA2:HomeNet
+ :90:WPA2:Lab-5G
+ :40:WPA2:Lab-5G
+ :55::Airport Free
+ :30:WPA1 WPA2:Neighbor
+ :65:WPA2 802.1X:eduroam
+ :50::
+ :15:WPA2:Cafe\:Free
+EOF
+}
+wm() { sx wifi-menu; labels=$(cat "$MT/picker-items" 2>/dev/null | tr '\n' ';'); }
+rm -rf "$work/tmp"/*; reset; wifi_world HomeNet; pick CANCEL; wm
+first=$(head -n 1 "$MT/picker-items"); order=$(sed -n '2,7p' "$MT/picker-items" | sed 's/  ✓ connected$//; s/^.*  //' | tr '\n' '|')
+case "$first" in *"Disconnect HomeNet") r=0 ;; *) r=1 ;; esac; check "wifi-menu: Disconnect <active> comes first" $r "$first"
+[ "$order" = "Lab-5G|HomeNet|eduroam|Airport Free|Neighbor|Cafe:Free|" ]; check "wifi-menu: strongest first, one line per SSID, hidden SSIDs left out, escaped colon shown plain" $? "$order"
+grep -q 'HomeNet  ✓ connected$' "$MT/picker-items" && [ "$(grep -c '✓' "$MT/picker-items")" = 1 ]; check "wifi-menu: only the active network is marked connected" $? "$labels"
+grep -q '^󰤢    Airport Free$' "$MT/picker-items" && grep -q '^󰤨 󰌾  Lab-5G$' "$MT/picker-items"; check "wifi-menu: signal bars, lock only on secured networks" $? "$labels"
+tail -n 3 "$MT/picker-items" | grep -q Rescan && tail -n 1 "$MT/picker-items" | grep -q 'Edit connections'; check "wifi-menu: rescan, wifi off and the editor at the end" $? "$labels"
+! has "nmcli [con] [up]" && ! has "[connect]"; check "wifi-menu: cancel does nothing" $? "$(calls)"
+[ -z "$(/bin/ls -A "$work/tmp")" ]; check "wifi-menu: leaves no temp files after a cancel" $? "$(/bin/ls -A "$work/tmp")"
+
+reset; wifi_world HomeNet; pick "Lab-5G"; wm
+has "nmcli [con] [up] [id] [Lab]" && has "notify-send [-a] [Wi-Fi] [-i] [network-wireless] [Connected to Lab-5G]"; check "wifi-menu: a saved network connects through its profile (found by SSID)" $? "$(calls)"
+reset; wifi_world HomeNet; echo 4 > "$MT/rc/nmcli.up"; pick "Lab-5G"; wm
+has "[-u] [critical] [Couldn't connect to Lab-5G] [Error: Connection activation failed: Secrets were required, but not provided.]"; check "wifi-menu: a failed profile shows the error" $? "$(calls)"
+reset; wifi_world HomeNet; pick "HomeNet  ✓"; wm
+! has "[con] [up]" && ! has "[connect]"; check "wifi-menu: picking the network already connected does nothing" $? "$(calls)"
+reset; wifi_world HomeNet; pick "Airport Free"; wm
+has "nmcli [dev] [wifi] [connect] [Airport Free] [ifname] [wlp0s20f3]" && has "[Connected to Airport Free (open network)]" && ! has "[ask]"; check "wifi-menu: an open network connects without a password" $? "$(calls)"
+reset; wifi_world HomeNet; pick "Neighbor"; answer "ok:p@ss word;\"x"; wm
+has "[picker] [ask]" && has "[Password for Neighbor] [true]" && has "nmcli [dev] [wifi] [connect] [Neighbor] [password] [p@ss word;\"x] [ifname] [wlp0s20f3]"
+check "wifi-menu: a new secured network asks for a hidden password and connects with it" $? "$(calls)"
+reset; wifi_world HomeNet; pick "Neighbor"; answer cancel; wm
+! has "[connect]"; check "wifi-menu: cancelling the password connects nothing" $? "$(calls)"
+reset; wifi_world HomeNet; pick "Neighbor"; answer "ok:wrong"; echo 4 > "$MT/rc/nmcli.connect"; wm
+has "nmcli [con] [delete] [id] [Neighbor]" && has "[critical] [Couldn't connect to Neighbor]"; check "wifi-menu: a failed new connection deletes the half-made profile" $? "$(calls)"
+reset; wifi_world HomeNet; pick "eduroam"; wm
+has "nm-connection-editor" && has "[eduroam needs a username and certificate settings]" && ! has "[ask]"; check "wifi-menu: 802.1X without a profile opens the editor" $? "$(calls)"
+reset; wifi_world HomeNet; pick "Disconnect"; wm
+has "nmcli [dev] [disconnect] [wlp0s20f3]" && has "[Disconnected from HomeNet]"; check "wifi-menu: Disconnect" $? "$(calls)"
+reset; wifi_world HomeNet; pick "Turn Wi-Fi off"; wm
+has "nmcli [radio] [wifi] [off]" && has "[Wi-Fi off]"; check "wifi-menu: Turn Wi-Fi off" $? "$(calls)"
+reset; wifi_world HomeNet; echo disabled > "$MT/nm/radio"; pick "Turn Wi-Fi on"; wm
+[ "$(wc -l < "$MT/picker-items")" = 2 ] && has "nmcli [radio] [wifi] [on]" && ! has "[list]"; check "wifi-menu: radio off offers only Turn on and the editor" $? "$labels"
+reset; wifi_world HomeNet; pick "Rescan" CANCEL; wm
+has "nmcli [dev] [wifi] [rescan]" && [ "$(count '[picker] [open]')" = 2 ]; check "wifi-menu: Rescan rescans and opens the menu again" $? "$(calls)"
+reset; rm -rf "$work/tmp"/*; wifi_world HomeNet; pick "Rescan" CANCEL; wm
+[ -z "$(/bin/ls -A "$work/tmp")" ]; check "wifi-menu: Rescan leaves no temp dir behind (exec skips the EXIT trap)" $? "left: $(/bin/ls -A "$work/tmp" | tr '\n' ' ')"
+rm -rf "$work/tmp"/*
+reset; wifi_world HomeNet; touch "$MT/qs-picker-down"; pick "Neighbor"; answer "ok:secret"; wm
+has "fuzzel [--dmenu] [--no-sort]" && has "[--index]" && has "[--password]" && has "nmcli [dev] [wifi] [connect] [Neighbor] [password] [secret]"
+check "wifi-menu: fuzzel fallback for the list (by index) and the password" $? "$(calls)"
+reset; echo "eth0:ethernet" > "$MT/nm/devices"; wm
+[ "$rc" = 1 ] && has "[No Wi-Fi device found]" && ! has fuzzel && ! has picker; check "wifi-menu: no Wi-Fi device says so" $? "rc=$rc $(calls)"
+reset; wifi_world "Cafe:Free"; pick CANCEL; wm
+grep -q 'Cafe:Free  ✓ connected$' "$MT/picker-items" && grep -q 'Disconnect Cafe:Free$' "$MT/picker-items"
+check "wifi-menu: connected to an SSID with a colon, it is marked and named right" $? "$labels"
+reset; wifi_world HomeNet; pick "Cafe:Free"; wm
+has "nmcli [con] [up] [id] [Cafe:Free]" && ! has "[ask]"; check "wifi-menu: a saved network whose name has a colon reuses its profile" $? "$(grep -E 'con|connect|ask' "$MT/calls" | tr '\n' ';')"
+
+# ================= wifi-qr =================
+echo "case: wifi-qr"
+qr() {   # qr NAME SSID KEY-MGMT PSK
+    reset
+    printf 'Wired 1\t802-3-ethernet\n%s\t802-11-wireless\n' "$1" > "$MT/nm/active-cons"
+    printf '%s\t%s\t%s\t%s\t802-11-wireless\n' "$1" "$2" "$3" "$4" > "$MT/nm/profiles"
+    rm -f "$work/rt/wifi-qr.png"
+    sx wifi-qr
+    uri=$(grep '^qrencode' "$MT/calls" | sed 's/.*\] \[//; s/\]$//')
+}
+qr "HomeNet" "HomeNet" "wpa-psk" "hunter2"
+[ "$uri" = 'WIFI:T:WPA;S:HomeNet;P:hunter2;;' ]; check "wifi-qr: plain WPA network" $? "$uri"
+has "qrencode [-s] [8] [-m] [2] [-o] [$work/rt/wifi-qr.png]" && [ "$(sed -n 1p "$MT/stdout")" = "$work/rt/wifi-qr.png" ] && [ "$(sed -n 2p "$MT/stdout")" = hunter2 ]
+check "wifi-qr: writes into XDG_RUNTIME_DIR, prints the path then the password" $? "$(tr '\n' '|' < "$MT/stdout")"
+qr "Home6" "Home6" "sae" "pw"
+[ "$uri" = 'WIFI:T:SAE;S:Home6;P:pw;;' ]; check "wifi-qr: WPA3 (sae) says SAE" $? "$uri"
+qr "Airport" "Airport" "" ""
+[ "$uri" = 'WIFI:T:nopass;S:Airport;;' ] && [ "$(sed -n 2p "$MT/stdout")" = "" ]; check "wifi-qr: open network is nopass with no P: field" $? "$uri"
+qr "Odd" 'My;Net,"x"' "wpa-psk" 'p;a,s"s'
+[ "$uri" = 'WIFI:T:WPA;S:My\;Net\,\"x\";P:p\;a\,s\"s;;' ]; check "wifi-qr: escapes ; , and \" in SSID and password" $? "$uri"
+qr "Cafe" 'Cafe:Free' "wpa-psk" 'a:b'
+[ "$uri" = 'WIFI:T:WPA;S:Cafe\:Free;P:a\:b;;' ]; check "wifi-qr: a colon in SSID/password is escaped once (nmcli -g already escapes it)" $? "$uri"
+qr "Back" 'C:\net' "wpa-psk" 'x\y'
+[ "$uri" = 'WIFI:T:WPA;S:C\:\\net;P:x\\y;;' ]; check "wifi-qr: a backslash is escaped once" $? "$uri"
+[ "$(sed -n 2p "$MT/stdout")" = 'x\y' ]; check "wifi-qr: the printed password is the real one (not nmcli-escaped)" $? "$(sed -n 2p "$MT/stdout")"
+qr "Cafe:Free" "Cafe:Free" "wpa-psk" "latte"
+[ "$rc" = 0 ] && [ "$uri" = 'WIFI:T:WPA;S:Cafe\:Free;P:latte;;' ]; check "wifi-qr: works when the connection name has a colon" $? "rc=$rc uri=$uri"
+reset; printf 'Wired 1\t802-3-ethernet\n' > "$MT/nm/active-cons"; : > "$MT/nm/profiles"; rm -f "$work/rt/wifi-qr.png"; sx wifi-qr
+[ "$rc" = 1 ] && ! has qrencode && [ ! -e "$work/rt/wifi-qr.png" ]; check "wifi-qr: not on Wi-Fi exits 1 and writes nothing" $? "rc=$rc $(calls)"
+
+# ================= color-pick, ocr-region =================
+echo "case: color-pick, ocr-region"
+reset; echo "#F56600" > "$MT/out/hyprpicker"; sx color-pick
+has "hyprpicker [-a] [-f] [hex]" && has "notify-send [-a] [Color picker] [-i] [color-select] [Copied #F56600] [<span background='#F56600'>            </span>]"
+check "color-pick: picks with autocopy and shows the colour" $? "$(calls)"
+reset; echo 1 > "$MT/rc/hyprpicker"; sx color-pick
+[ "$rc" = 0 ] && ! has notify-send; check "color-pick: cancelled pick shows nothing" $? "$(calls)"
+reset; echo "10,20 300x40" > "$MT/out/slurp"; printf 'Hello OCR world   \nsecond line\n\n\n\f' > "$MT/out/tesseract"; sx ocr-region
+[ "$(cat "$MT/stdin-wl-copy" 2>/dev/null)" = "$(printf 'Hello OCR world\nsecond line')" ] && has "grim [-g] [10,20 300x40] [-s] [2] [-]" && has "tesseract [stdin] [stdout] [--psm] [6]" && has "[Copied 5 words] [Hello OCR world second line…]"
+check "ocr-region: text trimmed (trailing spaces, blank lines, form feed) to the clipboard, word count shown" $? "$(od -c "$MT/stdin-wl-copy" 2>/dev/null | head -3 | tr '\n' ' ') $(calls)"
+reset; echo 1 > "$MT/rc/slurp"; sx ocr-region
+[ "$rc" = 0 ] && ! has grim && ! has notify-send; check "ocr-region: cancelled selection does nothing" $? "$(calls)"
+reset; echo "1,1 5x5" > "$MT/out/slurp"; printf '\n\f' > "$MT/out/tesseract"; sx ocr-region
+[ "$rc" = 1 ] && has "[No text found in that region]" && ! has wl-copy; check "ocr-region: no text found says so and copies nothing" $? "rc=$rc $(calls)"
+reset; rm "$S/tesseract"; sx ocr-region; ln -s "$share/stubs/rec" "$S/tesseract"
+[ "$rc" = 1 ] && has "[-u] [critical] [tesseract isn't installed]" && ! has slurp; check "ocr-region: missing tesseract says how to install it" $? "rc=$rc $(calls)"
+
+# ================= quickshell-start =================
+echo "case: quickshell-start"
+reset; sx quickshell-start
+[ "$rc" = 0 ] && has "pkill [-x] [mako]" && has "[bar] [status]" && ! has setsid; check "quickshell-start: already running: stops mako, starts nothing" $? "rc=$rc $(calls)"
+reset; echo 1 > "$MT/bar-up-after"; cp "$share/stubs/nixGLIntel" "$GL"; chmod +x "$GL"; touch "$MT/setsid-run"; sx quickshell-start
+[ "$rc" = 0 ] && has "setsid [-f] [uwsm] [app] [--] [sh] [-c]" && has "[sh] [$GL] [$QS] [-n] [--no-color] {QT_QUICK_BACKEND=}" && has "nixGLIntel [$QS] [-n] [--no-color]" && [ "$(count '[bar] [status]')" = 2 ] && ! has hyprpaper
+check "quickshell-start: starts qs through nixGLIntel and uwsm, then sees it up" $? "rc=$rc $(calls)"
+printf '  INFO: config loaded\n<4>  WARN qml: something odd\n<3>  ERROR boom\n<2>CRIT the end\n<2>FATAL really\n' > "$MT/want"
+has "systemd-cat [-t] [quickshell]" && cmp -s "$MT/want" "$MT/stdin-systemd-cat"; check "quickshell-start: Quickshell's output goes to the journal, WARN/ERROR/CRIT/FATAL at their priorities" $? "$(tr '\n' '|' < "$MT/stdin-systemd-cat" 2>/dev/null)"
+reset; echo 99 > "$MT/bar-up-after"; rm -f "$GL"; echo 1 > "$MT/rc/pgrep"; sx quickshell-start
+[ "$rc" = 1 ] && has "{QT_QUICK_BACKEND=software}" && [ "$(count 'sleep [1]')" = 12 ] && has "pgrep [-x] [hyprpaper]" && has "setsid [-f] [uwsm] [app] [--] [hyprpaper]"
+check "quickshell-start: no nixGL = software rendering; never up = hyprpaper after 12 s, exit 1" $? "rc=$rc $(calls)"
+reset; echo 99 > "$MT/bar-up-after"; sx quickshell-start
+has "pgrep [-x] [hyprpaper]" && ! has "[--] [hyprpaper]"; check "quickshell-start: hyprpaper already running is left alone" $? "$(calls)"
+reset; rm -f "$QS"; echo 1 > "$MT/rc/pgrep"; sx quickshell-start; install_qs
+[ "$rc" = 1 ] && has "notify-send [-u] [critical] [Quickshell is not installed]" && has "[--] [hyprpaper]" && ! has pkill; check "quickshell-start: not installed says so and puts up hyprpaper" $? "rc=$rc $(calls)"
+
+# ================= run-logged =================
+echo "case: run-logged"
+reset; sx run-logged 'echo out; echo err >&2; true'
+[ "$rc" = 0 ] && ! has logger && [ ! -s "$MT/stdout" ]; check "run-logged: success logs nothing and prints nothing" $? "rc=$rc $(calls)"
+reset; sx run-logged 'echo out; echo first >&2; echo oops >&2; exit 3'
+[ "$rc" = 3 ] && has "logger [-t] [run-logged] [-p] [user.warning]" && [ "$(cat "$MT/stdin-logger")" = "exit 3: echo out; echo first >&2; echo oops >&2; exit 3 | first oops " ] && [ ! -s "$MT/stdout" ]
+check "run-logged: failure (one shell string) logs exit status, command and stderr; exit status kept" $? "rc=$rc log=$(cat "$MT/stdin-logger" 2>/dev/null)"
+reset; sx run-logged sh -c 'i=0; while [ $i -lt 10 ]; do echo "line$i" >&2; i=$((i+1)); done; exit 1'
+case "$(cat "$MT/stdin-logger")" in "exit 1: i=0;"*"| line4 line5 line6 line7 line8 line9 ") r=0 ;; *) r=1 ;; esac
+check "run-logged: several arguments run as given; only the last 6 stderr lines" $r "$(cat "$MT/stdin-logger" 2>/dev/null)"
+reset; sx run-logged no-such-program --flag
+[ "$rc" = 127 ] && grep -q '^exit 127: no-such-program --flag | .*not found' "$MT/stdin-logger"; check "run-logged: a missing program logs 127" $? "rc=$rc $(cat "$MT/stdin-logger" 2>/dev/null)"
+reset; sx run-logged 'printf "no newline at the end" >&2; exit 2'
+grep -q 'exit 2: .* | no newline at the end' "$MT/stdin-logger"; check "run-logged: stderr without a final newline is still logged" $? "$(cat "$MT/stdin-logger" 2>/dev/null)"
+
+# ================= bar-refresh, notif-dnd, dnd-toggle, osd =================
+echo "case: bar-refresh, notif-dnd, dnd-toggle"
+reset; sx bar-refresh 9
+[ "$rc" = 0 ] && has "qs [ipc] [call] [bar] [refresh]"; check "bar-refresh: asks the bar to re-read" $? "$(calls)"
+reset; touch "$MT/qs-down"; sx bar-refresh 9
+[ "$rc" = 0 ]; check "bar-refresh: Quickshell down still exits 0" $? "rc=$rc"
+reset; rm -f "$QS"; sx bar-refresh; install_qs
+[ "$rc" = 0 ] && [ ! -s "$MT/calls" ]; check "bar-refresh: no Quickshell installed, silent exit 0" $? "rc=$rc $(calls)"
+reset; echo on > "$MT/dnd"; sx notif-dnd
+[ "$(cat "$MT/stdout")" = on ]; check "notif-dnd status: on" $? "$(cat "$MT/stdout")"
+reset; touch "$MT/qs-down"; sx notif-dnd status
+[ "$(cat "$MT/stdout")" = off ]; check "notif-dnd status: Quickshell down reads as off" $? "$(cat "$MT/stdout")"
+for a in "on:setDnd] [true" "off:setDnd] [false" "toggle:toggleDnd"; do
+    reset; sx notif-dnd "${a%%:*}"
+    has "qs [ipc] [call] [notif] [${a#*:}]"; check "notif-dnd ${a%%:*}" $? "$(calls)"
+done
+reset; sx notif-dnd bogus
+[ "$rc" = 2 ] && ! has qs; check "notif-dnd: unknown argument is a usage error (2)" $? "rc=$rc"
+json_ok() { python3 -I -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d["class"]==sys.argv[1] and d["text"] and "Notifications" in d["tooltip"] else 1)' "$1" < "$MT/stdout"; }
+reset; echo on > "$MT/dnd"; sx dnd-toggle status
+json_ok on; check "dnd-toggle status: valid JSON, class on" $? "$(cat "$MT/stdout")"
+reset; echo off > "$MT/dnd"; sx dnd-toggle status
+json_ok off; check "dnd-toggle status: valid JSON, class off" $? "$(cat "$MT/stdout")"
+reset; sx dnd-toggle
+grep -n . "$MT/calls" | grep -q "toggleDnd" && [ "$(grep -n 'toggleDnd' "$MT/calls" | cut -d: -f1)" -lt "$(grep -n '\[bar\] \[refresh\]' "$MT/calls" | cut -d: -f1)" ]
+check "dnd-toggle: toggles through notif-dnd, then refreshes the bar" $? "$(calls)"
+
+echo "case: osd"
+reset; echo "Volume: 0.65" > "$MT/out/wpctl.get-volume.@DEFAULT_AUDIO_SINK@"; sx osd vol
+has "qs [ipc] [call] [osd] [level] [vol] [Volume 65%] [65]" && ! has notify-send; check "osd vol: Quickshell popup with the percentage" $? "$(calls)"
+reset; echo "Volume: 0.40 [MUTED]" > "$MT/out/wpctl.get-volume.@DEFAULT_AUDIO_SINK@"; sx osd vol
+has "[osd] [level] [vol] [Muted] [40]"; check "osd vol: muted" $? "$(calls)"
+reset; touch "$MT/qs-down"; echo "Volume: 0.656" > "$MT/out/wpctl.get-volume.@DEFAULT_AUDIO_SINK@"; sx osd vol
+has "notify-send [-a] [osd] [-t] [1500] [-i] [audio-volume-high] [-h] [string:x-canonical-private-synchronous:osd-vol] [-h] [int:value:66] [Volume 66%]"
+check "osd vol: fallback notification with a progress value, replacing the last one" $? "$(calls)"
+reset; echo "Volume: 1.00 [MUTED]" > "$MT/out/wpctl.get-volume.@DEFAULT_AUDIO_SOURCE@"; sx osd mic
+has "[osd] [level] [mic] [Microphone muted] [-1]"; check "osd mic: muted, no level (-1)" $? "$(calls)"
+reset; touch "$MT/qs-down"; echo "Volume: 1.00" > "$MT/out/wpctl.get-volume.@DEFAULT_AUDIO_SOURCE@"; sx osd mic
+has "notify-send [-a] [osd] [-t] [2000] [-i] [audio-input-microphone] [-h] [string:x-canonical-private-synchronous:osd-mic] [Microphone on]" && ! has "int:value"
+check "osd mic: fallback without a progress bar" $? "$(calls)"
+reset; echo 300 > "$MT/out/brightnessctl.get"; echo 1000 > "$MT/out/brightnessctl.max"; sx osd bright
+has "[osd] [level] [bright] [Brightness 30%] [30]"; check "osd bright: rounds cur/max to a percentage" $? "$(calls)"
+reset; printf '1: phy0: Wireless LAN\n\tSoft blocked: yes\n\tHard blocked: no\n' > "$MT/out/rfkill"; sx osd airplane
+has "rfkill [list] [wlan]" && has "[osd] [level] [airplane] [Airplane mode on] [-1]"; check "osd airplane: reads rfkill (on)" $? "$(calls)"
+reset; printf '1: phy0: Wireless LAN\n\tSoft blocked: no\n\tHard blocked: no\n' > "$MT/out/rfkill"; touch "$MT/qs-down"; sx osd airplane
+has "[-i] [network-wireless] [-h] [string:x-canonical-private-synchronous:osd-airplane] [Airplane mode off]"; check "osd airplane: off, fallback" $? "$(calls)"
+reset; sx osd touchpad off
+has "[osd] [level] [touchpad] [Touchpad off] [-1]"; check "osd touchpad off" $? "$(calls)"
+
+# ================= theme-by-time =================
+echo "case: theme-by-time"
+mkdir -p "$H/.config/hypr"
+printf 'profile {\n    time = 7:00\n    identity = true\n}\n\nprofile {\n    time = 21:30\n    temperature = 4500\n}\n' > "$H/.config/hypr/hyprsunset.conf"
+tst="$work/state/theme-by-time"; rm -f "$tst"
+tbt() { reset; sx FAKE_NOW="$1" theme-by-time; }
+tbt "2026-11-18 12:00"
+has "cosmic-theme-toggle [light]" && [ "$(cat "$tst")" = "2026-11-18 light" ] && grep -q 'switched to light' "$MT/stdout"; check "theme-by-time: midday, fresh state: switches to light" $? "$(calls) state=$(cat "$tst")"
+tbt "2026-11-18 15:00"
+! has cosmic-theme-toggle; check "theme-by-time: same period again leaves a manual toggle alone" $? "$(calls)"
+tbt "2026-11-18 21:29"
+! has cosmic-theme-toggle; check "theme-by-time: a minute before the dark time is still light" $? "$(calls)"
+tbt "2026-11-18 21:30"
+has "cosmic-theme-toggle [dark]" && [ "$(cat "$tst")" = "2026-11-18 dark" ]; check "theme-by-time: at the dark time switches to dark" $? "$(calls) state=$(cat "$tst")"
+tbt "2026-11-19 02:00"
+! has cosmic-theme-toggle && [ "$(cat "$tst")" = "2026-11-18 dark" ]; check "theme-by-time: after midnight it is still last night's period" $? "$(calls) state=$(cat "$tst")"
+tbt "2026-11-19 07:00"
+has "cosmic-theme-toggle [light]" && [ "$(cat "$tst")" = "2026-11-19 light" ]; check "theme-by-time: morning boundary switches to light" $? "$(calls) state=$(cat "$tst")"
+rm -f "$tst"; tbt "2026-11-19 00:09"
+has "cosmic-theme-toggle [dark]" && [ "$(cat "$tst")" = "2026-11-18 dark" ] && [ ! -s "$MT/stderr" ]; check "theme-by-time: 00:09 (leading zeros, not octal) is dark, yesterday's period" $? "$(calls) state=$(cat "$tst") err=$(cat "$MT/stderr")"
+printf 'profile {\n    time = 08:09\n    identity = true\n}\nprofile {\n    time = 19:08\n    temperature = 4000\n}\n' > "$H/.config/hypr/hyprsunset.conf"
+rm -f "$tst"; tbt "2026-11-19 08:09"
+has "cosmic-theme-toggle [light]" && [ ! -s "$MT/stderr" ]; check "theme-by-time: 08:09 / 19:08 profile times parse" $? "$(calls) err=$(cat "$MT/stderr")"
+printf 'profile {\n    time = 7:00\n    identity = true\n}\n' > "$H/.config/hypr/hyprsunset.conf"
+tbt "2026-11-19 12:00"
+[ "$rc" = 1 ] && ! has cosmic-theme-toggle && grep -q 'no light/dark profile times' "$MT/stderr"; check "theme-by-time: no dark profile is an error, no switch" $? "rc=$rc $(cat "$MT/stderr")"
+
+# ================= gtk-theme-follows-cosmic =================
+echo "case: gtk-theme-follows-cosmic"
+MODE="$H/.config/cosmic/com.system76.CosmicTheme.Mode/v1"; mkdir -p "$MODE"
+ln -s "$share/stubs/rec" "$H/.local/bin/hypr-theme-apply.stub"
+mv "$H/.local/bin/hypr-theme-apply" "$H/.local/bin/hypr-theme-apply.real"; mv "$H/.local/bin/hypr-theme-apply.stub" "$H/.local/bin/hypr-theme-apply"
+gs() { grep -c "^gsettings \[set\] \[org.gnome.desktop.interface\] \[$1\] \[$2\] {DCONF_PROFILE=$3}$" "$MT/calls"; }
+echo true > "$MODE/is_dark"; reset; sx gtk-theme-follows-cosmic once
+[ "$(gs gtk-theme adw-gtk3-dark '')" = 1 ] && [ "$(gs color-scheme prefer-dark '')" = 1 ] && [ "$(gs gtk-theme adw-gtk3-dark /usr/share/dconf/profile/cosmic)" = 1 ] && [ "$(gs color-scheme prefer-dark /usr/share/dconf/profile/cosmic)" = 1 ] && has "hypr-theme-apply [dark]" && ! has inotifywait
+check "gtk-theme-follows-cosmic once: dark sets theme + scheme in both dconf profiles, runs hypr-theme-apply dark, no watch" $? "$(calls)"
+if [ -d /usr/share/icons/Papirus-Dark ]; then echo "case: (Papirus is installed system-wide; icon-theme skip check not run)"
+else ! has icon-theme; check "gtk-theme-follows-cosmic: no Papirus installed, icon theme left alone" $? "$(calls)"; fi
+mkdir -p "$H/.local/share/icons/Papirus-Light"; echo false > "$MODE/is_dark"; reset; sx gtk-theme-follows-cosmic once
+[ "$(gs gtk-theme adw-gtk3 '')" = 1 ] && [ "$(gs color-scheme prefer-light /usr/share/dconf/profile/cosmic)" = 1 ] && [ "$(gs icon-theme Papirus-Light '')" = 1 ] && ! grep -q 'icon-theme.*cosmic' "$MT/calls" && has "hypr-theme-apply [light]"
+check "gtk-theme-follows-cosmic once: light, Papirus-Light icons in the default profile only" $? "$(calls)"
+rm -f "$MODE/is_dark"; reset; sx gtk-theme-follows-cosmic once
+[ "$(gs gtk-theme adw-gtk3 '')" = 1 ]; check "gtk-theme-follows-cosmic: no is_dark file means light" $? "$(calls)"
+echo true > "$MODE/is_dark"; reset
+printf '%s/ CLOSE_WRITE,CLOSE is_dark\n%s/ MOVED_TO other\n%s/ MOVED_TO is_dark\n' "$MODE" "$MODE" "$MODE" > "$MT/out/inotifywait"
+sx gtk-theme-follows-cosmic
+has "inotifywait [-m] [-q] [-e] [close_write] [-e] [moved_to] [$MODE]" && [ "$(count 'hypr-theme-apply [dark]')" = 3 ] && [ "$rc" = 0 ]
+check "gtk-theme-follows-cosmic: watches the mode directory and applies on each is_dark event only" $? "rc=$rc $(calls)"
+mv "$H/.local/bin/hypr-theme-apply" "$H/.local/bin/hypr-theme-apply.stub"; mv "$H/.local/bin/hypr-theme-apply.real" "$H/.local/bin/hypr-theme-apply"
+
+# ================= wallpaper-follows-theme =================
+echo "case: wallpaper-follows-theme"
+BG="$H/.config/cosmic/com.system76.CosmicBackground/v1/all"; mkdir -p "${BG%/*}"
+LIGHT="/usr/share/backgrounds/System76-Geometric-adapted_by_Kate_Hazen_of_System76.png"; DARK="$H/.local/share/backgrounds/System76-Geometric-dark.png"
+bgfile() { printf '(\n    output: "all",\n    source: Path("%s"),\n    filter_by_theme: true,\n    rotation_frequency: 300,\n)\n' "$1" > "$BG"; }
+echo true > "$MODE/is_dark"; bgfile /old/pic.png; reset; sx XDG_CURRENT_DESKTOP=COSMIC wallpaper-follows-theme once
+grep -qF "source: Path(\"$DARK\")," "$BG" && [ "$(wc -l < "$BG")" = 6 ] && grep -q 'rotation_frequency: 300' "$BG"; check "wallpaper-follows-theme: dark rewrites only the source line" $? "$(tr '\n' ' ' < "$BG")"
+echo false > "$MODE/is_dark"; reset; sx XDG_CURRENT_DESKTOP=COSMIC wallpaper-follows-theme once
+grep -qF "source: Path(\"$LIGHT\")," "$BG"; check "wallpaper-follows-theme: light puts the light picture back" $? "$(tr '\n' ' ' < "$BG")"
+ino=$(stat -c %i "$BG"); reset; sx XDG_CURRENT_DESKTOP=COSMIC wallpaper-follows-theme once
+[ "$rc" = 0 ] && [ "$(stat -c %i "$BG")" = "$ino" ] && [ ! -s "$MT/stderr" ]; check "wallpaper-follows-theme: already right leaves the file untouched" $? "rc=$rc $(cat "$MT/stderr")"
+rm -f "$BG"; reset; sx XDG_CURRENT_DESKTOP=COSMIC wallpaper-follows-theme once
+[ "$rc" = 0 ] && [ ! -e "$BG" ]; check "wallpaper-follows-theme: no cosmic-bg config, nothing created" $? "rc=$rc"
+mkdir -p "$H/.config/hypr"; printf 'preload = /x.png\nwallpaper {\n    monitor =\n    path = /old.png\n    fit_mode = cover\n}\n' > "$H/.config/hypr/hyprpaper.conf"
+echo true > "$MODE/is_dark"; bgfile /old/pic.png; reset; sx XDG_CURRENT_DESKTOP=Hyprland wallpaper-follows-theme once
+grep -qx "    path = $DARK" "$H/.config/hypr/hyprpaper.conf" && has "hyprctl [hyprpaper] [wallpaper] [,$DARK]" && grep -qF 'Path("/old/pic.png")' "$BG"
+check "wallpaper-follows-theme: under Hyprland rewrites hyprpaper.conf and swaps live, cosmic-bg untouched" $? "$(calls) $(grep path "$H/.config/hypr/hyprpaper.conf")"
+reset; printf '%s/ CLOSE_WRITE,CLOSE is_dark\n%s/ CLOSE_WRITE,CLOSE x\n' "$MODE" "$MODE" > "$MT/out/inotifywait"; sx XDG_CURRENT_DESKTOP=Hyprland wallpaper-follows-theme
+has "inotifywait [-m] [-q] [-e] [close_write] [-e] [moved_to] [$MODE]" && [ "$(count 'hyprctl [hyprpaper]')" = 2 ]; check "wallpaper-follows-theme: watch loop applies on is_dark events" $? "$(calls)"
+
+# ================= hypr-theme-apply =================
+echo "case: hypr-theme-apply"
+C="$H/.config"; mkdir -p "$C/fuzzel" "$C/btop/themes" "$C/gtk-3.0" "$C/gtk-4.0" "$C/qt5ct/colors" "$C/qt6ct/colors"
+touch "$C/qt5ct/colors/ClemsonDark.conf" "$C/qt5ct/colors/ClemsonLight.conf"
+printf '[Appearance]\ncolor_scheme_path=x\nicon_theme=Papirus-Light\nstyle=Fusion\n' > "$C/qt5ct/qt5ct.conf"
+echo "real css" > "$C/gtk-4.0/gtk.css"
+lnk() { readlink "$1" 2>/dev/null; }
+reset; sx XDG_CURRENT_DESKTOP=Hyprland hypr-theme-apply dark
+[ "$rc" = 0 ] && [ "$(lnk "$C/fuzzel/colors.ini")" = colors-dark.ini ] && [ "$(lnk "$C/btop/themes/clemson.theme")" = clemson-dark.theme ] && [ "$(lnk "$C/gtk-3.0/gtk.css")" = accent-dark.css ]
+check "hypr-theme-apply dark: fuzzel, btop and GTK accent links point at dark" $? "rc=$rc fuzzel=$(lnk "$C/fuzzel/colors.ini") btop=$(lnk "$C/btop/themes/clemson.theme") gtk3=$(lnk "$C/gtk-3.0/gtk.css")"
+[ ! -L "$C/gtk-4.0/gtk.css" ] && [ "$(cat "$C/gtk-4.0/gtk.css")" = "real css" ]; check "hypr-theme-apply: a real gtk.css is left alone" $? "$(/bin/ls -l "$C/gtk-4.0")"
+[ "$(lnk "$C/qt5ct/colors/Clemson.conf")" = ClemsonDark.conf ] && grep -qx 'icon_theme=Papirus-Dark' "$C/qt5ct/qt5ct.conf" && grep -qx 'style=Fusion' "$C/qt5ct/qt5ct.conf" && [ ! -e "$C/qt6ct/colors/Clemson.conf" ]
+check "hypr-theme-apply dark: qt5ct scheme + icon theme flipped, qt6ct without schemes skipped" $? "$(lnk "$C/qt5ct/colors/Clemson.conf") $(grep icon "$C/qt5ct/qt5ct.conf")"
+echo false > "$MODE/is_dark"; reset; sx XDG_CURRENT_DESKTOP=Hyprland hypr-theme-apply
+[ "$(lnk "$C/fuzzel/colors.ini")" = colors-light.ini ] && [ "$(lnk "$C/gtk-3.0/gtk.css")" = accent-light.css ] && [ "$(lnk "$C/qt5ct/colors/Clemson.conf")" = ClemsonLight.conf ] && grep -qx 'icon_theme=Papirus-Light' "$C/qt5ct/qt5ct.conf"
+check "hypr-theme-apply (no argument) follows is_dark: light" $? "$(lnk "$C/fuzzel/colors.ini") $(lnk "$C/gtk-3.0/gtk.css")"
+reset; sx XDG_CURRENT_DESKTOP=COSMIC hypr-theme-apply dark
+[ "$(lnk "$C/fuzzel/colors.ini")" = colors-dark.ini ] && [ "$(lnk "$C/gtk-3.0/gtk.css")" = accent-light.css ] && [ "$(lnk "$C/qt5ct/colors/Clemson.conf")" = ClemsonLight.conf ]
+check "hypr-theme-apply under COSMIC: fuzzel follows, GTK/Qt files left to COSMIC" $? "$(lnk "$C/fuzzel/colors.ini") $(lnk "$C/gtk-3.0/gtk.css")"
+reset; sx XDG_CURRENT_DESKTOP=Hyprland hypr-theme-apply purple
+[ "$rc" = 2 ] && [ "$(lnk "$C/fuzzel/colors.ini")" = colors-dark.ini ]; check "hypr-theme-apply: a bad mode is a usage error and changes nothing" $? "rc=$rc"
+
+echo "RESULT pass $pass fail $fail"
+[ "$fail" = 0 ]

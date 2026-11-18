@@ -291,7 +291,8 @@ ShellRoot {
     IpcHandler {
         target: "charge"        // Charge.qml: battery charge limit (asks for the password through polkit)
         function status(): string { return Charge.status() }
-        function set(name: string): void { Charge.set(name) }       // full_charge | balanced | max_lifespan
+        function set(name: string): void { Charge.set(name) }       // full_charge | balanced | max_lifespan | cap
+        function toggle(): void { Charge.toggle() }                 // full charge <-> the docked cap
         function next(): void { Charge.next() }
     }
     IpcHandler {

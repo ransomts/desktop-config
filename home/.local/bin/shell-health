@@ -211,7 +211,7 @@ TIMERS = [
          period=2 * MIN, floor=15 * MIN, streak="pull-mail", bad_at=2, net=True),
     dict(id="pull-calendars", name="Calendar sync", timer="pull-calendars.timer", service="pull-calendars.service",
          period=10 * MIN, floor=30 * MIN, streak="pull-calendars", bad_at=6, warn_at=3, net=True),
-    dict(id="push-roam", name="Notes push to sasquatch", timer="push-roam.timer", service="push-roam.service",
+    dict(id="push-roam", name="Notes push to homeserver", timer="push-roam.timer", service="push-roam.service",
          period=10 * MIN, floor=30 * MIN, streak="push-roam", bad_at=2, net=True),
     dict(id="calibre-backup", name="Calibre database backup", timer="calibre-db-backup.timer",
          service="calibre-db-backup.service", period=7 * D, net=False,

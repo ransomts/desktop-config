@@ -1,0 +1,6 @@
+#!/bin/sh
+# Stand-in agenda-day for LockNext (LOCK_AGENDA, qml-overlays-test). $QO_FIX/agenda-empty: no events.
+# Otherwise two timed events and an all-day one on any date asked for.
+echo "agenda $*" >> "$QO_CALLS"
+[ -e "$QO_FIX/agenda-empty" ] && { echo "[]"; exit 0; }
+printf '[{"date":"%s","start":"10:00","end":"11:00","title":"Secret budget meeting"},{"date":"%s","start":"14:30","end":"15:00","title":"Dentist"},{"date":"%s","allday":true,"title":"Holiday"}]\n' "$1" "$1" "$1"

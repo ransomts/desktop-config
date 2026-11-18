@@ -5,6 +5,8 @@
 #   charge-profile list              {"full_charge":{"title":"Full Charge","start":90,"end":100}, ...}
 #   charge-profile set NAME          full_charge | balanced | max_lifespan, then a popup with the result
 #   charge-profile next              the next one in that order, wrapping
+#   charge-profile set cap           the docked cap: custom thresholds, 70-80 unless CHARGE_CAP="START END"
+#   charge-profile toggle            full charge when any limit is on, otherwise the cap
 #
 # Setting a profile needs authorisation (polkit action com.system76.powerdaemon.set-charge-thresholds is
 # auth_admin): the desktop's polkit agent asks for the password and the command waits for it, up to
@@ -13,6 +15,8 @@
 # CHARGE_NOTIFY=0 turns the popup off (tests).
 bin=${SYSTEM76_POWER:-system76-power}
 order="full_charge balanced max_lifespan"
+cap=${CHARGE_CAP:-70 80}
+case "$cap" in [0-9]*" "[0-9]*) ;; *) cap="70 80" ;; esac
 
 popup() {
     [ "${CHARGE_NOTIFY:-1}" = 0 ] && return 0
@@ -27,7 +31,7 @@ status() {
         /^Profile:/ { if (match($0, /\([a-z_]+\)/)) p = substr($0, RSTART + 1, RLENGTH - 2) }
         /^Start:/   { s = $2 }
         /^End:/     { e = $2 }
-        END { if (s == "" || e == "") exit 1; if (p == "") p = "custom"; printf "{\"profile\":\"%s\",\"start\":%d,\"end\":%d}\n", p, s, e }'
+        END { if (s == "" || e == "") exit 1; if (p == "") p = "custom"; printf "{\"profile\":\"%s\",\"start\":%d,\"end\":%d,\"capto\":%d}\n", p, s, e, capto }' capto="${cap#* }"
 }
 
 list() {
@@ -49,15 +53,17 @@ plain() {
         full_charge)  echo "Full charge" ;;
         balanced)     echo "Balanced (stops at ${2}%)" ;;
         max_lifespan) echo "Longest life (stops at ${2}%)" ;;
-        *)            echo "Custom (stops at ${2}%)" ;;
+        *)            echo "Stops at ${2}%" ;;
     esac
 }
 
 field() { printf '%s' "$1" | sed -n "s/.*\"$2\":\"\{0,1\}\([a-z_0-9]*\).*/\1/p"; }
 
 set_profile() {
-    case " $order " in *" $1 "*) ;; *) echo "charge-profile: unknown profile '$1' (full_charge, balanced, max_lifespan)" >&2; return 2 ;; esac
-    if timeout 120 "$bin" charge-thresholds --profile "$1" >/dev/null 2>&1; then
+    case " $order cap " in *" $1 "*) ;; *) echo "charge-profile: unknown profile '$1' (full_charge, balanced, max_lifespan, cap)" >&2; return 2 ;; esac
+    if [ "$1" = cap ]; then how=$cap; else how="--profile $1"; fi
+    # shellcheck disable=SC2086  # $how is two words on purpose
+    if timeout 120 "$bin" charge-thresholds $how >/dev/null 2>&1; then
         now=$(status) || { popup "Charge limit set"; return 0; }
         popup "Charge limit: $(plain "$(field "$now" profile)" "$(field "$now" end)")"
         printf '%s\n' "$now"
@@ -81,5 +87,8 @@ case "$1" in
         done
         [ -n "$pick" ] || pick=full_charge      # custom thresholds: start the cycle at full
         set_profile "$pick" ;;
-    *) echo "usage: charge-profile status | list | set full_charge|balanced|max_lifespan | next" >&2; exit 2 ;;
+    toggle)
+        cur=$(status) || { echo "charge-profile: cannot read the current thresholds" >&2; exit 1; }
+        if [ "$(field "$cur" end)" -lt 100 ]; then set_profile full_charge; else set_profile cap; fi ;;
+    *) echo "usage: charge-profile status | list | set full_charge|balanced|max_lifespan|cap | next | toggle" >&2; exit 2 ;;
 esac

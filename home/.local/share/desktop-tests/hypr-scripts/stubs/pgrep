@@ -1,0 +1,5 @@
+#!/bin/sh
+# stub (hypr-scripts-test): `pgrep -x NAME` succeeds when NAME is a line of $W/procs
+echo "pgrep $*" >> "$CALLS"
+for a; do n=$a; done
+grep -qx "$n" "$W/procs" 2>/dev/null

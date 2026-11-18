@@ -1,0 +1,3 @@
+#!/bin/sh
+# stub (hypr-scripts-test): fake hyprctl over canned JSON in $FAKE_HYPR
+exec python3 -I "$(dirname "$0")/../fakehypr.py" hyprctl "$@"

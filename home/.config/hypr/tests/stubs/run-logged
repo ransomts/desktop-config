@@ -1,0 +1,4 @@
+#!/bin/sh
+# hypr-test stub for ~/.local/bin/run-logged: every hl.exec_cmd goes through it; record, don't run.
+printf 'exec %s\n' "$*" >> "${HYPR_TEST_LOG:-/dev/null}"
+exit 0

@@ -1,0 +1,12 @@
+#!/bin/sh
+# Stand-in pam-check (qml-overlays-test): the lock screen's password check. "open sesame" is right,
+# "boom" is a check that could not run (exit 2), anything else is wrong (exit 1). Records the service
+# name and whether the line came on stdin (never the password itself).
+read -r pw
+case "$pw" in
+    "open sesame") r=0 ;;
+    boom) r=2 ;;
+    *) r=1 ;;
+esac
+echo "pam-check $* len=${#pw} exit=$r" >> "$QO_CALLS"
+exit $r

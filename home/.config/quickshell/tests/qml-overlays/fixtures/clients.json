@@ -1,0 +1,194 @@
+[
+ {
+  "address": "0x5600000000c0",
+  "mapped": true,
+  "hidden": false,
+  "visible": true,
+  "at": [
+   0,
+   0
+  ],
+  "size": [
+   800,
+   600
+  ],
+  "workspace": {
+   "id": 21,
+   "name": "21"
+  },
+  "floating": false,
+  "monitor": 0,
+  "class": "com.mitchellh.ghostty",
+  "title": "~/Code: ghostty",
+  "initialClass": "com.mitchellh.ghostty",
+  "initialTitle": "~/Code: ghostty",
+  "pid": 1002,
+  "xwayland": false,
+  "pinned": false,
+  "fullscreen": 0,
+  "grouped": [],
+  "tags": [],
+  "focusHistoryID": 2,
+  "stableId": "1"
+ },
+ {
+  "address": "0x5600000000a0",
+  "mapped": true,
+  "hidden": false,
+  "visible": true,
+  "at": [
+   0,
+   0
+  ],
+  "size": [
+   800,
+   600
+  ],
+  "workspace": {
+   "id": 11,
+   "name": "11"
+  },
+  "floating": false,
+  "monitor": 0,
+  "class": "firefox",
+  "title": "Course page \u2014 Mozilla Firefox",
+  "initialClass": "firefox",
+  "initialTitle": "Course page \u2014 Mozilla Firefox",
+  "pid": 1000,
+  "xwayland": false,
+  "pinned": false,
+  "fullscreen": 0,
+  "grouped": [],
+  "tags": [],
+  "focusHistoryID": 0,
+  "stableId": "1"
+ },
+ {
+  "address": "0x5600000000d0",
+  "mapped": true,
+  "hidden": false,
+  "visible": true,
+  "at": [
+   0,
+   0
+  ],
+  "size": [
+   800,
+   600
+  ],
+  "workspace": {
+   "id": -98,
+   "name": "-98"
+  },
+  "floating": false,
+  "monitor": 0,
+  "class": "zoom",
+  "title": "Zoom Meeting",
+  "initialClass": "zoom",
+  "initialTitle": "Zoom Meeting",
+  "pid": 1003,
+  "xwayland": false,
+  "pinned": false,
+  "fullscreen": 0,
+  "grouped": [],
+  "tags": [],
+  "focusHistoryID": 3,
+  "stableId": "1"
+ },
+ {
+  "address": "0x5600000000b0",
+  "mapped": true,
+  "hidden": false,
+  "visible": true,
+  "at": [
+   0,
+   0
+  ],
+  "size": [
+   800,
+   600
+  ],
+  "workspace": {
+   "id": 12,
+   "name": "12"
+  },
+  "floating": false,
+  "monitor": 0,
+  "class": "emacs",
+  "title": "lecture-07.org - Emacs",
+  "initialClass": "emacs",
+  "initialTitle": "lecture-07.org - Emacs",
+  "pid": 1001,
+  "xwayland": false,
+  "pinned": false,
+  "fullscreen": 0,
+  "grouped": [],
+  "tags": [],
+  "focusHistoryID": 1,
+  "stableId": "1"
+ },
+ {
+  "address": "0x5600000000e0",
+  "mapped": false,
+  "hidden": false,
+  "visible": true,
+  "at": [
+   0,
+   0
+  ],
+  "size": [
+   800,
+   600
+  ],
+  "workspace": {
+   "id": 11,
+   "name": "11"
+  },
+  "floating": false,
+  "monitor": 0,
+  "class": "firefox",
+  "title": "unmapped helper",
+  "initialClass": "firefox",
+  "initialTitle": "unmapped helper",
+  "pid": 1004,
+  "xwayland": false,
+  "pinned": false,
+  "fullscreen": 0,
+  "grouped": [],
+  "tags": [],
+  "focusHistoryID": 4,
+  "stableId": "1"
+ },
+ {
+  "address": "0x5600000000f0",
+  "mapped": true,
+  "hidden": false,
+  "visible": true,
+  "at": [
+   0,
+   0
+  ],
+  "size": [
+   800,
+   600
+  ],
+  "workspace": {
+   "id": 0,
+   "name": "0"
+  },
+  "floating": false,
+  "monitor": 0,
+  "class": "xwaylandvideobridge",
+  "title": "bridge",
+  "initialClass": "xwaylandvideobridge",
+  "initialTitle": "bridge",
+  "pid": 1005,
+  "xwayland": false,
+  "pinned": false,
+  "fullscreen": 0,
+  "grouped": [],
+  "tags": [],
+  "focusHistoryID": 5,
+  "stableId": "1"
+ }
+]

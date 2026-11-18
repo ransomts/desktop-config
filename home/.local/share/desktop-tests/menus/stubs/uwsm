@@ -1,0 +1,6 @@
+#!/bin/sh
+# uwsm stand-in: "uwsm app -- CMD..." runs CMD (setsid only calls this when asked to run).
+line=uwsm; for a in "$@"; do line="$line [$a]"; done
+printf '%s\n' "$line" >> "$MT/calls"
+[ "$1" = app ] && shift; [ "$1" = -- ] && shift
+exec "$@"

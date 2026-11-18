@@ -1,0 +1,14 @@
+#!/bin/sh
+# Recording stand-in (menus-test). Linked under many names; logs "NAME [arg] [arg]..." to $MT/calls.
+# Output: $MT/out/NAME.$1.$2, else NAME.$1, else NAME (cat'ed). Exit code: same lookup in $MT/rc.
+# Commands fed on stdin (wl-copy, logger, systemd-cat) append it to $MT/stdin-NAME.
+n=${0##*/}
+line=$n; for a in "$@"; do line="$line [$a]"; done
+case $n in
+    gsettings) line="$line {DCONF_PROFILE=${DCONF_PROFILE-}}" ;;
+esac
+printf '%s\n' "$line" >> "$MT/calls"
+case $n in wl-copy|logger|systemd-cat) cat >> "$MT/stdin-$n" ;; esac
+for k in "$n.$1.$2" "$n.$1" "$n"; do [ -f "$MT/out/$k" ] && { cat "$MT/out/$k"; break; }; done
+for k in "$n.$1.$2" "$n.$1" "$n"; do [ -f "$MT/rc/$k" ] && exit "$(cat "$MT/rc/$k")"; done
+exit 0

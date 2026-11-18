@@ -1,0 +1,205 @@
+#!/bin/sh
+# Tests for the bar's popups and the small Quickshell panel pieces no other suite covers: Mixer,
+# WifiList, BluetoothList, TeamsList, MediaCard, MediaPop, PowerMenu, BatteryWarn, ProfileList,
+# WallMenu, MsgIcon, Slider, ScriptSource; plus one pass that builds every Settings*.qml page on its
+# own (dark and light) and fails on any error it logs (settings-test does the deep page checks).
+#
+#   qml-panels-test             run everything; PASS/FAIL lines, then RESULT pass N fail M; exit 1 on a failure
+#   qml-panels-test -v          also print everything Quickshell logged
+#   qml-panels-test -d DIR      test the config in DIR instead of ~/.config/quickshell
+#   qml-panels-test -k          keep the temporary directory (printed)
+#
+# Each popup: rows from stub data (two outputs with one default, apps and two mics; four Wi-Fi
+# networks from a stub nmcli; a connected and a paired Bluetooth device; two Teams chats; two MPRIS
+# players), what its clicks call (recorded by a stub Sys.run / the stub objects), its empty state,
+# and the real Fit.qml check (nothing cut off) in dark and light, in a window drawn like Bar.qml's
+# PopupWindow at its width. Bar.qml's own pill wiring (click = list, right = quick action,
+# middle = app) is checked from its source, since the bar itself needs Hyprland.
+#
+# Isolation: the real files are copied into a temporary config next to the stubs in
+# tests/qml-panels (Sys, Pipewire, Bluetooth, UPower, WallState, Charge, SaverState and the
+# tests/settings stubs); Mixer/BluetoothList/BatteryWarn lose their Quickshell.Services import on
+# the way (the stubs stand in), WallMenu becomes a plain window. Offscreen Qt on a 1920x1080 test
+# screen, its own dbus session, temporary HOME/XDG dirs, no Wayland/X/Hyprland variables; nmcli,
+# qs, hyprctl and every command a page might start are recording stand-ins first on PATH.
+verbose=0; keep=0; src="$HOME/.config/quickshell"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) verbose=1 ;;
+        -d) src="$2"; shift ;;
+        -k) keep=1 ;;
+        *) echo "usage: qml-panels-test [-v] [-k] [-d CONFIG_DIR]" >&2; exit 2 ;;
+    esac
+    shift
+done
+qs="$HOME/.nix-profile/bin/qs"
+tests="$HOME/.config/quickshell/tests/qml-panels"
+[ -d "$src/tests/qml-panels" ] && tests="$src/tests/qml-panels"
+[ -x "$qs" ] && [ -f "$tests/shell.qml" ] || { echo "qml-panels-test: no qs, or no $tests/shell.qml" >&2; exit 2; }
+command -v python3 >/dev/null && command -v dbus-run-session >/dev/null || { echo "qml-panels-test: needs python3 and dbus-run-session" >&2; exit 2; }
+
+work=$(mktemp -d) || exit 2
+[ "$keep" = 1 ] && echo "keeping $work" || trap 'rm -rf "$work"' EXIT
+cfg="$work/cfg"; fake="$work/home"; pbin="$work/bin"; stubs="$work/stubs"; data="$work/data"
+mkdir -p "$cfg" "$pbin" "$stubs" "$data" "$work/state" "$work/cache" \
+         "$fake/.config/cosmic/com.system76.CosmicTheme.Mode/v1" "$fake/.config/shell" "$fake/.config/hypr" "$fake/.local/share" "$fake/.local/state" || exit 2
+mkdir -m 700 "$work/run"
+echo true > "$fake/.config/cosmic/com.system76.CosmicTheme.Mode/v1/is_dark"
+[ -e "$HOME/.local/share/fonts" ] && ln -s "$HOME/.local/share/fonts" "$fake/.local/share/fonts"
+printf 'listener {\n    timeout = 1800\n    on-timeout = loginctl lock-session\n}\n' > "$fake/.config/hypr/hypridle.conf"
+
+# ---- the real files ----
+under="Mixer WifiList BluetoothList TeamsList MediaCard MediaPop PowerMenu BatteryWarn ProfileList WallMenu MsgIcon Slider ScriptSource"
+for f in $under MenuRow Caption Theme Icons SaverRow Fit; do cp "$src/$f.qml" "$cfg/" || exit 2; done
+pages=""
+for f in "$src"/Settings*.qml; do
+    b=$(basename "$f" .qml)
+    cp "$f" "$cfg/" || exit 2
+    grep -q '^    pageId: "' "$f" && pages="$pages $b"
+done
+rm -f "$cfg/Settings.qml" "$cfg/SettingsBody.qml"       # the window and its body: settings-test's job
+for f in JsonFile.qml Profiles.qml ProfilesCore.qml FocusRow.qml Clocks.qml ClocksCore.qml clocks.js displays.js quiet.js "$src"/Displays*.qml; do
+    case "$f" in /*) cp "$f" "$cfg/" ;; *) cp "$src/$f" "$cfg/" ;; esac || exit 2
+done
+python3 - "$cfg" <<'PY' || exit 2
+import re, sys
+d = sys.argv[1]
+def edit(name, fn):
+    p = f"{d}/{name}"; s = open(p, encoding="utf-8").read(); t = fn(s)
+    if t == s: sys.exit(f"qml-panels-test: could not rewrite {name}")
+    open(p, "w", encoding="utf-8").write(t)
+# the Services modules are swapped for the stubs beside them
+edit("Mixer.qml", lambda s: s.replace("import Quickshell.Services.Pipewire\n", 'import "pwnodetype.js" as PwNodeType\n'))
+edit("BluetoothList.qml", lambda s: s.replace("import Quickshell.Bluetooth\n", ""))
+edit("BatteryWarn.qml", lambda s: s.replace("import Quickshell.Services.UPower\n", ""))
+# WallMenu: PanelWindow -> FloatingWindow, without the screen / layer-shell / focus-grab lines
+def unpanel(s):
+    s = s.replace("PanelWindow {", "FloatingWindow {", 1)
+    s = re.sub(r"\n    screen: \{\n.*?\n    \}\n", "\n", s, flags=re.S)
+    s = re.sub(r"\n    HyprlandFocusGrab \{\n.*?\n    \}\n", "\n", s, flags=re.S)
+    s = s.replace("import Quickshell.Wayland\n", "").replace("import Quickshell.Hyprland\n", "")
+    return "\n".join(l for l in s.split("\n") if "WlrLayershell." not in l and "exclusionMode" not in l)
+edit("WallMenu.qml", unpanel)
+w = open(f"{d}/WallMenu.qml", encoding="utf-8").read()
+if "Hyprland" in w or "PanelWindow" in w: sys.exit("qml-panels-test: WallMenu.qml still needs Hyprland after the rewrite")
+PY
+cp "$tests"/*.qml "$tests"/*.js "$cfg/" || exit 2
+
+# ---- fixtures ----
+python3 - "$data" <<'PY'
+import struct, sys, zlib
+def png(path, w=48, h=48):
+    raw = b"".join(b"\x00" + bytes([245, 102, 0, 255]) * w for _ in range(h))
+    chunk = lambda t, b: struct.pack(">I", len(b)) + t + b + struct.pack(">I", zlib.crc32(t + b) & 0xffffffff)
+    open(path, "wb").write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+                           + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+png(sys.argv[1] + "/art.png"); png(sys.argv[1] + "/qr.png", 200, 200)
+PY
+: > "$data/ss.ticks"; : > "$data/nmcli.out"; : > "$data/nmcli.log"
+echo '{"screens":[{"name":"TEST-1","x":0,"y":0,"width":1920,"height":1080,"logicalDpi":96,"logicalBaseDpi":96,"dpr":1}]}' > "$work/screen.json"
+
+# ---- stand-ins: every command anything here could start records its call and does nothing ----
+for c in notify-send systemctl busctl dbus-send gdbus bluetoothctl pactl wpctl wl-copy wl-paste grim slurp fuzzel curl wget ssh rsync mpc \
+         emacsclient playerctl brightnessctl loginctl system76-power blueman-manager nm-connection-editor pavucontrol pw-play tailscale uwsm sg dbus-monitor jq; do
+    printf '#!/bin/sh\necho "%s $*" >> "%s/calls"\n' "$c" "$work" > "$stubs/$c"
+done
+printf '#!/bin/sh\necho "nmcli $*" >> "%s/nmcli.log"\ncat "%s/nmcli.out"\n' "$data" "$data" > "$stubs/nmcli"
+printf '#!/bin/sh\necho "qs $*" >> "%s/calls"\n[ "$1" = --version ] && echo "Quickshell 0.0.0 (test stand-in)"\nexit 0\n' "$work" > "$stubs/qs"
+printf '#!/bin/sh\necho "hyprctl $*" >> "%s/calls"\ncase "$*" in "version -j") echo %s ;; *-j*) echo "[]" ;; esac\nexit 0\n' "$work" "'{\"tag\":\"v0.0.0-test\"}'" > "$stubs/hyprctl"
+# $PANELS_BIN: what Sys.bin points at
+printf '#!/bin/sh\necho "wifi-qr $*" >> "%s/calls"\necho "%s/qr.png"\necho "hunter2 secret"\n' "$work" "$data" > "$pbin/wifi-qr"
+printf '#!/bin/sh\necho "sunset-times $*" >> "%s/calls"\necho %s\n' "$work" "'{\"light\": \"07:00\", \"dark\": \"20:00\", \"temp\": 4500}'" > "$pbin/sunset-times"
+printf '#!/bin/sh\necho "palette $*" >> "%s/calls"\n[ "$1" = list ] && echo "* clemson          primary #f56600  secondary #522d80  the hand-made plan"\nexit 0\n' "$work" > "$pbin/palette"
+printf '#!/bin/sh\necho "input-settings $*" >> "%s/calls"\n[ "$1" = get ] && echo %s\nexit 0\n' "$work" "'{\"values\":{},\"saved\":{},\"deviceSaved\":{},\"devices\":[]}'" > "$pbin/input-settings"
+for c in wifi-menu anim-preset tz-now display-layout teams-unread run-logged charge-profile; do
+    printf '#!/bin/sh\necho "%s $*" >> "%s/calls"\n' "$c" "$work" > "$pbin/$c"
+done
+chmod +x "$stubs"/* "$pbin"/*
+
+# ---- Bar.qml's pill wiring, from its source ----
+echo "case: Bar.qml pill wiring (source)"
+ok=0; pass=0; fail=0
+pass() { echo "PASS $1"; pass=$((pass + 1)); }
+fail() { echo "FAIL $1   [$2]"; fail=$((fail + 1)); ok=1; }
+wiring=$(python3 - "$src/Bar.qml" <<'PY'
+import re, sys
+s = open(sys.argv[1], encoding="utf-8").read()
+# each Pill { ... } block: from "Pill {" to the next line at the same indent with "}"
+blocks = []
+for m in re.finditer(r"^( +)Pill \{[^\n]*\n(.*?)^\1\}", s, flags=re.S | re.M):
+    blocks.append(m.group(0))
+def pill(name):
+    for b in blocks:
+        if re.search(r'togglePopup\("%s"' % name, b): return b
+    return ""
+want = [
+    ("volume pill: click = mixer, right = mute, middle = pavucontrol", "mixer",
+     [r'onClicked: bar\.togglePopup\("mixer"', r'onRightClicked: if \(audio\) audio\.muted = !audio\.muted', r'onMiddleClicked: Sys\.run\("pavucontrol"\)']),
+    ("network pill: click = Wi-Fi list, right/middle = connection editor", "wifi",
+     [r'onClicked: bar\.togglePopup\("wifi"', r'onRightClicked: Sys\.run\("nm-connection-editor"\)', r'onMiddleClicked: Sys\.run\("nm-connection-editor"\)']),
+    ("bluetooth pill: click = devices, right = bounce, middle = mode", "bluetooth",
+     [r'onClicked: bar\.togglePopup\("bluetooth"', r'onRightClicked: Sys\.run\(Sys\.bin \+ "bt-audio-status bounce"\)', r'onMiddleClicked: Sys\.run\(Sys\.bin \+ "bt-audio-status mode"\)']),
+    ("teams pill: click = chats, right = oldest unread, middle = all in Emacs", "teams",
+     [r'onClicked: bar\.togglePopup\("teams"', r'onRightClicked: Sys\.teamsOpen\(""\)', r'onMiddleClicked: Sys\.teamsList\(\)']),
+    ("music pill: click = player card, right = play/pause, middle = the player app", "media",
+     [r'onClicked: bar\.togglePopup\("media"', r'onRightClicked: if \(player && player\.canTogglePlaying\) player\.togglePlaying\(\)', r'onMiddleClicked: openPlayer\(\)']),
+    ("profile pill: click = profiles, right = next profile", "profile",
+     [r'onClicked: bar\.togglePopup\("profile", profilePill\)', r'onRightClicked: Sys\.nextProfile\(\)']),
+    ("power pill: click = power menu", "power", [r'onClicked: bar\.togglePopup\("power"']),
+]
+for label, name, pats in want:
+    b = pill(name)
+    miss = [p for p in pats if not re.search(p, b)]
+    print(("PASS " if b and not miss else "FAIL ") + "Bar: " + label + ("" if b and not miss else "   [" + ("no pill opens " + name if not b else "missing: " + "; ".join(miss)) + "]"))
+for name, comp in [("mixer", "Mixer"), ("wifi", "WifiList"), ("bluetooth", "BluetoothList"), ("profile", "ProfileList"), ("teams", "TeamsList"), ("power", "PowerMenu"), ("media", "MediaPop")]:
+    m = re.search(r"Component \{ id: (\w+); %s \{" % comp, s)
+    ok = m and re.search(r"\b%s: %s\b" % (name, m.group(1)), s)
+    print(("PASS " if ok else "FAIL ") + "Bar: popup \"%s\" loads %s" % (name, comp))
+for comp in ["WifiList", "BluetoothList", "ProfileList", "TeamsList", "PowerMenu"]:
+    ok = re.search(r"%s \{ onDone: bar\.popup = \"\" \}" % comp, s)
+    print(("PASS " if ok else "FAIL ") + "Bar: %s closes the popup when done" % comp)
+PY
+)
+echo "$wiring"
+pass=$((pass + $(echo "$wiring" | grep -c '^PASS'))); f=$(echo "$wiring" | grep -c '^FAIL'); fail=$((fail + f)); [ "$f" -gt 0 ] && ok=1
+
+# ---- the Quickshell run ----
+log="$work/log"
+env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u QT_QPA_PLATFORMTHEME -u QT_STYLE_OVERRIDE \
+    HOME="$fake" XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}" XDG_CONFIG_HOME="$fake/.config" \
+    QT_QPA_PLATFORM="offscreen:configfile=$work/screen.json" XDG_RUNTIME_DIR="$work/run" XDG_STATE_HOME="$work/state" XDG_CACHE_HOME="$work/cache" \
+    PANELS_BIN="$pbin" PANELS_DIR="$data" PANELS_PAGES="$pages" PATH="$stubs:$pbin:$PATH" \
+    dbus-run-session -- timeout 110 "$qs" -p "$cfg/shell.qml" --no-color > "$log" 2>&1
+code=$?
+[ "$verbose" = 1 ] && cat "$log"
+grep -o 'STEST \(PASS\|FAIL\|case:\).*' "$log" | sed 's/^STEST //'
+if r=$(grep -o 'STEST RESULT pass [0-9]* fail [0-9]*' "$log"); then
+    set -- $r; pass=$((pass + $4)); fail=$((fail + $6)); [ "$6" = 0 ] || ok=1
+else
+    fail "the Quickshell run finished" "exit $code; last lines: $(grep -vE 'dbus-daemon|portal' "$log" | tail -8 | tr '\n' '|')"
+fi
+
+# ---- nothing logged an error, per file (Qt says file:///…/X.qml:N, Quickshell says @X.qml[N:M]) ----
+echo "case: errors logged"
+errs='TypeError|ReferenceError|Binding loop|Unable to assign|Cannot assign|is not a type|is not defined|Cannot read property|non-existent property|Type error'
+sed '/STEST note: closing the pages/,$d' "$log" > "$work/log.open"
+sed -n '/STEST note: closing the pages/,$p' "$log" > "$work/log.close"
+errs_in() {     # FILE-BASENAME LOG
+    grep -E "[/@]$1\.qml[]:\"[].*($errs)|($errs).*[/@]$1\.qml[]:\"[]" "$2" | grep -v 'STEST ' | sed 's/^ *[A-Z]*[: ]*//' | sort -u | head -3
+}
+for f in $under $pages Fit MenuRow SaverRow shell; do
+    hits=$(errs_in "$f" "$work/log.open")
+    if [ -z "$hits" ]; then pass "no errors logged: $f.qml"; else fail "no errors logged: $f.qml" "$(echo "$hits" | tr '\n' '|' | cut -c1-600)"; fi
+done
+hits=$(grep -E "($errs)" "$work/log.close" | grep -v 'STEST ' | sed 's/^ *[A-Z]*[: ]*//' | sort | uniq -c | sort -rn | head -3)
+if [ -z "$hits" ]; then pass "Settings pages close without errors"; else fail "Settings pages close without errors" "$(echo "$hits" | tr '\n' '|' | tr -s ' ' | cut -c1-400)"; fi
+# errors that name no file at all (a component that failed to load says it this way)
+other=$(grep -E "$errs" "$work/log.open" | grep -v 'STEST ' | grep -vE '\.qml[]:"[]' | sort -u | head -3)
+[ -z "$other" ] && pass "no unattributed errors logged" || fail "no unattributed errors logged" "$(echo "$other" | tr '\n' '|' | cut -c1-400)"
+
+# ---- the commands that really ran were only the stand-ins we expect (nothing reached the system) ----
+bad=$(grep -vE '^(nmcli|qs --version|hyprctl version -j|wifi-qr|sunset-times get|palette list|input-settings get|tz-now|display-layout current|jq)' "$work/calls" 2>/dev/null | sort -u | head -5)
+[ -z "$bad" ] && pass "only read-only stand-ins were started" || fail "only read-only stand-ins were started" "$(echo "$bad" | tr '\n' '|')"
+
+echo "RESULT pass $pass fail $fail"
+exit $ok

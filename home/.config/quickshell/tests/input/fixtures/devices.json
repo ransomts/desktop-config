@@ -1,0 +1,56 @@
+{
+ "mice": [
+  {
+   "name": "elan0412:00-04f3:311d-mouse",
+   "defaultSpeed": 0.0,
+   "scrollFactor": -1.0
+  },
+  {
+   "name": "elan0412:00-04f3:311d-touchpad",
+   "defaultSpeed": 0.0,
+   "scrollFactor": -1.0
+  },
+  {
+   "name": "etps/2-elantech-touchpad",
+   "defaultSpeed": 0.0,
+   "scrollFactor": -1.0
+  }
+ ],
+ "keyboards": [
+  {
+   "name": "video-bus",
+   "layout": "us,us",
+   "active_keymap": "English (Dvorak)"
+  },
+  {
+   "name": "system76-acpi-hotkeys",
+   "layout": "us,us",
+   "active_keymap": "English (Dvorak)"
+  },
+  {
+   "name": "intel-hid-events",
+   "layout": "us,us",
+   "active_keymap": "English (Dvorak)"
+  },
+  {
+   "name": "power-button",
+   "layout": "us,us",
+   "active_keymap": "English (Dvorak)"
+  },
+  {
+   "name": "power-button-1",
+   "layout": "us,us",
+   "active_keymap": "English (Dvorak)"
+  },
+  {
+   "name": "sleep-button",
+   "layout": "us,us",
+   "active_keymap": "English (Dvorak)"
+  },
+  {
+   "name": "at-translated-set-2-keyboard",
+   "layout": "us,us",
+   "active_keymap": "English (Dvorak)"
+  }
+ ]
+}

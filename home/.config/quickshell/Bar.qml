@@ -333,7 +333,7 @@ PanelWindow {
         // One rule for every pill's buttons:
         //   click         opens its list or card when it has one, otherwise does its one thing
         //   right-click   the quick action (mute, Do Not Disturb, play / pause, eject, reconnect,
-        //                 next power profile), or its settings when it has no quick action
+        //                 next power profile, charge cap on / off), or its settings when it has no quick action
         //   middle-click  the full app (pavucontrol, the music player, ...), where there is one
         //   scroll        only where it changes a level: desktops (left) and volume
         // Nothing that cuts something off (eject, reconnect) sits on a plain click.
@@ -576,8 +576,10 @@ PanelWindow {
                 tip: "<b>Battery</b>: " + pct + "%" + (charging ? (span(dev.timeToFull) ? ", full in " + span(dev.timeToFull) : ", charging")
                      : plugged ? ", plugged in" : (span(dev ? dev.timeToEmpty : 0) ? ", " + span(dev.timeToEmpty) + " left" : ""))
                      + (Charge.tip !== "" ? "\n" + Charge.tip : "")
-                     + "\nClick: power profile"
+                     + "\nClick: power profile and charge limit"
+                     + (Charge.loaded ? "\nRight-click: " + (Charge.limited ? "charge to full" : "stop charging at " + Charge.cap + "%") : "")
                 onClicked: bar.togglePopup("profile", bat)
+                onRightClicked: Charge.toggle()
             }
 
             Pill {    // power menu

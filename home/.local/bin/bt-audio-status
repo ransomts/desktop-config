@@ -16,9 +16,10 @@ case "$1" in
         [ -n "$mac" ] && exec "$HOME/.local/bin/bt-bounce" "$mac"
         exec "$HOME/.local/bin/bt-bounce" ;;   # nothing connected: try the default (MOMENTUM 4)
     mode)
-        card=bluez_card.04_C8_B0_2F_A1_AF
+        card=bluez_card.04_C8_B0_00_00_F7
         if pactl list short cards | grep -q "$card"; then
-            if pactl list cards | grep -A40 "Name: $card" | grep -q 'Active Profile: headset-head-unit'; then
+            # the first Active Profile after the buds' Name is theirs (a later one belongs to the next card)
+            if pactl list cards | grep -A200 "Name: $card" | grep -m1 'Active Profile:' | grep -q headset-head-unit; then
                 "$HOME/.local/bin/buds-music" && notify-send -a Bluetooth "Pixel Buds: music mode"
             else
                 "$HOME/.local/bin/buds-call" && notify-send -a Bluetooth "Pixel Buds: call mode (mic on)"

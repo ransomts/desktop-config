@@ -35,7 +35,7 @@ if [ "$input" = 1 ]; then      # ask for a line of text instead of picking one
     fi
     set -- --dmenu --lines 0 --width 46 --prompt-only "$placeholder: "
     [ "$secret" = true ] && set -- "$@" --password
-    exec fuzzel "$@" < /dev/null
+    fuzzel "$@" < /dev/null; exit $?      # not exec: the EXIT trap must remove $dir
 fi
 
 cat > "$dir/raw"
@@ -57,4 +57,4 @@ fi
 # fallback: fuzzel, as before
 set -- --dmenu --no-sort --width 80 --lines 15 --prompt "${prompt:-> }" --placeholder "$placeholder"
 [ "$index" = 1 ] && set -- "$@" --index
-exec fuzzel "$@" < "$dir/raw"
+fuzzel "$@" < "$dir/raw"; exit $?      # not exec: the EXIT trap must remove $dir (it holds the list)

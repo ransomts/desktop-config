@@ -50,7 +50,7 @@ def preset_settings(preset: dict, light: str) -> dict | None:
     """The settings a preset gives one light (its own entry, else "all"), or None."""
     s = preset.get(light, preset.get("all"))
     return s if isinstance(s, dict) else None
-DEFAULT_ADDR = os.environ.get("GVM_ADDR") or next(iter(LIGHTS.values()), "A4:C1:38:5C:81:F8")
+DEFAULT_ADDR = os.environ.get("GVM_ADDR") or next(iter(LIGHTS.values()), "A4:C1:38:00:00:AE")
 
 
 def resolve(which: str) -> list[tuple[str, str]]:
@@ -461,7 +461,7 @@ def main() -> None:
   gvm -v set 7 4      raw register write, printing the frames
 
 Lights file (~/.config/gvm/lights), one per line, first is the default:
-  key   A4:C1:38:5C:81:F8
+  key   A4:C1:38:00:00:AE
 
 The light takes one connection at a time: close the GVM phone app (and gvm-gui) first.
 Each command connects, acts, and disconnects (about 3-5 s).""",

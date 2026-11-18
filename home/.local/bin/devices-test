@@ -1,0 +1,464 @@
+#!/bin/bash
+# Tests for the hardware glue in ~/.local/bin: bt-audio-reconnect, bt-bounce, bt-audio-status,
+# buds-call/buds-music, cams, on-battery and the GVM light tools (gvm, gvm-gui's non-GTK parts).
+#
+#   devices-test               run everything; PASS/FAIL lines and a RESULT line; exit 1 on a failure
+#   devices-test -v            also print each script's output and the stub call logs
+#   devices-test -k            keep the temporary directory (its path is printed)
+#   devices-test -b DIR        test the scripts in DIR instead of ~/.local/bin
+#
+# Nothing touches a real device. Every external command the scripts call is a recording stub
+# first on PATH (~/.local/share/desktop-tests/devices/stubs): bluetoothctl and pactl answer from a
+# made-up BlueZ/PipeWire state (connected with an A2DP sink; connected but no sink; headset
+# profile only; disconnected), gdbus and journalctl play scripted monitor lines (logind resume,
+# Device1 Connected flips, WirePlumber NotAuthorized, UPower OnBattery), and docker, brightnessctl,
+# notify-send, logger and timeout only record. bt-audio-reconnect and cams run inside bwrap: a
+# private /tmp (the service's PrivateTmp, for its /tmp/btr-* markers) and, for cams, a fake /dev/v4l
+# and /sys/class/video4linux. gvm and gvm-gui are imported as modules (python3 -I) with a fake
+# `bleak`, so nothing scans or connects; gvm-gui's window is not built (that needs a display).
+# HOME, XDG_RUNTIME_DIR/STATE/CONFIG/CACHE are temporary; WAYLAND_DISPLAY, DISPLAY and
+# HYPRLAND_INSTANCE_SIGNATURE are unset for everything run.
+set -u
+verbose=0; keep=0; bin="$HOME/.local/bin"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) verbose=1 ;;
+        -k) keep=1 ;;
+        -b) bin="$2"; shift ;;
+        *) echo "usage: devices-test [-v] [-k] [-b BIN_DIR]" >&2; exit 2 ;;
+    esac
+    shift
+done
+bin=$(cd "$bin" && pwd) || exit 2
+share="$HOME/.local/share/desktop-tests/devices"
+stubs="$share/stubs"
+for t in bwrap python3 awk sed; do command -v $t >/dev/null || { echo "devices-test: needs $t" >&2; exit 2; }; done
+# A script that is not there (e.g. not exported to the public dotfiles) has its part skipped.
+have() { local s; for s in "$@"; do [ -f "$bin/$s" ] || { echo "skip: $s not present"; return 1; }; done; }
+[ -x "$stubs/bluetoothctl" ] && [ -f "$share/gvm_test.py" ] || { echo "devices-test: missing $share" >&2; exit 2; }
+bwrap --ro-bind / / --tmpfs /tmp true 2>/dev/null || { echo "devices-test: bwrap cannot make a namespace here" >&2; exit 2; }
+
+work=$(mktemp -d) || exit 2
+binbind=(); case "$bin" in /tmp/*) binbind=(--ro-bind "$bin" "$bin") ;; esac   # a -b copy under /tmp: keep it visible past bwrap's private /tmp
+bgpids=()
+cleanup() {
+    for p in "${bgpids[@]}"; do kill "$p" 2>/dev/null; done
+    if [ "$keep" = 1 ]; then echo "kept $work" >&2; else rm -rf "$work"; fi
+}
+trap cleanup EXIT
+H="$work/home"
+mkdir -p "$H/.local/bin" "$H/.nix-profile/bin" "$work/rt" "$work/state" "$work/config" "$work/cache"
+chmod 700 "$work/rt"
+
+np=0; nf=0
+pass() { echo "PASS $1"; np=$((np + 1)); }
+fail() { echo "FAIL $1${2:+   [$2]}"; nf=$((nf + 1)); }
+check() { if [ "$2" = 0 ]; then pass "$1"; else fail "$1" "${3:-}"; fi; }
+# run CMD... with the isolated environment (FAKE_DIR must be set)
+iso() {
+    env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u BTR_MACS \
+        HOME="$H" XDG_RUNTIME_DIR="$work/rt" XDG_STATE_HOME="$work/state" XDG_CONFIG_HOME="$work/config" \
+        XDG_CACHE_HOME="$work/cache" PATH="$stubs:$PATH" FAKE_DIR="$F" LC_ALL=C "$@"
+}
+fn=0
+newfake() { fn=$((fn + 1)); F="$work/f$fn"; mkdir -p "$F/bt"; : > "$F/calls.log"; : > "$F/out.log"; }
+# mkdev MAC STATE [trusted|untrusted] [NAME] [ICON]
+mkdev() {
+    local d="$F/bt/${1//:/_}"; mkdir -p "$d"; echo "$2" > "$d/state"
+    [ "${3:-trusted}" = trusted ] && : > "$d/trusted"
+    [ -n "${4:-}" ] && echo "$4" > "$d/name"
+    [ -n "${5:-}" ] && echo "$5" > "$d/icon"
+    return 0
+}
+setdev() { echo "$3" > "$F/bt/${1//:/_}/$2"; }
+calls() { grep -c -- "$1" "$F/calls.log"; }
+waitlog() {  # PATTERN [SECONDS]: wait until out.log matches
+    local i=0 n=$(( ${2:-10} * 20 ))
+    while ! grep -q -- "$1" "$F/out.log"; do i=$((i + 1)); [ $i -ge $n ] && return 1; sleep 0.05; done
+}
+waitcall() { local i=0; while ! grep -q -- "$1" "$F/calls.log"; do i=$((i + 1)); [ $i -ge 200 ] && return 1; sleep 0.05; done; }
+waitfile() { local i=0; while [ ! -e "$1" ]; do i=$((i + 1)); [ $i -ge 200 ] && return 1; sleep 0.05; done; }
+show() { [ "$verbose" = 1 ] && { echo "--- out"; cat "$F/out.log"; echo "--- calls"; cat "$F/calls.log"; echo "---"; }; return 0; }
+
+# made-up addresses, passed to the scripts (BTR_MACS, bt-bounce's argument)
+M4=00:11:22:33:44:55; M4_=00_11_22_33_44_55; OTHER=AA:BB:CC:00:00:FE; OTHER2=AA:BB:CC:00:00:F0
+devline() { echo "/org/bluez/hci0/dev_${1//:/_}: org.freedesktop.DBus.Properties.PropertiesChanged ('org.bluez.Device1', {'Connected': <$2>}, @as [])"; }
+sleepline() { echo "/org/freedesktop/login1: org.freedesktop.login1.Manager.PrepareForSleep ($1,)"; }
+wedgeline() { echo "spa.bluez5: Acquire /org/bluez/hci0/dev_${1//:/_}/sep1/fd3 returned error: org.bluez.Error.NotAuthorized"; }
+
+# ======================================================================= bt-audio-reconnect
+if have bt-audio-reconnect; then
+# btr_start VAR=VAL...: start the service in a private /tmp, quick timings unless overridden
+btr_start() {
+    iso BTR_STARTUP_SETTLE=0 BTR_INTERVAL=0 BTR_SETTLE=0 BTR_ATTEMPTS=3 BTR_DROP_SETTLE=0 BTR_A2DP_SETTLE=0 "$@" \
+        bwrap --dev-bind / / --tmpfs /tmp --bind "$work" "$work" "${binbind[@]}" --unshare-pid --die-with-parent --proc /proc \
+        "$bin/bt-audio-reconnect" > "$F/out.log" 2>&1 &
+    bpid=$!; bgpids+=("$bpid")
+}
+btr_stop() {  # let every fake monitor end; the service must then exit 1 (wait -n); sets rc
+    local i=0
+    : > "$F/stop"
+    while kill -0 "$bpid" 2>/dev/null; do i=$((i + 1)); [ $i -ge 100 ] && { kill "$bpid"; break; }; sleep 0.05; done
+    wait "$bpid"; rc=$?; bgpids=()
+    show
+}
+
+echo "case: bt-audio-reconnect startup pass"
+newfake; mkdev $M4 a2dp trusted
+btr_start BTR_MACS=$M4
+waitlog "already connected"; check "healthy headphones at startup: 'already connected'" $? "$(cat "$F/out.log")"
+waitcall "^journalctl"; waitcall "^gdbus monitor.*login1"; sleep 0.2
+[ "$(calls "^bluetoothctl connect")" = 0 ] && [ "$(calls "^bluetoothctl trust")" = 0 ]; check "  ... no connect and no trust call" $?
+grep -q 'gdbus monitor --system --dest org.freedesktop.login1 --object-path /org/freedesktop/login1' "$F/calls.log" &&
+    [ "$(calls 'gdbus monitor --system --dest org.bluez')" = 2 ] &&
+    grep -qF 'journalctl --user -f -n0 -o cat -u wireplumber.service -g Acquire .* returned error: org\.bluez\.Error\.NotAuthorized' "$F/calls.log"
+check "  ... all four watchers start (logind, 2x BlueZ, WirePlumber journal)" $? "$(grep -E 'gdbus|journalctl' "$F/calls.log")"
+btr_stop
+[ "$rc" = 1 ] && grep -q 'a watcher exited, restarting' "$F/out.log"; check "a watcher ending makes the service exit 1 (Restart=on-failure)" $? "rc=$rc"
+
+newfake; mkdev $M4 a2dp untrusted
+btr_start BTR_MACS=$M4; waitlog "already connected"; btr_stop
+grep -q "$M4 not trusted (re-pairing clears it) -- restoring" "$F/out.log" && grep -q "bluetoothctl trust $M4" "$F/calls.log" &&
+    [ -e "$F/bt/$M4_/trusted" ]
+check "untrusted device: trust flag restored and logged" $?
+
+newfake; mkdev $M4 off; setdev $M4 connectq "$(printf 'nosink\nhfp\na2dp')"
+btr_start BTR_MACS=$M4 BTR_ATTEMPTS=5; waitlog "connected on attempt"; btr_stop
+grep -q "$M4 connected on attempt 3" "$F/out.log" && [ "$(calls "^bluetoothctl connect $M4")" = 3 ]
+check "'Connected: yes' without a sink, then headset-only, are not success; A2DP on the 3rd try is" $? "$(grep attempt "$F/out.log")"
+
+newfake; mkdev $M4 off; setdev $M4 default hfp
+btr_start BTR_MACS=$M4 BTR_ATTEMPTS=3; waitlog "giving up"; btr_stop
+grep -q "not reachable, giving up: $M4" "$F/out.log" && [ "$(calls "^bluetoothctl connect $M4")" = 3 ]
+check "headset profile only every time: ATTEMPTS connects, then gives up" $? "$(cat "$F/out.log")"
+
+newfake; mkdev $M4 manual-hfp
+btr_start BTR_MACS=$M4; waitlog "already connected"; btr_stop
+[ "$(calls "^bluetoothctl connect")" = 0 ]; check "headset mode picked by hand (A2DP still listed) counts as connected" $?
+
+newfake; mkdev $M4 a2dp-unavail
+btr_start BTR_MACS=$M4 BTR_ATTEMPTS=2; waitlog "giving up"; btr_stop
+grep -q "giving up: $M4" "$F/out.log"; check "a2dp-sink listed but 'available: no' is not connected" $?
+
+newfake; mkdev $M4 a2dp-nosink
+btr_start BTR_MACS=$M4 BTR_ATTEMPTS=2; waitlog "giving up"; btr_stop
+grep -q "giving up: $M4" "$F/out.log"; check "A2DP listed on the card but no bluez_output sink is not connected" $?
+
+newfake; mkdev $M4 off; setdev $M4 default a2dp; mkdev $OTHER off; setdev $OTHER default fail
+btr_start BTR_MACS="$OTHER $M4" BTR_ATTEMPTS=3; waitlog "giving up"; btr_stop
+grep -q "$M4 connected on attempt 1" "$F/out.log" && grep -q "giving up: $OTHER\$" "$F/out.log" &&
+    [ "$(calls "^bluetoothctl connect $M4")" = 1 ] && [ "$(calls "^bluetoothctl connect $OTHER")" = 3 ]
+check "two devices: a switched-off one does not starve the other (round robin)" $? "$(cat "$F/out.log")"
+
+echo "case: bt-audio-reconnect resume and dropped links"
+newfake; mkdev $M4 a2dp; setdev $M4 default a2dp
+{ sleepline true; echo "@wait /tmp/btr-sleeping"; echo "@set bt/$M4_/state off"; echo "@touch slept"
+  echo "@wait dropseen"; sleepline false; } > "$F/monitor-org.freedesktop.login1.script"
+{ echo "@wait slept"; devline $M4 false; devline $M4 true; echo "@sleep 0.6"; echo "@touch dropseen"; } > "$F/monitor-org.bluez.script"
+btr_start BTR_MACS=$M4; waitlog "connected on attempt"; btr_stop
+grep -q "resumed, reconnecting" "$F/out.log" && grep -q "$M4 connected on attempt 1" "$F/out.log"
+check "resume (PrepareForSleep false): reconnects" $? "$(cat "$F/out.log")"
+! grep -q "link dropped" "$F/out.log" && [ "$(calls "^bluetoothctl connect")" = 1 ]
+check "  ... the drop while suspending is left to the resume path (sleep marker)" $? "$(cat "$F/out.log")"
+
+newfake; mkdev $M4 off; mkdev $OTHER off
+{ echo "@grep out.log giving up"; echo "@set bt/$M4_/default a2dp"; devline $OTHER false; devline $M4 false; } > "$F/monitor-org.bluez.script"
+btr_start BTR_MACS=$M4 BTR_ATTEMPTS=1; waitlog "after drop"; btr_stop
+grep -q "$M4 link dropped, reconnecting in 0s" "$F/out.log" && grep -q "$M4 A2DP re-established after drop (attempt 1)" "$F/out.log"
+check "mid-session drop (Device1 Connected false): reconnected" $? "$(cat "$F/out.log")"
+! grep -q "$OTHER" "$F/out.log"; check "  ... a drop of a device not in BTR_MACS is ignored" $?
+
+newfake; mkdev $M4 a2dp
+{ devline $M4 false; echo "@touch bz-done"; } > "$F/monitor-org.bluez.script"
+btr_start BTR_MACS=$M4; waitlog "came back on its own"; check "drop but already back with A2DP: 'came back on its own'" $?
+btr_stop; [ "$(calls "^bluetoothctl connect")" = 0 ]; check "  ... and no connect call" $?
+
+echo "case: bt-audio-reconnect connected without A2DP (headset profile only)"
+newfake; mkdev $M4 hfp; setdev $M4 default hfp
+{ echo "@grep out.log giving up"; echo "@set bt/$M4_/default a2dp"; devline $M4 true
+  echo "@wait /tmp/btr-bouncing-$M4_"; devline $M4 false
+  echo "@grep out.log after bounce"; echo "@set bt/$M4_/state hfp"; devline $M4 true; echo "@touch bz-done"; } > "$F/monitor-org.bluez.script"
+btr_start BTR_MACS=$M4 BTR_ATTEMPTS=1 BTR_SETTLE=1 BTR_A2DP_COOLDOWN=120
+waitlog "in cooldown" 15; btr_stop
+grep -q "$M4 connected without A2DP (headset profile only) -- bouncing link" "$F/out.log" &&
+    grep -q "$M4 A2DP re-established after bounce (attempt 1)" "$F/out.log"
+check "connect with headset profile only: link bounced, A2DP back" $? "$(cat "$F/out.log")"
+awk '/bluetoothctl disconnect/{d=NR} /bluetoothctl connect/{c=NR} END{exit !(d && c > d)}' "$F/calls.log"
+check "  ... disconnect first, then connect" $?
+! grep -q "link dropped" "$F/out.log"; check "  ... the bounce's own disconnect is not treated as a drop (bounce marker)" $? "$(cat "$F/out.log")"
+grep -q "$M4 connected without A2DP again -- in cooldown, leaving it" "$F/out.log" && [ "$(calls "^bluetoothctl disconnect")" = 1 ]
+check "  ... a second headset-only connect within the cooldown is left alone" $? "$(cat "$F/out.log")"
+
+newfake; mkdev $M4 a2dp
+{ devline $M4 true; echo "@sleep 0.8"; echo "@touch bz-done"; } > "$F/monitor-org.bluez.script"
+btr_start BTR_MACS=$M4; waitfile "$F/bz-done"; sleep 0.3; btr_stop
+[ "$(calls "^bluetoothctl disconnect")" = 0 ] && ! grep -q "without A2DP" "$F/out.log"
+check "a connect that brings A2DP is left alone" $? "$(cat "$F/out.log")"
+
+echo "case: bt-audio-reconnect wedged A2DP (WirePlumber NotAuthorized)"
+newfake; mkdev $M4 a2dp; setdev $M4 default a2dp
+{ wedgeline $M4; wedgeline $OTHER; wedgeline $OTHER; wedgeline $M4; echo "@grep out.log after bounce"
+  wedgeline $M4; wedgeline $M4; echo "@sleep 0.6"; echo "@touch j-done"; } > "$F/journal.script"
+btr_start BTR_MACS=$M4 BTR_WEDGE_HITS=2 BTR_WEDGE_WINDOW=60 BTR_WEDGE_COOLDOWN=120
+waitfile "$F/j-done"; sleep 0.3; btr_stop
+grep -q "$M4 A2DP wedged (2 NotAuthorized in 60s) -- bouncing link" "$F/out.log" && grep -q "$M4 A2DP re-established after bounce" "$F/out.log"
+check "two NotAuthorized in the window: link bounced" $? "$(cat "$F/out.log")"
+[ "$(calls "^bluetoothctl disconnect")" = 1 ] && ! grep -q "disconnect $OTHER" "$F/calls.log"
+check "  ... once (cooldown), and never for a device not in BTR_MACS" $? "$(grep disconnect "$F/calls.log")"
+
+newfake; mkdev $M4 a2dp
+{ wedgeline $M4; echo "@sleep 1.2"; wedgeline $M4; echo "@sleep 0.5"; echo "@touch j-done"; } > "$F/journal.script"
+btr_start BTR_MACS=$M4 BTR_WEDGE_HITS=2 BTR_WEDGE_WINDOW=0
+waitfile "$F/j-done"; sleep 0.2; btr_stop
+[ "$(calls "^bluetoothctl disconnect")" = 0 ]; check "errors further apart than the window do not bounce" $?
+
+newfake
+iso bwrap --dev-bind / / --tmpfs /tmp --bind "$work" "$work" "${binbind[@]}" --unshare-pid --die-with-parent --proc /proc \
+    "$bin/bt-audio-reconnect" > "$F/out.log" 2>&1; rc=$?
+[ "$rc" != 0 ] && grep -q "BTR_MACS is unset" "$F/out.log"; check "no BTR_MACS: refuses to start" $? "rc=$rc"
+
+fi
+
+# ======================================================================= bt-bounce
+if have bt-bounce; then
+echo "case: bt-bounce"
+bb() { iso "$bin/bt-bounce" "$@" > "$F/out.log" 2>&1; rc=$?; show; }
+newfake; mkdev $M4 hfp; setdev $M4 connectq a2dp
+bb $M4
+[ "$rc" = 0 ] && grep -q "Reconnected. Press play to resume." "$F/out.log"; check "bounces the given headphones, A2DP back: exit 0" $? "rc=$rc $(cat "$F/out.log")"
+awk -v m="$M4" '$0 ~ "bluetoothctl disconnect " m {d=NR} $0 ~ "bluetoothctl connect " m {c=NR} END{exit !(d && c > d)}' "$F/calls.log"
+check "  ... disconnect, then connect (under timeout)" $? "$(cat "$F/calls.log")"
+grep -q "timeout 10 bluetoothctl disconnect $M4" "$F/calls.log" && grep -q "timeout 20 bluetoothctl connect $M4" "$F/calls.log"
+check "  ... both bluetoothctl calls are time-limited" $?
+grep -q "logger -t bt-bounce $M4: bouncing; before: sink=\[bluez_output.$M4_.1.*\] Active Profile: headset-head-unit" "$F/calls.log"
+check "  ... logs the state before the bounce (sink, active profile)" $? "$(grep logger "$F/calls.log")"
+grep -q "notify-send -a Bluetooth -i audio-headphones Headphones Reconnected. Press play to resume." "$F/calls.log"
+check "  ... popup says to press play" $?
+
+newfake; mkdev $M4 a2dp; setdev $M4 connectq "$(printf 'nosink\na2dp')"
+bb $M4; [ "$rc" = 0 ] && [ "$(calls "^bluetoothctl connect")" = 2 ]
+check "connected without a sink is not success: tries connect again" $? "rc=$rc $(calls 'bluetoothctl connect')"
+
+newfake; mkdev $M4 a2dp; setdev $M4 default hfp
+bb $M4; [ "$rc" = 1 ] && grep -q "Could not reconnect. Are they on and in range?" "$F/out.log" && [ "$(calls "^bluetoothctl connect")" = 3 ]
+check "comes back headset-only every time: 3 tries, then 'Could not reconnect', exit 1" $? "rc=$rc"
+grep -q "notify-send.*Could not reconnect" "$F/calls.log"; check "  ... and says so in a popup" $?
+
+newfake; mkdev $OTHER2 hfp "" "Pixel Buds Pro 2"; setdev $OTHER2 connectq a2dp; mkdev $M4 a2dp
+bb $OTHER2; [ "$rc" = 0 ] && grep -q "disconnect $OTHER2" "$F/calls.log" && ! grep -q "disconnect $M4" "$F/calls.log"
+check "a MAC argument bounces that device only" $? "rc=$rc"
+
+fi
+
+# ======================================================================= buds-call / buds-music
+if have buds-call; then
+echo "case: buds-call / buds-music (HFP vs A2DP)"
+BUDS_=$(sed -n 's/^CARD=bluez_card\.\([0-9A-Fa-f_]*\)$/\1/p' "$bin/buds-call"); BUDS=${BUDS_//_/:}   # buds-call has no override
+mkdir -p "$work/buds"; cp "$bin/buds-call" "$work/buds/buds-call"; ln -sf buds-call "$work/buds/buds-music"
+newfake; mkdev $BUDS a2dp "" "Pixel Buds Pro 2"
+out=$(iso "$work/buds/buds-call" 2>&1); rc=$?
+[ "$rc" = 0 ] && [ "$out" = "Pixel Buds -> headset-head-unit" ] && grep -q "pactl set-card-profile bluez_card.$BUDS_ headset-head-unit\$" "$F/calls.log"
+check "buds-call: card to headset-head-unit (HFP, mic on)" $? "rc=$rc $out"
+out=$(iso "$work/buds/buds-music" 2>&1); rc=$?
+[ "$rc" = 0 ] && [ "$out" = "Pixel Buds -> a2dp-sink" ] && grep -q "set-card-profile bluez_card.$BUDS_ a2dp-sink\$" "$F/calls.log"
+check "buds-music (symlink name): card to a2dp-sink" $? "rc=$rc $out"
+newfake; mkdev $M4 a2dp
+out=$(iso "$work/buds/buds-call" 2>&1); rc=$?
+[ "$rc" = 1 ] && [ "$out" = "Pixel Buds not connected" ] && ! grep -q set-card-profile "$F/calls.log"
+check "buds not connected: exit 1, says so, no profile change (MOMENTUM untouched)" $? "rc=$rc $out"
+newfake; mkdev $BUDS a2dp; : > "$F/pactl-fail"
+out=$(iso "$work/buds/buds-call" 2>/dev/null); rc=$?
+[ "$rc" = 1 ] && [ -z "$out" ]; check "set-card-profile refused: exit 1, no success line" $? "rc=$rc $out"
+
+fi
+
+# ======================================================================= bt-audio-status
+if have bt-audio-status; then
+echo "case: bt-audio-status"
+BUDS_=$(sed -n 's/^ *card=bluez_card\.\([0-9A-Fa-f_]*\)$/\1/p' "$bin/bt-audio-status"); BUDS=${BUDS_//_/:}   # no override there
+# fake HOME scripts: bt-bounce records; buds-call/buds-music are the real ones (a stand-in when absent)
+printf '#!/bin/sh\necho "bt-bounce $*" >> "$FAKE_DIR/calls.log"\n' > "$H/.local/bin/bt-bounce"
+if [ -f "$bin/buds-call" ]; then cp "$bin/buds-call" "$H/.local/bin/buds-call"
+else printf '#!/bin/sh\ncase "$(basename "$0")" in buds-music) p=a2dp-sink ;; *) p=headset-head-unit ;; esac\npactl set-card-profile bluez_card.%s "$p"\n' "$BUDS_" > "$H/.local/bin/buds-call"; fi
+ln -sf buds-call "$H/.local/bin/buds-music"
+chmod +x "$H/.local/bin/bt-bounce" "$H/.local/bin/buds-call"
+bas() { iso sh "$bin/bt-audio-status" "$@" > "$F/out.log" 2>&1; rc=$?; show; }
+newfake; mkdev $OTHER a2dp "" "Kensington Expert Mouse" input-mouse; mkdev $BUDS a2dp "" "Pixel Buds Pro 2"
+bas bounce; grep -q "^bt-bounce $BUDS\$" "$F/calls.log"; check "bounce: the connected audio device (not the mouse)" $? "$(grep bt-bounce "$F/calls.log")"
+newfake; mkdev $M4 off
+bas bounce; grep -q "^bt-bounce \$" "$F/calls.log"; check "bounce with nothing connected: bt-bounce's default" $? "$(grep bt-bounce "$F/calls.log")"
+newfake; mkdev $M4 a2dp
+bas mode; grep -q "notify-send -a Bluetooth Pixel Buds aren't connected" "$F/calls.log" && ! grep -q set-card-profile "$F/calls.log"
+check "mode without the buds: popup, nothing switched" $?
+newfake; mkdev $BUDS a2dp "" "Pixel Buds Pro 2"
+bas mode; grep -q "set-card-profile bluez_card.$BUDS_ headset-head-unit" "$F/calls.log" &&
+    grep -q "notify-send -a Bluetooth Pixel Buds: call mode (mic on)" "$F/calls.log"
+check "mode from music: to call mode (HFP), popup" $? "$(grep -E 'set-card|notify' "$F/calls.log")"
+newfake; mkdev $BUDS manual-hfp "" "Pixel Buds Pro 2"
+bas mode; grep -q "set-card-profile bluez_card.$BUDS_ a2dp-sink" "$F/calls.log" &&
+    grep -q "notify-send -a Bluetooth Pixel Buds: music mode" "$F/calls.log"
+check "mode from call: to music mode (A2DP), popup" $? "$(grep -E 'set-card|notify' "$F/calls.log")"
+newfake; mkdev $BUDS a2dp "" "Pixel Buds Pro 2"; mkdev $OTHER hfp; setdev $BUDS props 4; setdev $OTHER props 4   # $OTHER's card lists after the buds' card
+bas mode; grep -q "set-card-profile bluez_card.$BUDS_ headset-head-unit" "$F/calls.log"
+check "mode reads the buds' own Active Profile, not the next card's (other headphones in headset mode)" $? "$(grep -E 'set-card' "$F/calls.log")"
+newfake; mkdev $BUDS manual-hfp "" "Pixel Buds Pro 2"; setdev $BUDS props 26
+bas mode; grep -q "set-card-profile bluez_card.$BUDS_ a2dp-sink" "$F/calls.log"
+check "mode finds Active Profile below a real-length (26-line) Properties list" $? "$(grep -E 'set-card' "$F/calls.log")"
+newfake; bas frob; [ "$rc" = 2 ] && grep -q "usage: bt-audio-status bounce|mode" "$F/out.log"; check "unknown action: usage, exit 2" $?
+
+fi
+
+# ======================================================================= cams
+if have cams; then
+echo "case: cams (fake /dev/v4l and /sys/class/video4linux)"
+R="$work/camroot"; mkdir -p "$R/v4l/by-id" "$R/sys" "$R/nodes"
+mkcam() {  # videoN name index
+    mkdir -p "$R/sys/$1"; echo "$2" > "$R/sys/$1/name"; echo "$3" > "$R/sys/$1/index"; : > "$R/nodes/$1"
+}
+mkcam video0 "Integrated_Webcam_HD: Integrate" 0; mkcam video1 "Integrated_Webcam_HD: Integrate" 1
+mkcam video2 "C922 Pro Stream Webcam" 0; mkcam video3 "C922 Pro Stream Webcam" 1
+mkcam video4 "OBS Virtual Camera" 0
+mkcam video5 "Nameless" 0; rm -rf "$R/sys/video5"   # a node with a by-id link but no sysfs entry
+ln -s ../../video2 "$R/v4l/by-id/usb-046d_C922_Pro_Stream_Webcam_A1B2C3-video-index0"
+ln -s ../../video3 "$R/v4l/by-id/usb-046d_C922_Pro_Stream_Webcam_A1B2C3-video-index1"
+ln -s ../../video0 "$R/v4l/by-id/usb-CN0_Integrated_Webcam_HD-video-index0"
+ln -s ../../video5 "$R/v4l/by-id/usb-Nameless_Cam-video-index0"
+camrun() {  # [--empty] args...: cams with the fake tree as /dev/v4l, /dev/videoN and sysfs
+    local b=(--dev-bind / / --tmpfs /tmp --bind "$work" "$work" "${binbind[@]}" --tmpfs /sys --dev /dev --die-with-parent)
+    if [ "${1:-}" = --empty ]; then shift; b+=(--dir /sys/class/video4linux)
+    else
+        b+=(--bind "$R/v4l" /dev/v4l --bind "$R/sys" /sys/class/video4linux)
+        for n in "$R"/nodes/*; do b+=(--bind "$n" "/dev/${n##*/}"); done
+    fi
+    iso bwrap "${b[@]}" sh "$bin/cams" "$@"
+}
+t=$(printf '\t')
+want=$(printf '%s\n' "/dev/v4l/by-id/usb-046d_C922_Pro_Stream_Webcam_A1B2C3-video-index0${t}C922 Pro Stream Webcam${t}/dev/video2" \
+    "/dev/v4l/by-id/usb-CN0_Integrated_Webcam_HD-video-index0${t}Integrated_Webcam_HD${t}/dev/video0" \
+    "/dev/v4l/by-id/usb-Nameless_Cam-video-index0${t}video5${t}/dev/video5" \
+    "/dev/video4${t}OBS Virtual Camera${t}/dev/video4")
+newfake; got=$(camrun 2>&1); rc=$?
+[ "$rc" = 0 ] && [ "$(echo "$got" | sort)" = "$(echo "$want" | sort)" ]
+check "list: by-id cameras, sysfs-only camera by /dev/videoN, no metadata nodes, name before ':'" $? "rc=$rc got:
+$got"
+[ "$(echo "$got" | grep -c 'video2')" = 1 ] && ! echo "$got" | grep -q 'video[13]'; check "  ... each camera once (by-id and sysfs not doubled)" $?
+echo "$got" | grep -q "Nameless_Cam-video-index0${t}video5${t}"; check "  ... a by-id camera with no sysfs name is named by its node" $?
+got=$(camrun --empty 2>&1); rc=$?
+[ "$rc" = 0 ] && [ -z "$got" ]; check "no cameras: empty list, exit 0" $? "rc=$rc $got"
+
+# pick: stub qs (status from $FAKE_DIR/qs-status) and qs-pick (answer from $FAKE_DIR/pick, stdin saved)
+cat > "$H/.nix-profile/bin/qs" <<'EOS'
+#!/bin/sh
+echo "qs $*" >> "$FAKE_DIR/calls.log"
+[ "$*" = "ipc call cam status" ] && cat "$FAKE_DIR/qs-status" 2>/dev/null
+exit 0
+EOS
+cat > "$H/.local/bin/qs-pick" <<'EOS'
+#!/bin/sh
+echo "qs-pick $*" >> "$FAKE_DIR/calls.log"
+cat > "$FAKE_DIR/pick-menu"
+a=$(cat "$FAKE_DIR/pick" 2>/dev/null); [ -n "$a" ] || exit 1
+echo "$a"
+EOS
+chmod +x "$H/.nix-profile/bin/qs" "$H/.local/bin/qs-pick"
+newfake; echo '{"shown":false,"device":""}' > "$F/qs-status"; echo 1 > "$F/pick"
+camrun pick > "$F/out.log" 2>&1; rc=$?; show
+second=$(echo "$want" | sort | sed -n 2p | cut -f1)
+[ "$rc" = 0 ] && grep -q "^qs ipc call cam use $second\$" "$F/calls.log"; check "pick: the chosen row's stable path goes to the bubble" $? "$(grep '^qs' "$F/calls.log")"
+[ "$(wc -l < "$F/pick-menu")" = 4 ] && ! grep -q "Hide the bubble" "$F/pick-menu" && grep -q -- "--index --placeholder Webcam for the bubble" "$F/calls.log"
+check "  ... menu lists the four cameras by name; no 'Hide' while the bubble is hidden" $? "$(cat "$F/pick-menu")"
+newfake; printf '{"shown":true,"device":"/dev/v4l/by-id/usb-046d_C922_Pro_Stream_Webcam_A1B2C3-video-index0"}' > "$F/qs-status"; echo 4 > "$F/pick"
+camrun pick > "$F/out.log" 2>&1; rc=$?
+grep -q "^C922 Pro Stream Webcam  (in use)\$" "$F/pick-menu" && [ "$(tail -1 "$F/pick-menu")" = "Hide the bubble" ]
+check "pick while showing: the camera in use is marked, last row hides" $? "$(cat "$F/pick-menu")"
+[ "$rc" = 0 ] && grep -q "^qs ipc call cam off\$" "$F/calls.log" && ! grep -q "cam use" "$F/calls.log"; check "  ... choosing the last row turns the bubble off" $?
+newfake; echo '{"shown":false}' > "$F/qs-status"
+camrun pick > /dev/null 2>&1; rc=$?
+[ "$rc" = 1 ] && ! grep -qE "cam (use|off)" "$F/calls.log"; check "pick cancelled: exit 1, bubble untouched" $? "rc=$rc"
+newfake; camrun --empty pick > /dev/null 2>&1; rc=$?
+[ "$rc" = 1 ] && grep -q "notify-send Webcam No camera found" "$F/calls.log" && ! grep -q qs-pick "$F/calls.log"
+check "pick with no camera: popup, exit 1, no menu" $? "rc=$rc"
+newfake; camrun bogus > /dev/null 2>&1; [ $? = 2 ]; check "unknown argument: usage, exit 2" $?
+
+fi
+
+# ======================================================================= on-battery
+if have on-battery; then
+echo "case: on-battery (fake UPower, docker, brightnessctl)"
+# ob_run SCRIPT-LINES... ; env from OB_ENV array. Runs to the end of the monitor script.
+ob_run() {
+    printf '%s\n' "$@" > "$F/monitor-org.freedesktop.UPower.script"; echo "@touch stop" >> "$F/monitor-org.freedesktop.UPower.script"
+    iso XDG_STATE_HOME="$F/state" "${OB_ENV[@]}" /usr/bin/timeout 20 bash "$bin/on-battery" > "$F/out.log" 2> "$F/err.log"; rc=$?
+    show
+}
+ev() { echo "/org/freedesktop/UPower: org.freedesktop.DBus.Properties.PropertiesChanged ('org.freedesktop.UPower', {'OnBattery': <$1>}, @as [])"; }
+OB_ENV=()
+newfake; echo false > "$F/onbattery"; echo 15 > "$F/bright"
+ob_run "@calls 1" "@set onbattery true" "$(ev true)" "@calls 2" "$(ev true)" "@calls 3" "@set onbattery false" "$(ev false)" "@calls 4"
+[ "$rc" = 0 ] && grep -q "^now on ac\$" "$F/out.log" && grep -q "^now on battery\$" "$F/out.log"; check "follows OnBattery: ac at start, then battery, then ac" $? "rc=$rc $(cat "$F/out.log")"
+[ "$(calls 'docker stop lidarr nzbget')" = 1 ] && [ "$(calls 'docker start lidarr nzbget')" = 2 ]
+check "  ... containers stopped on battery, started on AC (default lidarr nzbget)" $? "$(grep docker "$F/calls.log")"
+grep -q "brightnessctl -q -d acpi_video0 s 8" "$F/calls.log" && grep -q "^backlight 15 -> 8\$" "$F/out.log"; check "  ... backlight dimmed 15 -> 8 on battery" $?
+grep -q "brightnessctl -q -d acpi_video0 s 15" "$F/calls.log" && [ "$(cat "$F/bright")" = 15 ] && grep -q "^backlight 8 -> 15\$" "$F/out.log"
+check "  ... put back to 15 on AC" $?
+[ ! -e "$F/state/on-battery/brightness" ] && [ ! -e "$F/state/on-battery/dimmed-to" ]; check "  ... saved level cleared after restore" $?
+[ "$(grep -c '^now on' "$F/out.log")" = 3 ]; check "  ... a repeated OnBattery=true does nothing twice" $?
+
+newfake; echo true > "$F/onbattery"; echo 5 > "$F/bright"
+ob_run "@calls 1" "@set onbattery false" "$(ev false)" "@calls 2"
+! grep -q " s " "$F/calls.log" && grep -q "docker stop" "$F/calls.log"; check "already dimmer than the limit: backlight left alone" $? "$(grep brightnessctl "$F/calls.log")"
+
+newfake; echo false > "$F/onbattery"; echo 19 > "$F/bright"
+ob_run "@calls 1" "@set onbattery true" "$(ev true)" "@calls 2" "$(ev true)" "@calls 3" "@set bright 12" "@set onbattery false" "$(ev false)" "@calls 4"
+grep -q "backlight changed by hand (12), leaving it" "$F/out.log" && [ "$(cat "$F/bright")" = 12 ] && [ ! -e "$F/state/on-battery/brightness" ]
+check "changed by hand while on battery: not overridden on AC" $? "$(cat "$F/out.log")"
+
+newfake; echo false > "$F/onbattery"; echo 15 > "$F/bright"
+OB_ENV=(ON_BATTERY_CONTAINERS= ON_BATTERY_BRIGHTNESS=4 ON_BATTERY_BACKLIGHT=intel_backlight)
+ob_run "@calls 1" "/org/freedesktop/UPower: org.freedesktop.DBus.Properties.PropertiesChanged ('org.freedesktop.UPower', {'Percentage': <55.0>}, @as [])" \
+    "@set onbattery true" "$(ev true)" "@calls 2"
+OB_ENV=()
+! grep -q docker "$F/calls.log" && grep -q "brightnessctl -q -d intel_backlight s 4" "$F/calls.log"
+check "ON_BATTERY_CONTAINERS empty, BRIGHTNESS=4, BACKLIGHT=intel_backlight honoured" $? "$(cat "$F/calls.log")"
+[ "$(wc -l < "$F/upower-calls")" = 2 ]; check "  ... other UPower property changes are ignored" $?
+
+newfake; echo unknown > "$F/onbattery"; echo 15 > "$F/bright"
+ob_run "@calls 1" "@set onbattery true" "$(ev true)" "@calls 2"
+grep -q "UPower unreadable" "$F/err.log" && [ "$(grep -c '^now on' "$F/out.log")" = 1 ] && grep -q "^now on battery" "$F/out.log"
+check "UPower unreadable: says so, does nothing, recovers on the next signal" $? "$(cat "$F/err.log" "$F/out.log")"
+
+newfake; echo true > "$F/onbattery"; echo 8 > "$F/bright"; mkdir -p "$F/state/on-battery"
+echo 15 > "$F/state/on-battery/brightness"; echo 8 > "$F/state/on-battery/dimmed-to"
+ob_run "@calls 1" "@set onbattery false" "$(ev false)" "@calls 2"
+[ "$(cat "$F/bright")" = 15 ]
+check "restarted while on battery (already dimmed): AC still restores the level from before unplugging" $? "brightness on AC = $(cat "$F/bright"); out: $(tr '\n' ';' < "$F/out.log")"
+
+newfake; echo true > "$F/onbattery"; echo 5 > "$F/bright"; mkdir -p "$F/state/on-battery"
+echo 15 > "$F/state/on-battery/brightness"; echo 8 > "$F/state/on-battery/dimmed-to"
+ob_run "@calls 1" "@set onbattery false" "$(ev false)" "@calls 2"
+[ "$(cat "$F/bright")" = 5 ] && [ ! -e "$F/state/on-battery/brightness" ]
+check "restarted on battery but changed since dimming: saved level dropped, AC leaves it" $? "brightness $(cat "$F/bright")"
+
+fi
+
+# ======================================================================= gvm, gvm-gui
+if have gvm; then
+echo "case: gvm and gvm-gui (python, fake bleak)"
+GH="$work/gvmhome"; mkdir -p "$GH/.local/bin" "$GH/.config/gvm"
+cp "$bin/gvm" "$GH/.local/bin/gvm"
+env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u GVM_ADDR HOME="$GH" XDG_RUNTIME_DIR="$work/rt" \
+    XDG_STATE_HOME="$GH/.local/state" XDG_CONFIG_HOME="$GH/.config" XDG_CACHE_HOME="$work/cache" \
+    timeout 90 python3 -I "$share/gvm_test.py" "$bin/gvm" "$([ -f "$bin/gvm-gui" ] && echo "$bin/gvm-gui")" > "$work/gvm.log" 2>&1
+grc=$?
+[ "$verbose" = 1 ] && cat "$work/gvm.log"
+grep -E '^(PASS|FAIL|case:|skip:)' "$work/gvm.log"
+p=$(grep -c '^PASS' "$work/gvm.log"); f=$(grep -c '^FAIL' "$work/gvm.log")
+np=$((np + p)); nf=$((nf + f))
+if ! grep -q '^GVM DONE' "$work/gvm.log"; then
+    fail "gvm tests ran to the end" "exit $grc: $(tail -5 "$work/gvm.log" | tr '\n' ' ')"
+fi
+
+fi
+
+echo "RESULT pass $np fail $nf"
+[ "$nf" = 0 ]

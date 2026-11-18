@@ -1,0 +1,2 @@
+#!/bin/sh
+echo "logger $*" >> "${FAKE_DIR:?}/calls.log"

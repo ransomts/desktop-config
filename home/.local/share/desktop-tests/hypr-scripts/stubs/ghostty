@@ -1,0 +1,4 @@
+#!/bin/sh
+# stub (hypr-scripts-test): record; the ncmpcpp window appears on special:music unless $W/no-window
+echo "ghostty $*" >> "$CALLS"
+[ -e "$W/no-window" ] || python3 -I "$(dirname "$0")/../fakehypr.py" add-client org.tsr.ncmpcpp ncmpcpp special:music

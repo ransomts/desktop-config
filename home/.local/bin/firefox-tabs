@@ -1,0 +1,651 @@
+#!/usr/bin/env python3
+"""Triage a large Firefox tab pile from the command line.
+
+Firefox gives you no way to ask "which of these 82 tabs can go?", so
+this reads sessionstore plus the history DB and sorts them into buckets
+you can act on: duplicates, tabs you keep re-opening (pin them), and
+tabs you have not touched in a week (close or bookmark them).
+
+Read-only by design. Nothing here closes a tab or writes to a Firefox
+database; --export writes a separate HTML file you import yourself.
+
+Caveats worth knowing when reading the output:
+  * sessionstore is flushed on an interval (15s), so very recent tabs
+    may be missing.
+  * history is read with immutable=1, which skips the WAL because
+    Firefox holds an exclusive lock. Visit counts can lag by a session.
+  * lastAccessed is restamped in bulk on session restore, so a stale
+    age is a floor: the tab is at least that old, possibly much older.
+"""
+import argparse
+import collections
+import configparser
+import html
+import json
+import os
+import signal
+import sqlite3
+import sys
+import time
+from urllib.parse import urlparse, urlunparse
+
+import lz4.block
+
+MOZLZ4_MAGIC = b"mozLz40\0"
+PROFILES_INI = os.path.expanduser("~/.mozilla/firefox/profiles.ini")
+
+DEFAULT_STALE_DAYS = 7
+DEFAULT_PIN_VISITS = 40
+
+JUNK_PARAMS = {
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "fbclid", "gclid", "msclkid", "mc_cid", "mc_eid", "_ga", "ref", "ref_src",
+}
+
+# Sites where a tab is a running app, not a document. Age means nothing
+# here (a mail tab open for a month is working as intended), so they are
+# kept out of the stale bucket and pushed toward pinning instead.
+APP_HOSTS = (
+    "mail.google.com", "outlook.office.com", "outlook.cloud.microsoft",
+    "teams.microsoft.com", "teams.cloud.microsoft",
+    "music.youtube.com", "calendar.google.com",
+    "messages.google.com", "web.whatsapp.com", "discord.com", "slack.com",
+)
+
+
+def find_profile(explicit=None):
+    """Return the profile directory to read, or exit with a message."""
+    if explicit:
+        return os.path.expanduser(explicit)
+
+    # profiles.ini is authoritative; globbing *.default-release picks the
+    # wrong one when an old profile is still lying around.
+    if os.path.exists(PROFILES_INI):
+        cfg = configparser.ConfigParser()
+        cfg.read(PROFILES_INI)
+        base = os.path.dirname(PROFILES_INI)
+        for section in cfg.sections():
+            if not section.startswith("Install"):
+                continue
+            path = cfg[section].get("Default")
+            if path:
+                full = path if os.path.isabs(path) else os.path.join(base, path)
+                if os.path.isdir(full):
+                    return full
+        for section in cfg.sections():
+            if cfg[section].get("Default") == "1" and cfg[section].get("Path"):
+                path = cfg[section]["Path"]
+                full = path if os.path.isabs(path) else os.path.join(base, path)
+                if os.path.isdir(full):
+                    return full
+
+    sys.exit("could not find a Firefox profile; pass --profile")
+
+
+def load_session(profile):
+    """Decompress the newest readable sessionstore file in the profile."""
+    backups = os.path.join(profile, "sessionstore-backups")
+    for path in (os.path.join(backups, "recovery.jsonlz4"),
+                 os.path.join(backups, "recovery.baklz4"),
+                 os.path.join(profile, "sessionstore.jsonlz4")):
+        if not os.path.exists(path):
+            continue
+        with open(path, "rb") as fh:
+            blob = fh.read()
+        if not blob.startswith(MOZLZ4_MAGIC):
+            continue
+        try:
+            return json.loads(lz4.block.decompress(blob[len(MOZLZ4_MAGIC):])), path
+        except Exception:
+            continue  # torn write mid-flush; fall through to the backup
+    sys.exit("no readable sessionstore found under %s" % backups)
+
+
+def host_of(url):
+    return urlparse(url).netloc.lower().removeprefix("www.")
+
+
+def normalize(url, keep_query=False):
+    """Collapse the cosmetic differences between two URLs for the same page."""
+    parts = urlparse(url)
+    path = parts.path.rstrip("/") or "/"
+    query = ""
+    if keep_query and parts.query:
+        kept = [p for p in parts.query.split("&")
+                if p.split("=", 1)[0] not in JUNK_PARAMS]
+        query = "&".join(sorted(kept))
+    # Fragment always dropped: #inbox and #settings are the same document
+    # as far as "do I already have this open" goes.
+    scheme = "https" if parts.scheme in ("http", "https") else parts.scheme   # was .replace("http","https"): "https" became "httpss"
+    return urlunparse((scheme,
+                       host_of(url), path, "", query, ""))
+
+
+def collect(session, now_ms):
+    """Flatten every window's tabs into dicts the buckets can sort."""
+    tabs = []
+    for wnum, window in enumerate(session.get("windows", []), 1):
+        for tnum, tab in enumerate(window.get("tabs", []), 1):
+            entries = tab.get("entries") or []
+            if not entries:
+                continue
+            idx = min(tab.get("index", len(entries)) - 1, len(entries) - 1)
+            entry = entries[max(idx, 0)]
+            url = entry.get("url") or ""
+            if not url or url.startswith("about:"):
+                continue  # about:newtab x12 is not a finding
+            tabs.append({
+                "window": wnum,
+                "index": tnum,
+                "url": url,
+                "title": entry.get("title") or "",
+                "host": host_of(url),
+                "age": (now_ms - tab.get("lastAccessed", now_ms)) / 86400000.0,
+                "lastAccessed": tab.get("lastAccessed", 0),
+                "pinned": bool(tab.get("pinned")),
+                # formdata means typed-but-unsubmitted input. Never put one
+                # of these in a bulk-close list.
+                "unsaved": bool(tab.get("formdata")),
+                "depth": len(entries),
+            })
+    return tabs
+
+
+def visit_counts(profile, urls):
+    """Map url -> visit_count from the history DB, or {} if unreadable."""
+    path = os.path.join(profile, "places.sqlite")
+    if not os.path.exists(path) or not urls:
+        return {}
+    # Firefox holds an exclusive lock, so mode=ro fails; immutable=1 reads
+    # the file directly. Skips the WAL, which is fine for a heuristic.
+    try:
+        con = sqlite3.connect("file:%s?immutable=1" % path, uri=True)
+    except sqlite3.Error:
+        return {}
+    counts = {}
+    try:
+        urls = list(urls)
+        for i in range(0, len(urls), 400):
+            chunk = urls[i:i + 400]
+            marks = ",".join("?" * len(chunk))
+            rows = con.execute(
+                "SELECT url, visit_count FROM moz_places WHERE url IN (%s)" % marks,
+                chunk)
+            counts.update(dict(rows))
+    except sqlite3.Error:
+        return {}
+    finally:
+        con.close()
+    return counts
+
+
+def label(tab, width=70):
+    text = tab["title"] or tab["url"]
+    return text[:width]
+
+
+def age_str(days):
+    if days < 1:
+        return "today"
+    if days < 2:
+        return "1 day"
+    return "%d days" % int(days)
+
+
+def find_dupes(tabs, strict):
+    groups = collections.defaultdict(list)
+    for tab in tabs:
+        groups[normalize(tab["url"], keep_query=strict)].append(tab)
+    return sorted((g for g in groups.values() if len(g) > 1), key=lambda g: -len(g))
+
+
+def find_pin(tabs, counts, threshold):
+    """One row per URL you visit constantly but have not pinned.
+
+    A URL already pinned somewhere is not a candidate, even if a second
+    unpinned copy is open: that copy is a duplicate to close, and telling
+    you to pin it again is noise. The duplicates section covers it.
+    """
+    covered = {normalize(t["url"]) for t in tabs if t["pinned"]}
+    best = {}
+    for tab in tabs:
+        key = normalize(tab["url"])
+        if tab["pinned"] or key in covered:
+            continue
+        n = counts.get(tab["url"], 0)
+        if n < threshold:
+            continue
+        if key not in best or n > best[key][1]:
+            best[key] = (tab, n)
+    return sorted(best.values(), key=lambda p: -p[1])
+
+
+def find_stale(tabs, days, exclude=()):
+    """Old tabs worth closing.
+
+    A high-traffic destination is deliberately excluded even when it is
+    old: the advice for those is "pin it", and telling you to both pin
+    and close the same tab is useless.
+    """
+    out = [t for t in tabs
+           if t["age"] >= days
+           and not t["pinned"]
+           and t["host"] not in APP_HOSTS
+           and normalize(t["url"]) not in exclude]
+    return sorted(out, key=lambda t: -t["age"])
+
+
+def find_clusters(tabs, minimum=2):
+    by_host = collections.defaultdict(list)
+    for tab in tabs:
+        by_host[tab["host"]].append(tab)
+    return sorted(((h, v) for h, v in by_host.items() if len(v) >= minimum),
+                  key=lambda kv: -len(kv[1]))
+
+
+PIN_SCRIPT = r"""// Pin %d high-traffic tabs. Generated by firefox-tabs on %s.
+//
+// Paste into the Browser Console (Ctrl+Shift+J), NOT the page console.
+// If the console will not accept typed input, set devtools.chrome.enabled
+// and devtools.debugger.remote-enabled to true in about:config first.
+//
+// Pins only; nothing is closed or navigated. Re-running it is harmless.
+(() => {
+  const TARGETS = [
+%s
+  ];
+  // Same normalisation firefox-tabs uses: drop fragment, query, trailing
+  // slash, and the http/https distinction, so a tab that has drifted
+  // slightly still matches.
+  const norm = u => {
+    try {
+      const p = new URL(u);
+      return p.origin.replace(/^http:/, "https:") + p.pathname.replace(/\/$/, "");
+    } catch (e) { return u; }
+  };
+  const want = new Set(TARGETS.map(norm));
+  const seen = new Set();
+  let pinned = 0, already = 0, dupes = 0;
+
+  for (const win of Services.wm.getEnumerator("navigator:browser")) {
+    // pinTab() reorders the strip, so snapshot before mutating.
+    for (const tab of Array.from(win.gBrowser.tabs)) {
+      let url;
+      try { url = tab.linkedBrowser.currentURI.spec; } catch (e) { continue; }
+      const key = norm(url);
+      if (!want.has(key)) continue;
+      if (tab.pinned) { already++; seen.add(key); continue; }
+      if (seen.has(key)) { dupes++; continue; }   // pin one copy, leave the rest
+      try { win.gBrowser.pinTab(tab); pinned++; seen.add(key); }
+      catch (e) { console.error("could not pin", url, e); }
+    }
+  }
+  const msg = `pinned ${pinned}, already pinned ${already}, duplicates left alone ${dupes}`;
+  console.log(msg);
+  return msg;
+})();
+"""
+
+
+def pin_script(pins):
+    """Emit chrome-privileged JS that pins the candidates in the live browser."""
+    urls = "\n".join('    "%s",' % t["url"].replace('"', '\\"') for t, _ in pins)
+    return PIN_SCRIPT % (len(pins), time.strftime("%Y-%m-%d"), urls)
+
+
+# Topic rules, checked in order; first match wins. These are seeded from
+# what was actually open when the tool was written - edit freely, or drop a
+# replacement list in ~/.config/firefox-tabs/topics.json as
+# [["Topic name", ["keyword", ...]], ...]. Keywords match title+URL,
+# case-insensitively.
+TOPIC_RULES = [
+    ("Knowledge transfer & rhetoric", [
+        "knowledge transfer", "rhetoric", "transfer in cognitive", "near and far",
+        "agents of integration", "telliel", "julie ford", "gagn", "implicit skills",
+        "r&d knowledge", "mechanisms of knowledge",
+    ]),
+    ("CS education research", [
+        "cognitive load", "tpack", "pedagogical content", "novice programmer",
+        "student modelling", "learning sciences", "computers-and-education",
+        "computers & education", "s-stem", "aera", "triquest", "constraint-based",
+        "sagepub", "springer", "tandfonline", "wiley", "sci-hub", "proquest",
+        "scholar.google", "sciencedirect",
+    ]),
+    ("Grants & funding", [
+        "grants.gov", "imls", "spin database", "opportunity listing",
+        "broad agency", "national leadership", "museums for america", "compass",
+        "research innovation center", "infoedglobal",
+    ]),
+    ("Teaching & courses", [
+        "instructure", "gradescope", "syllabus", "degree works", "navigate360",
+        "iroar", "cpsc", "4300-6300", "coding plan", "journal 0", "simple syllabus",
+    ]),
+    ("Dev & infra", [
+        "github", "codecov", "git.", "jupyter", "ondemand", "ubuntu",
+        "nika", "org-canvas", "batch_connect", "127.0.0.1",
+        "r vs. python", "service portal",
+    ]),
+    ("Home & shopping", [
+        "planer", "shaker furniture", "gravel", "muffuletta", "foreveryard",
+    ]),
+    ("Games & music", [
+        "osrs", "runescape", "youtube music", "who loves the sun", "wfmu",
+        "techtonic", "ectofuntus",
+    ]),
+    ("Law & SC courts", ["supreme court", "judicial branch"]),
+    ("Reading & ideas", [
+        "popper", "ineffable", "jordan peterson", "para method", "theverge",
+        "goodreads", "ethical evaluations", "wikipedia",
+    ]),
+]
+TOPICS_OVERRIDE = os.path.expanduser("~/.config/firefox-tabs/topics.json")
+UNSORTED = "Unsorted"
+
+
+def load_topics():
+    """TOPIC_RULES, unless the user dropped a replacement list on disk."""
+    if os.path.exists(TOPICS_OVERRIDE):
+        try:
+            with open(TOPICS_OVERRIDE) as fh:
+                return [(name, [k.lower() for k in words])
+                        for name, words in json.load(fh)]
+        except Exception as exc:
+            print("ignoring %s: %s" % (TOPICS_OVERRIDE, exc), file=sys.stderr)
+    return TOPIC_RULES
+
+
+def topic_of(tab, rules):
+    haystack = ("%s %s" % (tab["title"], tab["url"])).lower()
+    for name, words in rules:
+        if any(word in haystack for word in words):
+            return name
+    return UNSORTED
+
+
+def session_label(tabs, rules):
+    """Name a burst after the topic most of its tabs share."""
+    counts = collections.Counter(topic_of(t, rules) for t in tabs)
+    named = [(n, c) for n, c in counts.most_common() if n != UNSORTED]
+    if named and named[0][1] > 1:
+        return named[0][0]
+    hosts = collections.Counter(t["host"] for t in tabs).most_common(1)
+    return hosts[0][0] if hosts else "mixed"
+
+
+def group_tabs(tabs, mode, rules, gap_minutes):
+    """Return [(heading, [tab, ...]), ...] for the requested grouping."""
+    if mode == "session":
+        # A gap in lastAccessed is the seam between two sittings, which is
+        # the closest thing the session file has to "train of thought".
+        ordered = sorted(tabs, key=lambda t: t["lastAccessed"])
+        bursts, current = [], []
+        for tab in ordered:
+            if current and (tab["lastAccessed"] - current[-1]["lastAccessed"]) \
+                    > gap_minutes * 60000:
+                bursts.append(current)
+                current = []
+            current.append(tab)
+        if current:
+            bursts.append(current)
+        sections = []
+        for burst in reversed(bursts):   # most recent sitting first
+            start = time.localtime(burst[0]["lastAccessed"] / 1000)
+            end = time.localtime(burst[-1]["lastAccessed"] / 1000)
+            span = time.strftime("%b %-d, %H:%M", start)
+            if time.strftime("%H:%M", end) != time.strftime("%H:%M", start):
+                span += time.strftime("-%H:%M", end)
+            # Session restore restamps tabs in bulk, so a "burst" where most
+            # tabs share one second is an artefact, not a sitting. Say so
+            # rather than implying the tabs were opened together.
+            stamps = collections.Counter(t["lastAccessed"] // 1000 for t in burst)
+            restored = len(burst) > 2 and stamps.most_common(1)[0][1] > len(burst) / 2
+            note = " [restored together, not a real sitting]" if restored else ""
+            sections.append(("%s — %s (%d tab%s)%s"
+                             % (span, session_label(burst, rules), len(burst),
+                                "" if len(burst) == 1 else "s", note),
+                             burst))
+        return sections
+
+    if mode == "topic":
+        buckets = collections.defaultdict(list)
+        for tab in tabs:
+            buckets[topic_of(tab, rules)].append(tab)
+        order = [name for name, _ in rules if name in buckets]
+        if UNSORTED in buckets:
+            order.append(UNSORTED)
+        return [("%s (%d tab%s)" % (name, len(buckets[name]),
+                                    "" if len(buckets[name]) == 1 else "s"),
+                 buckets[name]) for name in order]
+
+    if mode == "domain":
+        buckets = collections.defaultdict(list)
+        for tab in tabs:
+            buckets[tab["host"]].append(tab)
+        return [("%s (%d tab%s)" % (h, len(v), "" if len(v) == 1 else "s"), v)
+                for h, v in sorted(buckets.items(), key=lambda kv: (-len(kv[1]), kv[0]))]
+
+    buckets = collections.defaultdict(list)
+    for tab in tabs:
+        buckets[tab["window"]].append(tab)
+    return [("Window %d (%d tab%s)" % (w, len(buckets[w]),
+                                       "" if len(buckets[w]) == 1 else "s"), buckets[w])
+            for w in sorted(buckets)]
+
+
+def render_list(tabs, dupes, stale, stale_days, fmt, meta, sections):
+    """Render tabs as a reviewable list, annotated with why each stands out."""
+    dup_keys = {normalize(g[0]["url"]) for g in dupes}
+    stale_ids = {(t["window"], t["index"]) for t in stale}
+
+    def markers(tab):
+        out = []
+        if tab["pinned"]:
+            out.append("pinned")
+        if normalize(tab["url"]) in dup_keys:
+            out.append("dup")
+        if (tab["window"], tab["index"]) in stale_ids:
+            out.append("stale %s" % age_str(tab["age"]))
+        if tab["unsaved"]:
+            out.append("unsaved")
+        return out
+
+    summary = ("%d tabs, %d windows, %d pinned. Grouped by %s. "
+               "Stale = untouched %d+ days."
+               % (meta["tabs"], meta["windows"], meta["pinned"],
+                  meta["group_by"], stale_days))
+    lines = []
+    if fmt == "org":
+        lines += ["#+TITLE: Firefox tab triage",
+                  "#+DATE: %s" % time.strftime("%Y-%m-%d"),
+                  "#+STARTUP: content", "", summary, ""]
+        for heading, group in sections:
+            # [/] makes org track checked items as you triage (C-c C-c).
+            lines.append("* %s [/]" % heading)
+            for tab in group:
+                tags = markers(tab)
+                suffix = ("  " + " ".join("=%s=" % m for m in tags)) if tags else ""
+                title = (tab["title"] or tab["url"]).replace("[", "(").replace("]", ")")
+                lines.append("- [ ] [[%s][%s]]%s  /w%d#%d/"
+                             % (tab["url"], title, suffix, tab["window"], tab["index"]))
+            lines.append("")
+    else:
+        lines += ["Firefox tabs — %s" % time.strftime("%Y-%m-%d %H:%M"), summary, ""]
+        for heading, group in sections:
+            lines += [heading, "=" * len(heading), ""]
+            for tab in group:
+                tags = markers(tab)
+                suffix = ("  [%s]" % ", ".join(tags)) if tags else ""
+                lines.append("  %-6s %s%s"
+                             % ("w%d#%d" % (tab["window"], tab["index"]),
+                                tab["title"] or tab["url"], suffix))
+                lines.append("         %s" % tab["url"])
+            lines.append("")
+    return "\n".join(lines)
+
+
+def export_html(tabs, path):
+    """Write a Netscape bookmark file: Bookmarks > Import > HTML in Firefox."""
+    by_host = collections.defaultdict(list)
+    for tab in tabs:
+        by_host[tab["host"]].append(tab)
+    stamp = int(time.time())
+    lines = ['<!DOCTYPE NETSCAPE-Bookmark-file-1>',
+             '<META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=UTF-8">',
+             '<TITLE>Bookmarks</TITLE>', '<H1>Bookmarks</H1>', '<DL><p>',
+             '    <DT><H3>Tab triage %s</H3>' % time.strftime("%Y-%m-%d"),
+             '    <DL><p>']
+    for host in sorted(by_host, key=lambda h: -len(by_host[h])):
+        lines.append('        <DT><H3>%s</H3>' % html.escape(host))
+        lines.append('        <DL><p>')
+        for tab in by_host[host]:
+            lines.append('            <DT><A HREF="%s" ADD_DATE="%d">%s</A>'
+                         % (html.escape(tab["url"], quote=True), stamp,
+                            html.escape(tab["title"] or tab["url"])))
+        lines.append('        </DL><p>')
+    lines += ['    </DL><p>', '</DL><p>', '']
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines))
+    return sum(len(v) for v in by_host.values())
+
+
+def main():
+    # Let `firefox-tabs --list | head` exit quietly instead of raising.
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+    ap = argparse.ArgumentParser(
+        description="Triage Firefox tabs: duplicates, pin candidates, stale tabs.")
+    ap.add_argument("--profile", help="profile directory (default: auto)")
+    ap.add_argument("--only", choices=["dupes", "pin", "stale", "groups"],
+                    help="show a single section instead of the full report")
+    ap.add_argument("--stale-days", type=int, default=DEFAULT_STALE_DAYS,
+                    metavar="N", help="stale threshold (default %d)" % DEFAULT_STALE_DAYS)
+    ap.add_argument("--pin-visits", type=int, default=DEFAULT_PIN_VISITS,
+                    metavar="N", help="visits before suggesting a pin (default %d)"
+                    % DEFAULT_PIN_VISITS)
+    ap.add_argument("--strict", action="store_true",
+                    help="compare full URLs; do not ignore query strings")
+    ap.add_argument("--urls", action="store_true",
+                    help="print bare URLs for the selected section")
+    ap.add_argument("--export", metavar="FILE",
+                    help="write stale tabs as an importable bookmarks HTML file")
+    ap.add_argument("--pin-script", action="store_true",
+                    help="print Browser Console JS that pins the candidates")
+    ap.add_argument("--list", action="store_true",
+                    help="print every tab as an annotated list (redirect to a file)")
+    ap.add_argument("--format", choices=["text", "org"], default="text",
+                    help="format for --list (default: text)")
+    ap.add_argument("--group-by", choices=["window", "topic", "session", "domain"],
+                    default="window", dest="group_by",
+                    help="how --list groups tabs (default: window)")
+    ap.add_argument("--session-gap", type=int, default=30, metavar="MIN",
+                    help="idle gap that separates sessions (default: 30 min)")
+    args = ap.parse_args()
+
+    profile = find_profile(args.profile)
+    session, path = load_session(profile)
+    tabs = collect(session, time.time() * 1000)
+    if not tabs:
+        sys.exit("no open tabs found in %s" % path)
+
+    counts = visit_counts(profile, {t["url"] for t in tabs})
+    dupes = find_dupes(tabs, args.strict)
+    pins = find_pin(tabs, counts, args.pin_visits)
+    stale = find_stale(tabs, args.stale_days,
+                       exclude={normalize(t["url"]) for t, _ in pins})
+    clusters = find_clusters(tabs)
+
+    if args.list:
+        sections = group_tabs(tabs, args.group_by, load_topics(), args.session_gap)
+        print(render_list(tabs, dupes, stale, args.stale_days, args.format,
+                          {"tabs": len(tabs),
+                           "windows": len(session.get("windows", [])),
+                           "pinned": sum(1 for t in tabs if t["pinned"]),
+                           "group_by": args.group_by},
+                          sections))
+        return
+
+    if args.pin_script:
+        if not pins:
+            sys.exit("no pin candidates at --pin-visits %d" % args.pin_visits)
+        print(pin_script(pins), end="")
+        return
+
+    if args.export:
+        n = export_html(stale, args.export)
+        print("wrote %d stale tab%s to %s" % (n, "" if n == 1 else "s", args.export))
+        print("import with Bookmarks > Manage Bookmarks > Import and Backup "
+              "> Import Bookmarks from HTML")
+        if not args.only:
+            return
+
+    if args.urls:
+        picked = {"dupes": [t for g in dupes for t in g[1:]],
+                  "pin": [t for t, _ in pins],
+                  "stale": stale,
+                  "groups": []}.get(args.only or "dupes", [])
+        for tab in picked:
+            print(tab["url"])
+        return
+
+    show = lambda name: args.only in (None, name)
+    windows = len(session.get("windows", []))
+    pinned = sum(1 for t in tabs if t["pinned"])
+    unsaved = [t for t in stale if t["unsaved"]]
+
+    if not args.only:
+        print("%d tabs · %d windows · %d pinned · %s"
+              % (len(tabs), windows, pinned, os.path.basename(path)))
+
+    if show("dupes"):
+        redundant = sum(len(g) - 1 for g in dupes)
+        print("\nDUPLICATES — %d tab%s to close"
+              % (redundant, "" if redundant == 1 else "s"))
+        if not dupes:
+            print("  none")
+        for group in dupes:
+            print("  x%d  %s" % (len(group), label(group[0])))
+            for tab in group:
+                print("        window %d, tab %d%s"
+                      % (tab["window"], tab["index"],
+                         "  [unsaved input]" if tab["unsaved"] else ""))
+
+    if show("pin"):
+        print("\nPIN THESE — %d page%s you keep re-opening"
+              % (len(pins), "" if len(pins) == 1 else "s"))
+        if not pins:
+            print("  none")
+        for tab, n in pins:
+            print("  %5d visits  w%d#%-3d %s" % (n, tab["window"], tab["index"],
+                                                 label(tab, 58)))
+
+    if show("stale"):
+        print("\nSTALE — %d tab%s untouched %d+ days"
+              % (len(stale), "" if len(stale) == 1 else "s", args.stale_days))
+        if not stale:
+            print("  none")
+        for tab in stale:
+            print("  %-8s w%d#%-3d %s%s"
+                  % (age_str(tab["age"]), tab["window"], tab["index"],
+                     label(tab, 58), "  [unsaved input]" if tab["unsaved"] else ""))
+        if unsaved:
+            print("\n  %d of these hold typed-but-unsubmitted input — check "
+                  "before closing." % len(unsaved))
+
+    if show("groups"):
+        print("\nGROUP — sites with enough tabs to be worth a tab group")
+        if not clusters:
+            print("  none")
+        for host, group in clusters:
+            print("  %3d  %-38s %s" % (len(group), host,
+                                       "w%s" % ",".join(
+                                           sorted({str(t["window"]) for t in group}))))
+
+    if not args.only:
+        print("\nNext: right-click a tab > Pin Tab, or > Add Tab to New Group.")
+        print("Pin them all at once:      firefox-tabs --pin-script")
+        print("Bank the stale ones with:  firefox-tabs --export ~/tabs.html")
+        print("Read them as a list:       firefox-tabs --list > ~/tabs.txt")
+
+
+if __name__ == "__main__":
+    main()

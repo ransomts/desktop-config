@@ -1,0 +1,182 @@
+#!/bin/sh
+# Tests for the lecture tools (Quickshell Lecture*.qml, Ink.qml) and the scripts behind them.
+#
+#   lecture-test               run everything, dark and light theme; PASS/FAIL lines and a summary; exit 1 on a failure
+#   lecture-test -v            also print everything Quickshell logged
+#   lecture-test -o FILE.png   save pictures: FILE-dark-draw.png, FILE-dark-spot.png, FILE-light-draw.png, FILE-light-spot.png
+#   lecture-test -d DIR        test the config in DIR instead of ~/.config/quickshell (scripts from DIR/../bin if there)
+#
+# Parts:
+#  - overlays: the real Lecture.qml, Ink.qml and Lecture*View.qml over a mock slide, offscreen,
+#    driven with synthetic mouse and key events and a fake clock (cases in
+#    ~/.config/quickshell/tests/lecture/shell.qml, stub Sys beside it): each draw tool,
+#    Shift, undo/redo/clear, strokes round trip, the draw keys and hold, the timer,
+#    key-display lines, spotlight geometry, zoom commands, the panel block, allOff,
+#    presenting ending. Nothing is run, no sound plays, no keyboard is read.
+#  - lecture-keys: its key-to-line mapping (US and Dvorak), from made-up key codes.
+#  - lecture-menu: the menu lines and the IPC call for a choice, against a fake qs and qs-pick.
+#  - cursor-track: exits when its stdin closes (one read of the real pointer position).
+# The picture also shows the pixels: the spotlight is checked to be clear at the pointer
+# and dark far from it.
+verbose=0; out=""; src="$HOME/.config/quickshell"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) verbose=1 ;;
+        -o) out="$2"; shift ;;
+        -d) src="$2"; shift ;;
+        *) echo "usage: lecture-test [-v] [-o FILE.png] [-d CONFIG_DIR]" >&2; exit 2 ;;
+    esac
+    shift
+done
+bin="$HOME/.local/bin"
+[ -x "$src/../bin/lecture-keys" ] && bin=$(cd "$src/../bin" && pwd)
+qs="$HOME/.nix-profile/bin/qs"
+tests="$src/tests/lecture"
+[ -d "$tests" ] || tests="$HOME/.config/quickshell/tests/lecture"
+[ -x "$qs" ] && [ -f "$tests/shell.qml" ] || { echo "lecture-test: no qs, or no $tests/shell.qml" >&2; exit 2; }
+
+work=$(mktemp -d) || exit 2
+trap 'rm -rf "$work"' EXIT
+ok=0
+
+for mode in dark light; do
+    rm -rf "$work/cfg" "$work/state" "$work/home" "$work/run"
+    mkdir -p "$work/cfg" "$work/state" "$work/run" "$work/home/.config/cosmic/com.system76.CosmicTheme.Mode/v1"
+    [ "$mode" = dark ] && echo true > "$work/home/.config/cosmic/com.system76.CosmicTheme.Mode/v1/is_dark" \
+                      || echo false > "$work/home/.config/cosmic/com.system76.CosmicTheme.Mode/v1/is_dark"
+    touch "$work/run/presenting"
+    for f in Theme Caption Lecture Ink LectureDraw LectureDrawView LectureSpot LectureSpotView LectureKeys LectureKeysView \
+             LectureTimer LectureTimerView LecturePanel; do
+        cp "$src/$f.qml" "$work/cfg/"
+    done
+    cp "$tests"/*.qml "$work/cfg/"
+    # PanelWindow has no backend offscreen: the windows load on a stand-in (tests/lecture/StubPanel.qml)
+    sed -i 's/^\( *\)PanelWindow {/\1StubPanel {/; s/^\( *\)WlrLayershell\./\1\/\/ WlrLayershell./' "$work/cfg/LectureDraw.qml" "$work/cfg/LectureSpot.qml" "$work/cfg/LectureKeys.qml" "$work/cfg/LectureTimer.qml"
+    # fake scripts for those windows to run: a pointer at 400,300 and three key presses
+    mkdir -p "$work/fakebin"
+    printf '#!/bin/sh\necho "400 300"\nexec cat > /dev/null\n' > "$work/fakebin/cursor-track"
+    printf '#!/bin/sh\nprintf "Ctrl\\tC\\n\\to\\n\\tk\\n"\nexec cat > /dev/null\n' > "$work/fakebin/lecture-keys"
+    chmod +x "$work/fakebin/cursor-track" "$work/fakebin/lecture-keys"
+    pic=""; [ -n "$out" ] && pic="${out%.png}-$mode.png"
+    log="$work/log-$mode"
+    echo "== overlays ($mode theme)"
+    env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u QT_QPA_PLATFORMTHEME -u QT_STYLE_OVERRIDE \
+        QT_QPA_PLATFORM=offscreen HOME="$work/home" XDG_STATE_HOME="$work/state" XDG_RUNTIME_DIR="$work/run" \
+        LECTURE_TEST_OUT="$pic" LECTURE_TEST_BIN="$work/fakebin" \
+        dbus-run-session -- timeout 90 "$qs" -p "$work/cfg/shell.qml" --no-color > "$log" 2>&1
+    code=$?
+    [ "$verbose" = 1 ] && cat "$log"
+    grep -o 'LECTURETEST \(PASS\|FAIL\|case:\|RESULT\).*' "$log" | sed 's/^LECTURETEST //' | grep -v '^case:'
+    if ! grep -q 'LECTURETEST RESULT' "$log"; then
+        echo "lecture-test: the $mode run did not finish (exit $code). Last lines:" >&2
+        grep -vE 'dbus-daemon|portal' "$log" | tail -15 >&2
+        ok=1; continue
+    fi
+    grep -q 'LECTURETEST RESULT pass [0-9]* fail 0$' "$log" || ok=1
+    if grep -q '\(Lecture\|Ink\)[A-Za-z]*\.qml.*\(TypeError\|ReferenceError\|Binding loop\|Unable to assign\|is not a\)' "$log"; then
+        echo "FAIL the lecture files logged errors:"; grep '\(Lecture\|Ink\)[A-Za-z]*\.qml' "$log" | sort -u | head -8; ok=1
+    fi
+    if [ -n "$pic" ] && [ -f "${pic%.png}-spot.png" ]; then
+        python3 -I - "${pic%.png}-draw.png" "${pic%.png}-spot.png" <<'EOF' || ok=1
+import sys
+from PIL import Image
+draw, spot = Image.open(sys.argv[1]).convert("RGB"), Image.open(sys.argv[2]).convert("RGB")
+lum = lambda p: 0.3 * p[0] + 0.59 * p[1] + 0.11 * p[2]
+bad = 0
+def check(what, ok, detail=""):
+    global bad
+    bad += not ok
+    print(("PASS " if ok else "FAIL ") + what + ("" if ok else "   [" + detail + "]"))
+# spotlight at (260, 330), radius 150: the pointer spot as bright as without it, far away much darker
+for x, y in [(260, 330), (330, 330)]:
+    a, b = lum(draw.getpixel((x, y))), lum(spot.getpixel((x, y)))
+    check(f"spot picture: clear at ({x},{y})", abs(a - b) < 3, f"{a:.0f} vs {b:.0f}")
+for x, y in [(1100, 100), (700, 330), (20, 780)]:
+    a, b = lum(draw.getpixel((x, y))), lum(spot.getpixel((x, y)))
+    check(f"spot picture: dimmed at ({x},{y})", b < a * 0.5 + 1, f"{a:.0f} -> {b:.0f}")
+# the soft edge: brightness falls off between the radius and radius + feather
+# (straight down from the pointer, where the slide is plain background)
+e = [lum(spot.getpixel((260, 330 + r))) / max(1, lum(draw.getpixel((260, 330 + r)))) for r in (140, 155, 165, 175, 195)]
+check("spot picture: soft edge falls off outward", all(a >= b - 0.02 for a, b in zip(e, e[1:])) and e[0] - e[-1] > 0.3, str([round(v, 2) for v in e]))
+sys.exit(1 if bad else 0)
+EOF
+    fi
+done
+
+echo "== lecture-keys mapping"
+python3 -I - "$bin/lecture-keys" <<'EOF' || ok=1
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("lk", sys.argv[1])
+spec = importlib.util.spec_from_loader("lk", loader); lk = importlib.util.module_from_spec(spec); loader.exec_module(lk)
+from evdev import ecodes as e
+bad = 0
+cases = [  # (code, held, layout, expected line)
+    (e.KEY_H, set(), "us", "\th"), (e.KEY_H, set(), "dvorak", "\td"), (e.KEY_H, {"Shift"}, "dvorak", "\tD"),
+    (e.KEY_1, {"Shift"}, "us", "\t!"), (e.KEY_Q, set(), "dvorak", "\t'"), (e.KEY_Z, {"Shift"}, "dvorak", "\t:"),
+    (e.KEY_C, {"Ctrl"}, "us", "Ctrl\tC"), (e.KEY_I, {"Ctrl"}, "dvorak", "Ctrl\tC"),
+    (e.KEY_D, {"Super", "Shift"}, "us", "Super+Shift\tD"), (e.KEY_D, {"Super", "Shift"}, "dvorak", "Super+Shift\tE"),
+    (e.KEY_TAB, {"Alt"}, "us", "Alt\tTab"), (e.KEY_TAB, {"Shift"}, "us", "Shift\tTab"),
+    (e.KEY_ESC, set(), "us", "\tEsc"), (e.KEY_ENTER, set(), "dvorak", "\tEnter"), (e.KEY_SPACE, set(), "us", "\tSpace"),
+    (e.KEY_F5, set(), "us", "\tF5"), (e.KEY_LEFT, {"Ctrl", "Alt"}, "us", "Ctrl+Alt\tLeft"),
+    (e.KEY_EQUAL, {"Super"}, "us", "Super\t="), (e.KEY_RIGHTBRACE, {"Super"}, "dvorak", "Super\t="),
+    (e.KEY_BACKSLASH, {"Super"}, "us", "Super\t\\"), (e.KEY_KP5, set(), "us", "\t5"),
+]
+for code, held, lay, want in cases:
+    got = lk.line_for(code, held, lay)
+    ok = got == want
+    bad += not ok
+    print(("PASS " if ok else "FAIL ") + f"{lay} {sorted(held)} {e.KEY[code] if not isinstance(e.KEY[code], list) else e.KEY[code][0]} -> {want!r}" + ("" if ok else f"   [got {got!r}]"))
+class D:  # a fake device for the layout choice
+    def __init__(s, n): s.name = n
+lay = lk.Layouts(["Moonlander=us"]); lay.live = {"at-translated-set-2-keyboard": "dvorak"}
+lay.default = "auto"
+c = [lay.of(D("ZSA Technology Labs Moonlander Mark I")), lay.of(D("AT Translated Set 2 keyboard"))]
+ok = c == ["us", "dvorak"]; bad += not ok
+print(("PASS " if ok else "FAIL ") + "layout per device: Moonlander us, laptop follows Hyprland" + ("" if ok else f"   [{c}]"))
+lay.event("at-translated-set-2-keyboard,English (US)")
+ok = lay.of(D("AT Translated Set 2 keyboard")) == "us"; bad += not ok
+print(("PASS " if ok else "FAIL ") + "Super+Space to US is followed")
+sys.exit(1 if bad else 0)
+EOF
+# no keyboard readable here (or the 0.5 s limit): it must exit by itself, quickly, writing nothing
+t0=$(date +%s)
+timeout 10 "$bin/lecture-keys" --max-seconds 0.5 < /dev/null > "$work/lk.out" 2>&1
+code=$?
+if [ "$code" -ne 124 ] && [ $(( $(date +%s) - t0 )) -le 3 ]; then echo "PASS lecture-keys stops by itself (exit $code, said: $(head -c 40 "$work/lk.out" | tr '\n' ' '))"
+else echo "FAIL lecture-keys did not stop by itself (exit $code)"; ok=1; fi
+
+echo "== lecture-menu"
+mkdir -p "$work/fake/.nix-profile/bin" "$work/fake/.local/bin"
+cat > "$work/fake/.nix-profile/bin/qs" <<'EOF'
+#!/bin/sh
+[ "$4" = status ] && { echo "draw=off tool=pen colour=orange weight=4 spot=on spotsize=150 zoom=1.5 keys=off timer=04:10 label=Pop_quiz presenting=yes"; exit 0; }
+echo "$*" >> "$HOME/calls"
+EOF
+cat > "$work/fake/.local/bin/qs-pick" <<'EOF'
+#!/bin/sh
+cat > "$HOME/lines"; grep -m1 -- "$PICK" "$HOME/lines"
+EOF
+chmod +x "$work/fake/.nix-profile/bin/qs" "$work/fake/.local/bin/qs-pick"
+menu() { rm -f "$work/fake/calls"; HOME="$work/fake" PICK="$1" sh "$bin/lecture-menu"; cat "$work/fake/calls" 2>/dev/null; }
+mcheck() { if [ "$2" = "$3" ]; then echo "PASS menu: $1"; else echo "FAIL menu: $1   [got '$3', want '$2']"; ok=1; fi; }
+mcheck "spot line shows on" "ipc call lecture spot" "$(menu '^spot ')"
+mcheck "spotsize offered while on" "ipc call lecture spotsize 250" "$(menu '^spotsize   250')"
+mcheck "timer 15" "ipc call lecture timer 15 " "$(menu '^timer      15 min')"
+mcheck "timer stop" "ipc call lecture timerstop" "$(menu '^timerstop ')"
+mcheck "timer pause shows time left and label" "ipc call lecture timerpause" "$(menu 'Pop quiz)')"
+mcheck "timer reset" "ipc call lecture timerreset" "$(menu '^timerreset ')"
+mcheck "zoom shows the level" "ipc call lecture zoomin" "$(menu 'now 1.5x')"
+mcheck "everything off" "ipc call lecture off" "$(menu 'Everything off')"
+n=$(grep -c . "$work/fake/lines"); mcheck "line count (no ink lines while not drawing)" "21" "$n"
+
+echo "== cursor-track"
+if [ -n "$HYPRLAND_INSTANCE_SIGNATURE" ]; then
+    t0=$(date +%s)
+    (sleep 1) | timeout 5 "$bin/cursor-track" > "$work/ct.out"
+    code=$?
+    if [ "$code" -eq 0 ] && grep -qE '^-?[0-9]+ -?[0-9]+$' "$work/ct.out"; then echo "PASS cursor-track prints x y and stops when stdin closes"
+    else echo "FAIL cursor-track (exit $code): $(head -2 "$work/ct.out")"; ok=1; fi
+else echo "skip cursor-track (not in Hyprland)"; fi
+
+[ "$ok" = 0 ] && echo "ALL PASS" || echo "SOME FAILED"
+exit $ok

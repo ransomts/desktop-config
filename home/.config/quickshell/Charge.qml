@@ -4,7 +4,9 @@ pragma Singleton
 //   Charge.label     plain name: "Full charge", "Balanced (stops at 90%)", "Longest life (stops at 60%)"
 //   Charge.limited   a limit is active (anything but full charge)
 //   Charge.tip       "Charging stops at 90%" while limited, else ""
-//   Charge.set(name) full_charge | balanced | max_lifespan;  Charge.next() cycles;  Charge.refresh() reads again
+//   Charge.set(name) full_charge | balanced | max_lifespan | cap;  Charge.next() cycles;  Charge.refresh() reads again
+//   Charge.cap       where the docked cap stops (charge-profile's CHARGE_CAP, 80);  Charge.capped: that cap is on
+//   Charge.toggle()  full charge when any limit is on, otherwise the cap (the battery pill's right-click)
 // Read once when the shell starts, when the control panel opens (Sys.panelOpen) and after every
 // change; never polled. A change asks polkit for authorisation (auth_admin), so the desktop's
 // password prompt appears and `busy` stays true until it is answered. The percentages come from
@@ -20,6 +22,7 @@ Singleton {
     property string profile: ""
     property int start: 0
     property int end: 100
+    property int cap: 80
     property var profiles: ({})             // id -> { title, start, end }, from `charge-profile list`
     property bool loaded: false
     property bool busy: false
@@ -35,15 +38,17 @@ Singleton {
         if (p === "full_charge") return "Full charge"
         if (p === "balanced") return "Balanced (stops at " + ends(p) + "%)"
         if (p === "max_lifespan") return "Longest life (stops at " + ends(p) + "%)"
-        return p === "" ? "" : "Custom (stops at " + ends(p) + "%)"
+        return p === "" ? "" : "Stops at " + ends(p) + "%"
     }
     readonly property string label: nameOf(profile)
     readonly property bool limited: loaded && profile !== "full_charge" && end < 100
+    readonly property bool capped: loaded && profile === "custom" && end === cap
     readonly property string tip: limited ? "Charging stops at " + end + "%" : ""
 
     function refresh() { if (!reader.running) reader.running = true }
-    function set(name) { if (!busy && /^(full_charge|balanced|max_lifespan)$/.test(name)) { busy = true; error = ""; setter.command = Sys.clean.concat([Sys.bin + "charge-profile", "set", name]); setter.running = true } }
+    function set(name) { if (!busy && /^(full_charge|balanced|max_lifespan|cap)$/.test(name)) { busy = true; error = ""; setter.command = Sys.clean.concat([Sys.bin + "charge-profile", "set", name]); setter.running = true } }
     function next() { if (!busy) { busy = true; error = ""; error = ""; setter.command = Sys.clean.concat([Sys.bin + "charge-profile", "next"]); setter.running = true } }
+    function toggle() { if (!busy) { busy = true; error = ""; setter.command = Sys.clean.concat([Sys.bin + "charge-profile", "toggle"]); setter.running = true } }
     function status() { return loaded ? label + " (" + profile + ", " + start + "-" + end + ")" + (busy ? ", waiting" : "") : "unknown" }
 
     // two lines: the status object, then the profile list
@@ -56,6 +61,7 @@ Singleton {
                 try {
                     const s = JSON.parse(lines[0])
                     charge.profile = String(s.profile); charge.start = s.start; charge.end = s.end
+                    if (s.capto > 0) charge.cap = s.capto
                     if (lines.length > 1) charge.profiles = JSON.parse(lines[1])
                     charge.loaded = true
                 } catch (e) { charge.error = "unreadable" }

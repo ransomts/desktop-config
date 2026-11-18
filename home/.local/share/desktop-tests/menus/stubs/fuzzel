@@ -1,0 +1,17 @@
+#!/bin/sh
+# fuzzel stand-in: logs its arguments, keeps its stdin in $MT/fuzzel-in, and answers from the
+# same queues as the qs stand-in ($MT/picks for lists, $MT/answers for --prompt-only input).
+line=fuzzel; idx=0; ask=0
+for a in "$@"; do line="$line [$a]"; [ "$a" = --index ] && idx=1; [ "$a" = --prompt-only ] && ask=1; done
+printf '%s\n' "$line" >> "$MT/calls"
+pop() { [ -s "$1" ] || return 1; head -n 1 "$1"; sed -i 1d "$1"; }
+cat > "$MT/fuzzel-in"
+if [ "$ask" = 1 ]; then
+    a=$(pop "$MT/answers") || exit 1
+    case "$a" in ok:*) printf '%s\n' "${a#ok:}"; exit 0 ;; *) exit 1 ;; esac
+fi
+want=$(pop "$MT/picks") || exit 1
+[ "$want" = CANCEL ] && exit 1
+n=$(grep -nF -- "$want" "$MT/fuzzel-in" | head -n 1 | cut -d: -f1)
+[ -n "$n" ] || exit 1
+if [ "$idx" = 1 ]; then echo $((n - 1)); else sed -n "${n}p" "$MT/fuzzel-in"; fi

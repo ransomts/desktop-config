@@ -1,0 +1,84 @@
+#!/bin/sh
+# Tests for the background-job health feature: shell-health, and the Quickshell pill, popup and singleton.
+#
+#   health-test               run everything; PASS/FAIL lines and a summary; exit 1 on a failure
+#   health-test -v            also print everything Quickshell logged
+#   health-test -o PREFIX     save PREFIX-dark.png and PREFIX-light.png (the pill over the popup)
+#   health-test -d DIR        test the config in DIR instead of ~/.config/quickshell
+#   health-test -b DIR        take shell-health and updates-check from DIR (default: next to this script, else ~/.local/bin)
+#
+# Two parts:
+#  - script: shell-health against fake systemctl, findmnt and gsettings on PATH and made-up state
+#    files in a temporary HOME (tests/health/script-test.py): ok, stale, failed, off, offline, and the
+#    notices (updates, disk with a fake statvfs table, hidden jobs, health.json). The real systemd,
+#    state and disks are never read.
+#  - updates: updates-check against fake apt, flatpak and fwupdmgr on a private PATH
+#    (tests/health/updates-test.py): none, some, security, stale lists, offline, timeouts, missing tools,
+#    reboot, the cache.
+#  - qml: the real Health.qml, HealthPill.qml, HealthList.qml and Theme (is_dark unhooked) with a
+#    stub Sys (tests/health), offscreen, with made-up answers and synthetic mouse events. Nothing
+#    is launched; XDG_STATE_HOME is a temporary directory.
+verbose=0; out=""; src="$HOME/.config/quickshell"; bindir=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) verbose=1 ;;
+        -o) out="$2"; shift ;;
+        -d) src="$2"; shift ;;
+        -b) bindir="$2"; shift ;;
+        *) echo "usage: health-test [-v] [-o PREFIX] [-d CONFIG_DIR] [-b BIN_DIR]" >&2; exit 2 ;;
+    esac
+    shift
+done
+if [ -z "$bindir" ]; then
+    bindir=$(dirname "$0"); [ -f "$bindir/shell-health" ] || bindir="$HOME/.local/bin"
+fi
+qs="$HOME/.nix-profile/bin/qs"
+tests="$src/tests/health"
+[ -x "$qs" ] && [ -f "$tests/shell.qml" ] && [ -f "$bindir/shell-health" ] || { echo "health-test: no qs, shell-health or $tests/shell.qml" >&2; exit 2; }
+case "$out" in ""|/*) ;; *) out="$PWD/$out" ;; esac
+
+ok=0
+echo "case: shell-health (fake systemctl, findmnt, gsettings)"
+python3 -I "$tests/script-test.py" "$bindir/shell-health" || ok=1
+echo "case: updates-check (fake apt, flatpak, fwupdmgr)"
+if [ -f "$bindir/updates-check" ]; then
+    python3 -I "$tests/updates-test.py" "$bindir/updates-check" || ok=1
+else echo "FAIL no updates-check in $bindir"; ok=1; fi
+
+work=$(mktemp -d) || exit 2
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/cfg" "$work/state"
+cp "$src/Health.qml" "$src/HealthPill.qml" "$src/HealthList.qml" "$src/Pill.qml" "$src/Caption.qml" "$work/cfg/"
+sed 's|path: Quickshell.env("HOME") + "/.config/cosmic[^"]*"|path: "/nonexistent/is_dark"|' "$src/Theme.qml" > "$work/cfg/Theme.qml"
+grep -q '/nonexistent/is_dark' "$work/cfg/Theme.qml" || { echo "health-test: could not unhook Theme.qml's is_dark" >&2; exit 2; }
+cp "$tests"/*.qml "$work/cfg/"
+
+echo "case: qml (pill, popup, singleton)"
+log="$work/log"
+env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u QT_QPA_PLATFORMTHEME -u QT_STYLE_OVERRIDE \
+    QT_QPA_PLATFORM=offscreen XDG_STATE_HOME="$work/state" HEALTH_TEST_OUT="$out" \
+    dbus-run-session -- timeout 60 "$qs" -p "$work/cfg/shell.qml" --no-color > "$log" 2>&1
+code=$?
+[ "$verbose" = 1 ] && cat "$log"
+grep -o 'HEALTHTEST \(PASS\|FAIL\|case:\|RESULT\).*' "$log" | sed 's/^HEALTHTEST //'
+if ! grep -q 'HEALTHTEST RESULT' "$log"; then
+    echo "health-test: the qml run did not finish (exit $code). Last lines:" >&2
+    grep -vE 'dbus-daemon|portal' "$log" | tail -15 >&2
+    exit 2
+fi
+grep -q 'HEALTHTEST RESULT pass [0-9]* fail 0$' "$log" || ok=1
+if grep -q 'Health[A-Za-z]*\.qml.*\(TypeError\|ReferenceError\|Binding loop\|Cannot assign\)' "$log"; then
+    echo "FAIL the files logged errors:"; grep 'Health[A-Za-z]*\.qml' "$log" | sort -u | head -8; ok=1
+fi
+if grep -q '"ignored":{"calibre":' "$work/state/health-ignore.json"; then
+    echo "PASS ignore list written to \$XDG_STATE_HOME/health-ignore.json"
+else echo "FAIL health-ignore.json not written as expected:"; cat "$work/state/health-ignore.json" 2>&1; ok=1; fi
+if grep -q '"boot":"boot-[BC]".*"reboot"' "$work/state/health-notices.json" 2>/dev/null; then
+    echo "PASS once-per-boot memory written to \$XDG_STATE_HOME/health-notices.json"
+else echo "FAIL health-notices.json not written as expected:"; cat "$work/state/health-notices.json" 2>&1; ok=1; fi
+if [ -n "$out" ]; then
+    for m in dark light; do
+        if [ -s "$out-$m.png" ]; then echo "picture: $out-$m.png"; else echo "FAIL no picture $out-$m.png"; ok=1; fi
+    done
+fi
+exit $ok

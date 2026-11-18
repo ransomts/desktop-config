@@ -1,0 +1,16 @@
+#!/bin/sh
+# stub (hypr-scripts-test): `udevadm monitor ...` plays $W/udev-script, one step per line, then exits:
+#   emit TEXT        print TEXT (an event line)
+#   run CMD          run CMD with sh
+#   wait-calls RE    wait (up to 5 s) until $CALLS has a line matching RE
+#   pause SECS       really sleep
+echo "udevadm $*" >> "$CALLS"
+[ -f "$W/udev-script" ] || exit 0
+while IFS= read -r step; do
+    case "$step" in
+        "emit "*) echo "${step#emit }" ;;
+        "run "*) sh -c "${step#run }" ;;
+        "wait-calls "*) i=0; until grep -qE "${step#wait-calls }" "$CALLS" || [ $i -ge 100 ]; do /bin/sleep 0.05; i=$((i + 1)); done ;;
+        "pause "*) /bin/sleep "${step#pause }" ;;
+    esac
+done < "$W/udev-script"

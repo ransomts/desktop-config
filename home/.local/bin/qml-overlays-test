@@ -1,0 +1,184 @@
+#!/bin/sh
+# Tests for the shell's full-screen and overlay pieces that no other suite reaches: Overview.qml
+# (Super+Tab), Switcher.qml (Alt+Tab), Dashboard.qml (Super+I), the lock screen (lockscreen.qml,
+# LockView.qml, LockNext.qml, LockInfo.qml, LockPet.qml), CursorFind.qml, DropPreview.qml,
+# ShotButton.qml, WallSeason.qml with the real WallState's season and game-day rules, and the pet
+# pieces pet-test does not drive: PetBrief.qml with the real PetSay.qml, PetJournal.qml, PetSky.qml,
+# PetAntics.qml. (pet-test covers PetNature, PetFocusPage and PetRemindPage through the menu.)
+#
+#   qml-overlays-test               run everything; PASS/FAIL lines, then "RESULT pass N fail M"; exit 1 on a failure
+#   qml-overlays-test -v            also print everything Quickshell logged
+#   qml-overlays-test -k            keep the temporary directory (printed)
+#   qml-overlays-test -d DIR        test the config in DIR instead of ~/.config/quickshell
+#                                   (its tests/qml-overlays is used if it has one)
+#
+# Three offscreen Quickshell runs, each in its own temporary HOME, XDG_RUNTIME_DIR, XDG_STATE_HOME,
+# XDG_CONFIG_HOME and XDG_CACHE_HOME, a private session bus (dbus-run-session), the system bus pointed
+# at nothing, and two fake screens (eDP-1 1920x1080, DP-3 1152x2048 to the right) from a Qt offscreen
+# config file. WAYLAND_DISPLAY, DISPLAY and HYPRLAND_INSTANCE_SIGNATURE are unset.
+#   overlays   the real files copied next to the stubs in tests/qml-overlays (Sys, Hyprland, Notif, Pet,
+#              PetArc, PetFocus, PetSecrets, FakeSprite): layer-shell windows become plain windows and
+#              `import Quickshell.Hyprland` is taken out, so monitors, workspaces and windows come from
+#              the stub's fixtures. hyprctl, dashboard-data, cursor-shake and drop-preview are stand-ins
+#              (tests/qml-overlays/bin) answering from fixtures and recording every call; Sys.run is
+#              recorded, never run. Checks run in dark and in light. Fit.qml's own check finds cut-offs.
+#   lock wrong lockscreen.qml with the session lock off (no compositor) and LockDriver.qml added; dark;
+#              pam-check is a stand-in in the temporary HOME (exit 1 wrong, 2 error); three misses
+#              must write "handover" to the result file and quit without unlocking.
+#   lock right light, no calendar events, no mail, no pet: the right password must write "unlocked".
+# Nothing touches the live session: no compositor, no real hyprctl, no PAM, no network.
+verbose=0; keep=0; src="$HOME/.config/quickshell"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) verbose=1 ;;
+        -k) keep=1 ;;
+        -d) src="$2"; shift ;;
+        *) echo "usage: qml-overlays-test [-v] [-k] [-d CONFIG_DIR]" >&2; exit 2 ;;
+    esac
+    shift
+done
+qs="$HOME/.nix-profile/bin/qs"
+tests="$src/tests/qml-overlays"
+[ -d "$tests" ] || tests="$HOME/.config/quickshell/tests/qml-overlays"
+[ -x "$qs" ] && [ -f "$tests/shell.qml" ] || { echo "qml-overlays-test: no qs, or no $tests/shell.qml" >&2; exit 2; }
+command -v dbus-run-session >/dev/null && command -v python3 >/dev/null || { echo "qml-overlays-test: needs dbus-run-session and python3" >&2; exit 2; }
+
+work=$(mktemp -d) || exit 2
+[ "$keep" = 1 ] && echo "keeping $work" || trap 'rm -rf "$work"' EXIT
+pass=0; fail=0
+ok()   { echo "PASS $1"; pass=$((pass + 1)); }
+bad()  { echo "FAIL $1   [$2]"; fail=$((fail + 1)); }
+expect() { case "$2" in $3) ok "$1" ;; *) bad "$1" "$2" ;; esac; }
+
+# copy a file, turning a layer-shell PanelWindow into a FloatingWindow and dropping the Hyprland import
+conv() {
+    python3 - "$1" "$2" <<'PY'
+import sys
+s = open(sys.argv[1], encoding="utf-8").read()
+s = s.replace("PanelWindow {", "FloatingWindow {")
+keep = []
+for l in s.split("\n"):
+    t = l.strip()
+    if t == "import Quickshell.Hyprland" or "WlrLayershell." in t or t.startswith("exclusionMode:") \
+       or t == "anchors { top: true; bottom: true; left: true; right: true }":
+        continue
+    keep.append(l)
+open(sys.argv[2], "w", encoding="utf-8").write("\n".join(keep))
+PY
+}
+
+# a fresh, empty world for one run: $p, $cfg, $fake (HOME), $fix, $calls
+prep() {
+    p="$work/$1"; cfg="$p/cfg"; fake="$p/home"; fix="$p/fix"; calls="$p/calls"
+    mkdir -p "$cfg/assets" "$fake/.config/cosmic/com.system76.CosmicTheme.Mode/v1" "$fake/.local/bin" "$fake/.local/share" \
+             "$p/state" "$p/cache" "$fix" "$p/bin"
+    mkdir -m 700 "$p/run"
+    : > "$calls"
+    echo true > "$fake/.config/cosmic/com.system76.CosmicTheme.Mode/v1/is_dark"
+    [ -e "$HOME/.local/share/fonts" ] && ln -s "$HOME/.local/share/fonts" "$fake/.local/share/fonts"
+    cp "$tests"/bin/* "$p/bin/" && chmod +x "$p/bin"/*
+    cp "$tests"/fixtures/* "$fix/"
+    for f in clients feeds sys; do cp "$fix/$f.json" "$fix/$f.full.json"; done
+    printf '%s\n' '{"screens":[{"name":"eDP-1","x":0,"y":0,"width":1920,"height":1080,"logicalDpi":96,"dpr":1},{"name":"DP-3","x":1920,"y":0,"width":1152,"height":2048,"logicalDpi":96,"dpr":1}]}' > "$p/screens.json"
+}
+
+# run Quickshell on $cfg/$1 offscreen; log in $p/log; extra env as further arguments
+runqs() {
+    entry="$1"; shift
+    env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u QT_QPA_PLATFORMTHEME -u QT_STYLE_OVERRIDE -u LOCK_TEST \
+        -u LOCK_SCENE -u LOCK_CAPS -u LOCK_FORM -u LOCK_SCREEN \
+        HOME="$fake" XDG_CONFIG_HOME="$fake/.config" XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}" \
+        XDG_RUNTIME_DIR="$p/run" XDG_STATE_HOME="$p/state" XDG_CACHE_HOME="$p/cache" \
+        DBUS_SYSTEM_BUS_ADDRESS=unix:path=/nonexistent/system_bus_socket \
+        QT_QPA_PLATFORM="offscreen:configfile=$p/screens.json" \
+        QO_BIN="$p/bin" QO_FIX="$fix" QO_CALLS="$calls" PATH="$p/bin:$PATH" "$@" \
+        dbus-run-session -- timeout 100 "$qs" -p "$cfg/$entry" --no-color > "$p/log" 2>&1
+    code=$?
+    [ "$verbose" = 1 ] && cat "$p/log"
+}
+
+# the QTEST lines of a run, counted; then the errors logged by the files under test
+report() {    # NAME FILE-REGEX
+    while IFS= read -r line; do
+        case "$line" in
+            PASS*) echo "$line"; pass=$((pass + 1)) ;;
+            FAIL*) echo "$line"; fail=$((fail + 1)) ;;
+            case:*) echo "$line" ;;
+            note:*) echo "  $line" ;;
+        esac
+    done <<EOF
+$(grep -o 'QTEST \(PASS\|FAIL\|case:\|note:\).*' "$p/log" | sed 's/^QTEST //')
+EOF
+    if ! grep -q 'QTEST RESULT' "$p/log"; then
+        bad "$1: the run finished" "exit $code; last lines: $(grep -vE 'dbus-daemon|portal' "$p/log" | tail -6 | tr '\n' ' ')"
+    fi
+    errs=$(grep -E "($2)\.qml.*(TypeError|ReferenceError|Binding loop|Unable to assign|Cannot assign|is not a type|is not installed|Cannot read property|Type error|Invalid property)" "$p/log" | sed 's/^.*\(file:[^ ]*\)/\1/' | sort -u | head -8)
+    [ -z "$errs" ] && ok "$1: no TypeError/ReferenceError/binding loop/'is not a type' logged" || bad "$1: errors logged" "$(echo "$errs" | tr '\n' ' ')"
+}
+
+# ---------------------------------------------------------------- overlays
+echo "== overlays: Overview, Switcher, Dashboard, CursorFind, DropPreview, ShotButton, WallSeason, PetBrief/PetSay, PetJournal, PetSky, PetAntics"
+prep overlays
+for f in Overview Switcher Dashboard CursorFind DropPreview WallState Fit; do conv "$src/$f.qml" "$cfg/$f.qml" || exit 2; done
+# CursorFind and DropPreview keep their window inside a Scope, out of reach: hand it to the tests
+for f in CursorFind DropPreview; do
+    grep -q '^        id: win$' "$cfg/$f.qml" || { echo "qml-overlays-test: $f.qml has no 'id: win' window any more" >&2; exit 2; }
+    sed -i '0,/^    id: \(find\|drop\)$/s//&\n    readonly property var testWin: win    \/\/ added by qml-overlays-test/' "$cfg/$f.qml"
+done
+for f in ShotButton WallSeason PetSay PetBrief PetJournal PetSky PetAntics Theme Caption Icons MediaCard; do cp "$src/$f.qml" "$cfg/" || exit 2; done
+cp "$src/sky.js" "$src/palettes.js" "$cfg/" || exit 2
+cp "$src/assets/cursor-big.png" "$src/assets/tiger-paw.png" "$src/assets/pet-cat-tiger.png" "$cfg/assets/" || exit 2
+for f in "$tests"/*.qml; do case "$f" in */LockDriver.qml) ;; *) cp "$f" "$cfg/" ;; esac; done
+runqs shell.qml WALL_HARNESS=1 WALL_STATE="$p/state/wallpaper.json"
+report overlays 'Overview|Switcher|Dashboard|CursorFind|DropPreview|ShotButton|WallSeason|WallState|PetSay|PetBrief|PetJournal|PetSky|PetAntics|MediaCard|Fit|shell|FakeSprite'
+expect "overlays: Sys.run never reached a real hyprctl (no live calls)" "$(grep -c '^hyprctl dispatch' "$calls")" "0"
+
+# ---------------------------------------------------------------- lock screen
+lockprep() {    # NAME
+    prep "$1"
+    conv "$src/lockscreen.qml" "$cfg/lockscreen.qml" || exit 2
+    python3 - "$cfg/lockscreen.qml" <<'PY' || exit 2
+import sys
+p = sys.argv[1]; s = open(p, encoding="utf-8").read()
+a = 'locked: root.mode !== "preview"'
+assert a in s, "lockscreen.qml: the lock line moved; update qml-overlays-test"
+s = s.replace(a, "locked: false")
+i = s.rstrip().rfind("}")
+s = s[:i] + "    LockDriver { ctl: root }\n}\n"
+open(p, "w", encoding="utf-8").write(s)
+PY
+    for f in LockView LockNext LockInfo LockPet WallSky; do cp "$src/$f.qml" "$cfg/" || exit 2; done
+    cp "$src/sky.js" "$src/palettes.js" "$tests/LockDriver.qml" "$cfg/" || exit 2
+    mkdir -p "$cfg/shaders"; cp "$src"/shaders/*.qsb "$cfg/shaders/" 2>/dev/null
+    cp "$src"/assets/pet-*.png "$src"/assets/hat-*.png "$src/assets/pet-anchors.js" "$cfg/assets/" 2>/dev/null
+    cp "$p/bin/pam-check" "$p/bin/dashboard-data" "$fake/.local/bin/"
+}
+led=0
+for l in /sys/class/leds/*::capslock/brightness; do [ -r "$l" ] && [ "$(cat "$l")" != 0 ] && led=1; done
+
+echo "== lock screen, wrong passwords (dark)"
+lockprep lockwrong
+printf '%s\n' '{"scene": "nonsense-scene"}' > "$p/state/wallpaper.json"
+printf '%s\n' '{"animal": "cat", "coat": "tiger", "name": "Cub", "enabled": true}' > "$p/state/pet.json"
+printf '%s\n' '[{"summary": "a", "seen": false}, {"summary": "b", "seen": true}, {"summary": "c", "seen": false}]' > "$p/state/notif-history.json"
+runqs lockscreen.qml QO_LOCK=wrong QO_LED_ON=$led LOCK_AGENDA="$p/bin/agenda"
+report "lock wrong" 'lockscreen|LockView|LockNext|LockInfo|LockPet|LockDriver'
+expect "lock wrong: three misses write 'handover' for lock-screen (hyprlock takes over)" "$(cat "$p/run/lock-screen.result" 2>/dev/null)" "handover"
+expect "lock wrong: the instance quits by itself after the handover" "$code $(grep -c 'still running 5 s after' "$p/log")" "0 0"
+expect "lock wrong: pam-check ran once per Enter (3), service hyprlock" "$(grep -c '^pam-check hyprlock ' "$calls")" "3"
+expect "lock wrong: the passwords never reached the log or the calls" "$(grep -c -e 'nope' -e 'slow' -e 'boom' "$p/log" "$calls" | awk -F: '{s+=$2} END {print s}')" "0"
+
+echo "== lock screen, right password (light, nothing to show)"
+lockprep lockright
+echo false > "$fake/.config/cosmic/com.system76.CosmicTheme.Mode/v1/is_dark"
+echo '{}' > "$fix/feeds.json"
+: > "$fix/agenda-empty"
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["keyboards"][0]["capsLock"]=False; json.dump(d,open(sys.argv[1],"w"))' "$fix/devices.json"
+runqs lockscreen.qml QO_LOCK=right QO_LED_ON=$led LOCK_AGENDA="$p/bin/agenda"
+report "lock right" 'lockscreen|LockView|LockNext|LockInfo|LockPet|LockDriver'
+expect "lock right: the right password writes 'unlocked'" "$(cat "$p/run/lock-screen.result" 2>/dev/null)" "unlocked"
+expect "lock right: the instance quits by itself after the unlock" "$code $(grep -c 'still running 5 s after' "$p/log")" "0 0"
+expect "lock right: pam-check ran once" "$(grep -c '^pam-check hyprlock len=11 exit=0' "$calls")" "1"
+
+echo "RESULT pass $pass fail $fail"
+[ "$fail" = 0 ]

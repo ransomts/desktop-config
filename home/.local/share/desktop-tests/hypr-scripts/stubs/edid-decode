@@ -1,0 +1,5 @@
+#!/bin/sh
+# stub (hypr-scripts-test): the fake EDID file holds just the model name
+m=$(cat "$1" 2>/dev/null)
+[ -n "$m" ] && printf "    Display Product Name: '%s'\n" "$m"
+exit 0

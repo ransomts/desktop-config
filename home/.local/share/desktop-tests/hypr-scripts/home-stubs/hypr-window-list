@@ -1,0 +1,4 @@
+#!/bin/sh
+# stub (hypr-scripts-test): record; print $W/winlist
+echo "hypr-window-list $*" >> "$CALLS"
+cat "$W/winlist" 2>/dev/null

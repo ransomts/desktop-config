@@ -1,0 +1,84 @@
+#!/bin/sh
+# Tests for the notification core (Quickshell Notif.qml, NotifStack.qml, NotifGroups.qml,
+# NotifList.qml, NotifPopups.qml).
+#
+#   notify-test               run everything; PASS/FAIL lines and a summary; exit 1 on a failure
+#   notify-test -v            also print everything Quickshell logged
+#   notify-test -o PREFIX     save PREFIX-dark.png and PREFIX-light.png (grouped popups + grouped list)
+#   notify-test -d DIR        test the config in DIR instead of ~/.config/quickshell
+#
+# The real files are staged with the stub Sys and StubPanel from tests/notify (NotifPopups.qml's
+# PanelWindow becomes a StubPanel: it loads but draws nothing; NotifStack draws the cards) and Theme
+# (its is_dark watch pointed at nothing; the test sets dark/light). A temporary XDG_STATE_HOME holds a
+# made-up old-shape history (30 entries), a snoozed list (one already due, one due in an hour); the
+# real ~/.local/state is never read or written. Everything runs inside dbus-run-session: the real
+# NotificationServer takes org.freedesktop.Notifications on that private bus only, and the end-to-end
+# case sends to it with gdbus on the same bus. No sound plays, nothing is launched.
+verbose=0; out=""; src="$HOME/.config/quickshell"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) verbose=1 ;;
+        -o) out="$2"; shift ;;
+        -d) src="$2"; shift ;;
+        *) echo "usage: notify-test [-v] [-o PREFIX] [-d CONFIG_DIR]" >&2; exit 2 ;;
+    esac
+    shift
+done
+qs="$HOME/.nix-profile/bin/qs"
+tests="$src/tests/notify"
+[ -x "$qs" ] && [ -f "$tests/shell.qml" ] || { echo "notify-test: no qs, or no $tests/shell.qml" >&2; exit 2; }
+case "$out" in ""|/*) ;; *) out="$PWD/$out" ;; esac
+
+work=$(mktemp -d) || exit 2
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/cfg" "$work/state"
+for f in Notif NotifStack NotifGroups NotifList NotifPopups Caption Icons MsgIcon; do
+    cp "$src/$f.qml" "$work/cfg/" || exit 2
+done
+sed 's|path: Quickshell.env("HOME") + "/.config/cosmic[^"]*"|path: "/nonexistent/is_dark"|' "$src/Theme.qml" > "$work/cfg/Theme.qml"
+grep -q '/nonexistent/is_dark' "$work/cfg/Theme.qml" || { echo "notify-test: could not unhook Theme.qml's is_dark" >&2; exit 2; }
+cp "$tests"/*.qml "$work/cfg/"
+sed -i 's/^\( *\)PanelWindow {/\1StubPanel {/; s/^\( *\)WlrLayershell\./\1\/\/ WlrLayershell./' "$work/cfg/NotifPopups.qml"
+grep -q 'StubPanel {' "$work/cfg/NotifPopups.qml" || { echo "notify-test: could not swap NotifPopups.qml's PanelWindow" >&2; exit 2; }
+
+# made-up state: the history in its old shape (before 2026-11-14), and two snoozed entries
+python3 -I - "$work/state" <<'PY'
+import json, sys, time
+d = sys.argv[1]
+h = []
+for i in range(30):
+    e = {"app": "App%d" % (i % 4), "summary": "Old %d" % i, "body": "body %d" % i,
+         "critical": i == 2, "seen": i > 2, "time": "Mon 09:%02d" % i}
+    if i == 29: del e["seen"]
+    h.append(e)
+json.dump(h, open(d + "/notif-history.json", "w"))
+now = int(time.time() * 1000)
+s = [{"id": "s1", "app": "Remind", "summary": "Snoozed earlier", "body": "", "critical": False, "urgency": 1,
+      "image": "", "appIcon": "", "time": "Mon 08:00", "due": now - 60000},
+     {"id": "s2", "app": "Remind", "summary": "Snoozed later", "body": "", "critical": False, "urgency": 1,
+      "image": "", "appIcon": "", "time": "Mon 08:01", "due": now + 3600000}]
+json.dump(s, open(d + "/notif-snoozed.json", "w"))
+PY
+
+log="$work/log"
+env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u QT_QPA_PLATFORMTHEME -u QT_STYLE_OVERRIDE \
+    QT_QPA_PLATFORM=offscreen XDG_STATE_HOME="$work/state" NOTIFY_TEST_OUT="$out" \
+    dbus-run-session -- timeout 120 "$qs" -p "$work/cfg/shell.qml" --no-color > "$log" 2>&1
+code=$?
+[ "$verbose" = 1 ] && cat "$log"
+grep -o 'NTEST \(PASS\|FAIL\|RESULT\).*' "$log" | sed 's/^NTEST //'
+if ! grep -q 'NTEST RESULT' "$log"; then
+    echo "notify-test: the run did not finish (exit $code). Last lines:" >&2
+    grep -vE 'dbus-daemon|portal' "$log" | tail -15 >&2
+    exit 2
+fi
+ok=0; grep -q 'NTEST RESULT pass [0-9]* fail 0$' "$log" || ok=1
+if grep -q 'Notif[A-Za-z]*\.qml.*\(TypeError\|ReferenceError\|Binding loop\|Cannot assign\|Unable to assign\)' "$log"; then
+    echo "FAIL the notification files logged errors:"; grep 'Notif[A-Za-z]*\.qml' "$log" | sort -u | head -8; ok=1
+fi
+if [ -n "$out" ]; then
+    for m in dark light; do
+        if [ -s "$out-$m.png" ]; then echo "picture: $out-$m.png"; else echo "FAIL no picture $out-$m.png"; ok=1; fi
+    done
+fi
+exit $ok

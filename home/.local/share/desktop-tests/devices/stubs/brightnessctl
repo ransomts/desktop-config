@@ -1,0 +1,11 @@
+#!/bin/sh
+# Fake brightnessctl: level in $FAKE_DIR/bright; `-m -d DEV g` reads, `-q -d DEV s N` sets. Logged.
+F=${FAKE_DIR:?}
+echo "brightnessctl $*" >> "$F/calls.log"
+last=""; prev=""; for a in "$@"; do prev=$last; last=$a; done
+case "$prev" in
+    g) ;;
+    s) echo "$last" > "$F/bright"; exit 0 ;;
+esac
+[ "$last" = g ] && cat "$F/bright"
+exit 0

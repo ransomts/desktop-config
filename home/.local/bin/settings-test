@@ -1,0 +1,119 @@
+#!/bin/sh
+# Tests for the settings window (Settings.qml and its Settings*.qml parts), JsonFile.qml, the focus
+# profiles (Profiles.qml, ProfilesCore.qml, FocusRow.qml) and sunset-times.
+#
+#   settings-test               run everything; PASS/FAIL lines and a summary; exit 1 on a failure
+#   settings-test -v            also print everything Quickshell logged
+#   settings-test -o DIR        save pictures (Appearance, Notifications, Quiet hours, Power, Focus
+#                               profiles; dark and light at 1920x1080, plus portrait and 1366x768) in DIR
+#   settings-test -d DIR        test the config in DIR instead of ~/.config/quickshell
+#   settings-test -b DIR        test the scripts in DIR instead of ~/.local/bin
+#   settings-test -k            keep the temporary directory (printed)
+#
+# The real files are loaded offscreen (Settings.qml as a plain window: the layer-shell lines are
+# taken out on the way) next to stub singletons in tests/settings that record every call (Sys, Notif,
+# Quiet, WallState, SaverState, Pet, PetPrefs, PetSound, CamState, Health, Lecture, Charge). Home,
+# state and config are temporary; the scripts the pages run are stand-ins (palette, anim-preset)
+# except sunset-times, which is the real one on a copy of hyprsunset.conf. A second pass runs
+# without Charge.qml and without breaks.json, as before agent power's work is merged.
+verbose=0; keep=0; out=""; src="$HOME/.config/quickshell"; bin="$HOME/.local/bin"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) verbose=1 ;;
+        -o) out="$2"; shift ;;
+        -d) src="$2"; shift ;;
+        -b) bin="$2"; shift ;;
+        -k) keep=1 ;;
+        *) echo "usage: settings-test [-v] [-k] [-o DIR] [-d CONFIG_DIR] [-b BIN_DIR]" >&2; exit 2 ;;
+    esac
+    shift
+done
+qs="$HOME/.nix-profile/bin/qs"
+tests="$src/tests/settings"
+[ -x "$qs" ] && [ -f "$tests/shell.qml" ] || { echo "settings-test: no qs, or no $tests/shell.qml" >&2; exit 2; }
+[ -x "$bin/sunset-times" ] || { echo "settings-test: no $bin/sunset-times" >&2; exit 2; }
+[ -n "$out" ] && { mkdir -p "$out" && out=$(cd "$out" && pwd) || exit 2; }
+
+work=$(mktemp -d) || exit 2
+[ "$keep" = 1 ] && echo "keeping $work" || trap 'rm -rf "$work"' EXIT
+ok=0
+
+# PanelWindow -> FloatingWindow, without the layer-shell, screen and anchor lines
+unpanel() {
+    python3 - "$1" "$2" <<'PY'
+import re, sys
+s = open(sys.argv[1], encoding="utf-8").read()
+s = s.replace("PanelWindow {", "FloatingWindow {", 1)
+s = re.sub(r"\n    screen: \{\n.*?\n    \}\n", "\n", s, flags=re.S)
+s = "\n".join(l for l in s.split("\n") if "WlrLayershell." not in l and "exclusionMode" not in l
+              and not l.strip().startswith("anchors { top: true;"))
+open(sys.argv[2], "w", encoding="utf-8").write(s)
+PY
+}
+
+run_pass() {    # NAME [nocharge]
+    p="$work/$1"; cfg="$p/cfg"; fake="$p/home"; sbin="$p/bin"
+    mkdir -p "$cfg" "$p/state" "$sbin" "$fake/.config/cosmic/com.system76.CosmicTheme.Mode/v1" "$fake/.config/shell" "$fake/.config/hypr" "$fake/.local/share"
+    mkdir -m 700 "$p/run"
+    echo true > "$fake/.config/cosmic/com.system76.CosmicTheme.Mode/v1/is_dark"
+    [ -e "$HOME/.local/share/fonts" ] && ln -s "$HOME/.local/share/fonts" "$fake/.local/share/fonts"
+    for f in "$src"/Settings*.qml "$src/JsonFile.qml" "$src/Profiles.qml" "$src/ProfilesCore.qml" "$src/FocusRow.qml" "$src/Clocks.qml" "$src/ClocksCore.qml" "$src/clocks.js" "$src"/Displays*.qml "$src/displays.js" \
+             "$src/Theme.qml" "$src/Caption.qml" "$src/Slider.qml" "$src/quiet.js"; do
+        cp "$f" "$cfg/" || exit 2
+    done
+    unpanel "$src/Settings.qml" "$cfg/Settings.qml"
+    cp "$tests"/*.qml "$cfg/"
+    [ "$2" = nocharge ] && rm -f "$cfg/Charge.qml"
+    # seeds: what the files hold before the pages touch them (each with a key the pages do not know)
+    printf '%s\n' '{ "enabled": true, "titles": ["lecture", "class", "exam", "office hours"], "calendars": [], "tags": ["quiet"], "lead": 0, "note": "mine" }' > "$fake/.config/shell/quiet.json"
+    printf '%s\n' '{ "captureKey": "i", "other": 1 }' > "$p/state/launcher.json"
+    [ "$2" = nocharge ] || printf '%s\n' '{ "enabled": false, "workMinutes": 25, "extra": "x" }' > "$fake/.config/shell/breaks.json"
+    printf 'profile {\n    time = 7:00\n    identity = true\n}\n\nprofile {\n    time = 20:00\n    temperature = 4500\n}\n' > "$p/hyprsunset.conf"
+    printf 'listener {\n    timeout = 1800\n    on-timeout = loginctl lock-session\n}\nlistener {\n    timeout = 900\n    on-timeout = hyprctl dispatch dpms off\n}\n' > "$fake/.config/hypr/hypridle.conf"
+    # stand-in scripts the pages run (Sys.run is recorded by the stub Sys, never run)
+    cp "$bin/sunset-times" "$sbin/"
+    printf '#!/bin/sh\ncase "$1" in list) printf "%%s\\n" "* clemson          primary #f56600  secondary #522d80  the hand-made plan" "  forest           primary #3fa34d  secondary #4b4700  from seed" "  ocean            primary #2f7fd8  secondary #005422  from seed" ;; *) echo "palette $*" >> "%s/calls" ;; esac\n' "$p" > "$sbin/palette"
+    printf '#!/bin/sh\necho "anim-preset $*" >> "%s/calls"\n' "$p" > "$sbin/anim-preset"
+    chmod +x "$sbin"/*
+    log="$p/log"
+    env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u QT_QPA_PLATFORMTHEME -u QT_STYLE_OVERRIDE \
+        HOME="$fake" XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}" XDG_CONFIG_HOME="$fake/.config" \
+        QT_QPA_PLATFORM=offscreen XDG_RUNTIME_DIR="$p/run" XDG_STATE_HOME="$p/state" XDG_CACHE_HOME="$p/cache" \
+        SETTINGS_BIN="$sbin" SUNSET_CONF="$p/hyprsunset.conf" SUNSET_RESTART="" SETTINGS_PASS="$2" \
+        SETTINGS_TEST_OUT="$([ "$2" = nocharge ] || echo "$out")" PATH="$sbin:$PATH" \
+        dbus-run-session -- timeout 120 "$qs" -p "$cfg/shell.qml" --no-color > "$log" 2>&1
+    code=$?
+    [ "$verbose" = 1 ] && cat "$log"
+    grep -o 'STEST \(PASS\|FAIL\|case:\|RESULT\).*' "$log" | sed 's/^STEST //'
+    if ! grep -q 'STEST RESULT' "$log"; then
+        echo "settings-test: the $1 run did not finish (exit $code). Last lines:" >&2
+        grep -vE 'dbus-daemon|portal' "$log" | tail -15 >&2
+        ok=1; return
+    fi
+    grep -q 'STEST RESULT pass [0-9]* fail 0$' "$log" || ok=1
+    if grep -E '(Settings|JsonFile|Profiles|FocusRow|shell)[A-Za-z]*\.qml.*(TypeError|ReferenceError|Binding loop|Unable to assign|Cannot assign|is not a type)' "$log" | grep -q .; then
+        echo "FAIL errors were logged ($1):"; grep -E '(TypeError|ReferenceError|Binding loop|Unable to assign|Cannot assign|is not a type)' "$log" | sort -u | head -12; ok=1
+    fi
+}
+
+echo "== pass 1: everything"
+run_pass full
+echo "== pass 2: without Charge.qml and breaks.json"
+run_pass nocharge nocharge
+
+echo "case: sunset-times on its own"
+st="$work/st"; mkdir -p "$st"
+printf '# keep me\nprofile {\n    time = 7:00\n    identity = true\n}\n\nprofile {\n    time = 20:00\n    temperature = 4500\n}\n' > "$st/c"
+expect() { case "$2" in $3) echo "PASS $1" ;; *) echo "FAIL $1   [$2]"; ok=1 ;; esac; }
+sts() { SUNSET_CONF="$st/c" SUNSET_RESTART="echo restarted >> $st/r" "$bin/sunset-times" "$@" 2>&1; }
+expect "get" "$(sts get)" '{"light": "07:00", "dark": "20:00", "temp": 4500}'
+expect "set dark" "$(sts set dark 21:30)" '*"dark": "21:30"*'
+expect "set temp" "$(sts set temp 3800)" '*"temp": 3800*'
+expect "a bad time is refused" "$(sts set light 25:00; echo " $?")" '*HH:MM* 1'
+expect "light = dark is refused" "$(sts set light 21:30; echo " $?")" '*same time* 1'
+expect "comment kept, file style kept" "$(head -1 "$st/c") $(grep -c 'time = 21:30' "$st/c")" "# keep me 1"
+expect "restart after each change only" "$(wc -l < "$st/r" | tr -d ' ')" "2"
+expect "theme-by-time still reads the file" "$(awk '/time *=/ {gsub(/[ \t]/,""); split($0,a,"="); print a[2]}' "$st/c" | tr '\n' ' ')" "7:00 21:30 "
+
+[ -n "$out" ] && echo "pictures in $out"
+exit $ok

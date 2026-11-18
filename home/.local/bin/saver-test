@@ -1,0 +1,70 @@
+#!/bin/sh
+# Tests for the idle screensaver (Quickshell SaverState.qml, SaverView.qml, SaverRow.qml).
+#
+#   saver-test               run everything; PASS/FAIL lines and a summary; exit 1 on a failure
+#   saver-test -v            also print everything Quickshell logged
+#   saver-test -o PREFIX     save PREFIX-dark.png and PREFIX-light.png (two 640x360 "screens" + the settings row)
+#   saver-test -f            draw a flat gradient in place of the scene shader
+#   (offscreen means Qt's software renderer, which draws no ShaderEffect: without -f the scene area
+#   is empty and only the scrim, clock and pet show; look at the real scene with `qs ipc call saver preview`)
+#   saver-test -d DIR        test the config in DIR instead of ~/.config/quickshell
+#
+# The real SaverState/SaverView/SaverRow, LockPet, WallSky, Theme (its is_dark watch pointed at
+# nothing, so the test sets dark/light), palettes.js, sky.js, assets and shaders are staged
+# with the stub WallState and Sys from tests/saver, then run offscreen with SAVER_HARNESS=1
+# and WALL_HARNESS=1: no idle monitor, no Hyprland, no layer windows, nothing launched; the
+# idle signal and every blocker are set by the cases. A made-up pet.json in a temporary
+# XDG_STATE_HOME gives the sleeping pet; the real ~/.local/state is never read or written.
+verbose=0; out=""; src="$HOME/.config/quickshell"; flat=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) verbose=1 ;;
+        -o) out="$2"; shift ;;
+        -f) flat=1 ;;
+        -d) src="$2"; shift ;;
+        *) echo "usage: saver-test [-v] [-f] [-o PREFIX] [-d CONFIG_DIR]" >&2; exit 2 ;;
+    esac
+    shift
+done
+qs="$HOME/.nix-profile/bin/qs"
+tests="$src/tests/saver"
+[ -x "$qs" ] && [ -f "$tests/shell.qml" ] || { echo "saver-test: no qs, or no $tests/shell.qml" >&2; exit 2; }
+case "$out" in ""|/*) ;; *) out="$PWD/$out" ;; esac
+
+work=$(mktemp -d) || exit 2
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/cfg/shaders" "$work/state"
+cp "$src/SaverState.qml" "$src/SaverView.qml" "$src/SaverRow.qml" "$src/LockPet.qml" "$src/WallSky.qml" \
+   "$src/palettes.js" "$src/sky.js" "$work/cfg/"
+cp -r "$src/assets" "$work/cfg/"
+cp "$src"/shaders/*.qsb "$work/cfg/shaders/"
+sed 's|path: Quickshell.env("HOME") + "/.config/cosmic[^"]*"|path: "/nonexistent/is_dark"|' "$src/Theme.qml" > "$work/cfg/Theme.qml"
+grep -q '/nonexistent/is_dark' "$work/cfg/Theme.qml" || { echo "saver-test: could not unhook Theme.qml's is_dark" >&2; exit 2; }
+cp "$tests"/*.qml "$work/cfg/"
+printf '{"enabled":true,"animal":"cat","coat":"tiger","name":"Tester","hat":"none"}\n' > "$work/state/pet.json"
+
+log="$work/log"
+env -u WAYLAND_DISPLAY -u DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u QT_QPA_PLATFORMTHEME -u QT_STYLE_OVERRIDE \
+    QT_QPA_PLATFORM=offscreen XDG_STATE_HOME="$work/state" SAVER_HARNESS=1 WALL_HARNESS=1 \
+    SAVER_TEST_OUT="$out" SAVER_FLAT="$flat" \
+    dbus-run-session -- timeout 90 "$qs" -p "$work/cfg/shell.qml" --no-color > "$log" 2>&1
+code=$?
+[ "$verbose" = 1 ] && cat "$log"
+grep -o 'SAVERTEST \(PASS\|FAIL\|case:\|RESULT\).*' "$log" | sed 's/^SAVERTEST //'
+if ! grep -q 'SAVERTEST RESULT' "$log"; then
+    echo "saver-test: the run did not finish (exit $code). Last lines:" >&2
+    grep -vE 'dbus-daemon|portal' "$log" | tail -15 >&2
+    exit 2
+fi
+ok=0; grep -q 'SAVERTEST RESULT pass [0-9]* fail 0$' "$log" || ok=1
+if grep -q 'Saver[A-Za-z]*\.qml.*\(TypeError\|ReferenceError\|Binding loop\|Cannot assign\)' "$log"; then
+    echo "FAIL the saver logged errors:"; grep 'Saver[A-Za-z]*\.qml' "$log" | sort -u | head -8; ok=1
+fi
+if grep -q '"minutes": 7' "$work/state/saver.json" 2>/dev/null; then echo "PASS settings written to \$XDG_STATE_HOME/saver.json"
+else echo "FAIL saver.json not written as expected:"; cat "$work/state/saver.json" 2>&1; ok=1; fi
+if [ -n "$out" ]; then
+    for m in dark light; do
+        if [ -s "$out-$m.png" ]; then echo "picture: $out-$m.png"; else echo "FAIL no picture $out-$m.png"; ok=1; fi
+    done
+fi
+exit $ok

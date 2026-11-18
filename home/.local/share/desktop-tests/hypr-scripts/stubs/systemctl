@@ -1,0 +1,12 @@
+#!/bin/sh
+# stub (hypr-scripts-test): record; units started/stopped are kept in $W/active;
+# is-active answers from it; $W/hooks/start-UNIT runs after `start UNIT`
+echo "systemctl $*" >> "$CALLS"
+for a; do u=$a; done
+touch "$W/active"
+case " $* " in
+    *" start "*) echo "$u" >> "$W/active"; [ -x "$W/hooks/start-$u" ] && "$W/hooks/start-$u" ;;
+    *" stop "*) grep -vx "$u" "$W/active" > "$W/active.tmp"; mv "$W/active.tmp" "$W/active" ;;
+    *" is-active "*) grep -qx "$u" "$W/active"; exit $? ;;
+esac
+exit 0

@@ -1,0 +1,5 @@
+#!/bin/sh
+# hypr-test stub: record the call, do nothing. Keeps a nested Hyprland off the live session's
+# systemd/D-Bus environment (0.57 exports its own DISPLAY/WAYLAND_DISPLAY there at start).
+printf '%s %s\n' "$(basename "$0")" "$*" >> "${HYPR_TEST_LOG:-/dev/null}"
+exit 0

@@ -1,0 +1,64 @@
+#!/bin/sh
+# NetworkManager CLI stand-in (menus-test). Escapes ':' and '\' in terse (-t/-g) output the way
+# the real nmcli does (seen live: `nmcli -g GENERAL.HWADDR dev show` prints 04\:E8\:...), unless
+# given `-e no` (then raw, also checked live).
+#   $MT/nm/devices     "DEVICE:TYPE" lines         $MT/nm/radio    enabled|disabled
+#   $MT/nm/active      the device's connection name (empty = not connected)
+#   $MT/nm/scan        `dev wifi list` terse lines, already escaped as nmcli prints them
+#   $MT/nm/profiles    NAME<TAB>SSID<TAB>KEY-MGMT<TAB>PSK<TAB>TYPE per saved connection
+#   $MT/nm/active-cons NAME<TAB>TYPE per active connection
+#   $MT/rc/nmcli.VERB  exit code for up|connect (with an error line on stderr)
+line=nmcli; for a in "$@"; do line="$line [$a]"; done
+printf '%s\n' "$line" >> "$MT/calls"
+N="$MT/nm"; T="$(printf '\t')"
+escape=yes
+esc() { if [ "$escape" = no ]; then printf '%s\n' "$1"; else printf '%s\n' "$1" | sed -e 's/\\/\\\\/g' -e 's/:/\\:/g'; fi; }
+g=""; f=""
+while :; do
+    case "$1" in
+        -t|-s) shift ;;
+        -e) escape=$2; shift 2 ;;
+        -g) g=$2; shift 2 ;;
+        -f) f=$2; shift 2 ;;
+        *) break ;;
+    esac
+done
+fail() { rc=$(cat "$MT/rc/nmcli.$1" 2>/dev/null || echo 0); [ "$rc" = 0 ] && exit 0
+         echo "Error: Connection activation failed: Secrets were required, but not provided." >&2; exit "$rc"; }
+field() {   # field NAME COLUMN: column of the saved profile NAME (exact)
+    awk -F "$T" -v n="$1" -v c="$2" '$1==n {print $c; found=1} END {exit !found}' "$N/profiles"
+}
+case "$1" in
+    dev|device)
+        case "$2" in
+            "") cat "$N/devices" ;;
+            show) a=$(cat "$N/active" 2>/dev/null); [ -n "$a" ] && esc "$a" ;;
+            wifi) case "$3" in
+                      list) cat "$N/scan" ;;
+                      rescan) ;;
+                      connect) fail connect ;;
+                  esac ;;
+            disconnect) ;;
+        esac ;;
+    con|connection)
+        case "$2" in
+            show)
+                if [ "$3" = --active ]; then
+                    while IFS="$T" read -r name type; do echo "$(esc "$name"):$type"; done < "$N/active-cons"
+                elif [ -n "$3" ]; then
+                    case "$g" in
+                        802-11-wireless.ssid) v=$(field "$3" 2) || { echo "Error: $3 - no such connection profile." >&2; exit 10; } ;;
+                        802-11-wireless-security.key-mgmt) v=$(field "$3" 3) || exit 10 ;;
+                        802-11-wireless-security.psk) v=$(field "$3" 4) || exit 10 ;;
+                        *) exit 0 ;;
+                    esac
+                    esc "$v"
+                else
+                    while IFS="$T" read -r name ssid km psk type; do echo "$(esc "$name"):$type"; done < "$N/profiles"
+                fi ;;
+            up) shift 2; [ "$1" = id ] && shift; field "$1" 1 >/dev/null || { echo "Error: unknown connection '$1'." >&2; exit 10; }; fail up ;;
+            delete) ;;
+        esac ;;
+    radio) [ -z "$3" ] && cat "$N/radio" ;;
+esac
+exit 0

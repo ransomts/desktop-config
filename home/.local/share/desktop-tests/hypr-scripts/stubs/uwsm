@@ -1,0 +1,4 @@
+#!/bin/sh
+# stub (hypr-scripts-test): record the call
+echo "uwsm $*" >> "$CALLS"
+exit 0

@@ -23,7 +23,13 @@ def pos():
     return int(x), int(y)
 
 def main():
-    last = pos()
+    while True:                     # no socket yet (Hyprland starting/gone): wait, never a traceback
+        try:
+            last = pos()
+            break
+        except (OSError, ValueError):
+            if not os.path.exists(SOCK): return
+            time.sleep(1)
     anchor = [last[0], last[1]]     # per axis: where the current leg started
     sign = [0, 0]
     turns = [[], []]                # per axis: times of recent reversals
