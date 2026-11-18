@@ -9,6 +9,7 @@ Singleton {
     readonly property string bin: Quickshell.env("SETTINGS_BIN") + "/"
     readonly property var clean: []
     property var calls: []
+    property string nowHM: Qt.formatTime(new Date(), "HH:mm")   // ClocksCore listens to it (as in the real Sys.qml)
     function rec(what) { calls = calls.concat([what]) }
     function run(cmd) { rec("run " + cmd) }
     function launch(argv) { rec("launch " + argv.join(" ")) }

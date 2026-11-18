@@ -891,7 +891,7 @@ def part_keystats():
         ("hypr", b"activewin"), ("hypr", b"dow>>emacs,init.el\n"),           # one event split over two reads
         ("dev", ml, [key(E.KEY_RIGHTALT, K), key(E.KEY_E, K), key(E.KEY_E, P), key(E.KEY_RIGHTALT, P)], 3.0),
         ("fail", ml),                                                       # unplugged
-        ("dev", ml, [key(E.KEY_B, K), key(E.KEY_B, P)], 3.0),
+        ("dev", ml, [key(E.KEY_B, K), key(E.KEY_B, P)], 0.2),               # replugged and typing again quickly
         ("dev", ml, [key(E.KEY_LEFTCTRL, K), key(E.KEY_C, K), key(E.KEY_C, P), key(E.KEY_LEFTCTRL, P)], 0.3),
     ]
     drv = Driver(steps, devs)
@@ -910,6 +910,7 @@ def part_keystats():
     check("a modifier tapped alone counts under mods; one used in a combo does not", mods.get("Super") == 3 and not any(mods.get(m) for m in ("Shift", "Ctrl", "AltGr", "Alt")), mods)
     check("bigrams of consecutive keys", bi.get("KEY_H KEY_I") == 1 and bi.get("KEY_I KEY_J") == 1 and bi.get("KEY_GRAVE KEY_H") == 1, bi)
     check("no bigram across an unplug", "KEY_E KEY_B" not in bi and bi.get("KEY_B KEY_C") == 1, bi)
+    check("no timing pair across an unplug", "KEY_E KEY_B" not in tim and "KEY_B KEY_C" in tim, sorted(tim))
     check("autorepeat counted per key, not as presses", rep.get("KEY_J") == 3 and keys.get("KEY_J") == 1, (rep, keys.get("KEY_J")))
     check("timing: 90 ms falls in the 80-100 ms bucket", tim.get("KEY_H KEY_I") == [0, 0, 0, 1] + [0] * 11, tim.get("KEY_H KEY_I"))
     check("timing: pairs more than 1.5 s apart are pauses, not typing", "KEY_I KEY_J" not in tim and "KEY_J KEY_A" not in tim, sorted(tim))

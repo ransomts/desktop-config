@@ -167,5 +167,5 @@ while True:
         for d in devs:
             try: d.close()
             except OSError: pass
-        save(); held.clear(); prev = None
+        save(); held.clear(); prev = None; last_down = None   # no bigram or timing pair across a replug
         time.sleep(2)
