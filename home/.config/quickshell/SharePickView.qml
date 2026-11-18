@@ -31,7 +31,12 @@ Rectangle {
     readonly property int cols: tab === 1 ? 4 : Math.max(1, Math.min(3, outs.length))
 
     function reset() { tab = (lists.outputs || []).length > 0 ? 0 : 1; sel = 0; regionOut = -1; allow = !!lists.allowToken; box.clear() }   // (outs may not have caught up yet)
-    onListsChanged: reset()
+    // The first read of `lists` during creation (from the `pending` binding, through `outs`) reports it
+    // changed; resetting right then writes tab/sel/allow inside that binding's own evaluation (binding
+    // loop on `pending`). So only reset on real changes once built, and once at the end of creation.
+    property bool built: false
+    onListsChanged: if (built) reset()
+    Component.onCompleted: { built = true; reset() }
 
     function screenFor(name) { return screens.find(s => s.name === name) || null }
     function toplevelFor(w) {

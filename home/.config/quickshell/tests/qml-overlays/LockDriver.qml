@@ -56,6 +56,8 @@ Scope {
     function activate() { const q = formView.Window.window; if (q && !q.active) q.requestActivate() }
     function type(s) { activate(); for (const c of s) ev.keyClickChar(c, Qt.NoModifier, -1) }
     function key(k, mods) { activate(); ev.keyClick(k, mods || Qt.NoModifier, -1) }
+    // reads of agenda-day: each read asks for today and then tomorrow, so count today's lines
+    function agendaReads() { const d = Qt.formatDate(new Date(), "yyyy-MM-dd"); return calls().filter(c => c === "agenda " + d).length }
     function at(h, m) { const d = new Date(); return new Date(d.getFullYear(), d.getMonth(), d.getDate(), h, m) }
     readonly property bool ledOn: Quickshell.env("QO_LED_ON") === "1"
 
@@ -83,6 +85,7 @@ Scope {
         () => {
             const n = nextItem()
             check("next event: read today's and tomorrow's timed events only", n.events.length === 4, n.events.length)
+            check("two screens, one lock: agenda read once (LockNext only on the field's screen)", agendaReads() === 1 && find(otherView, o => o.nextText !== undefined) === null, agendaReads())
             n.now = at(9, 0)
             const a = n.text
             n.now = at(10, 15)
@@ -159,6 +162,7 @@ Scope {
         () => {
             const n = nextItem(), i = infoItem(), p = petItem()
             check("empty: no events, no next-event line", n && n.events.length === 0 && n.text === "")
+            check("two screens, one lock: agenda read once", agendaReads() === 1, agendaReads())
             check("empty: no mail, no notifications, no corner line", i && i.mail === 0 && i.notes === 0 && !has(texts(formView), "󰂚"))
             check("empty: no pet.json, no pet", !p || !p.visible)
             type("open sesame")

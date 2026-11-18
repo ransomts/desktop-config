@@ -136,6 +136,7 @@ Item {
             height: 20
             enabled: false
             visible: view.form
+            active: view.form       // only the field's screen shows it: load it there alone, so agenda-day runs once per lock
             source: Qt.resolvedUrl("LockNext.qml")
             onLoaded: item.now = Qt.binding(() => clock.date)
         }
