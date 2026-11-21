@@ -26,8 +26,8 @@
 #   settings      the settings window
 #   bar           a crop of the bar strip (from desktop)
 #   lecture       ink drawn over code and the countdown timer
-#   keys          the lecture key display (the spotlight is left out: on the headless screen its
-#                 clear circle renders as a light haze, 2026-11-21)
+#   spotlight     the lecture spotlight on a few lines of code
+#   keys          the lecture key display
 #   editor        the screenshot editor with marks (pointer and keys through vptr/vkbd)
 #   lock          the lock screen
 # Dark only:
@@ -348,6 +348,12 @@ print('m %d %d s 80 d s 50 ' % pts[0] + ' '.join('m %d %d s 12' % p for p in pts
         ptr m 1150 345 s 80 d s 50 m 1300 347 s 20 m 1450 346 s 20 m 1600 348 s 20 m 1780 347 s 100 u s 200
         qsi call lecture timer 10 "Quiz" >/dev/null; sleep 1.2
         shoot "lecture-$mode"
+        qsi call lecture off >/dev/null; sleep 0.8
+    fi
+    if want spotlight; then
+        qsi call lecture spotsize 240 >/dev/null; qsi call lecture spot >/dev/null; sleep 0.5
+        ptr m 500 650 s 80 m 540 680 s 80 m 560 690 s 300; sleep 0.8
+        shoot "spotlight-$mode"
         qsi call lecture off >/dev/null; sleep 0.8
     fi
     if want keys; then         # the key display (fed made-up presses; see lecture-keys above)

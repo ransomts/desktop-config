@@ -114,6 +114,8 @@ The scenes drift slowly; sped up five times:
 
 [[file:../screenshots/lecture-dark.png]]
 
+[[file:../screenshots/spotlight-light.png]]
+
 [[file:../screenshots/keys-light.png]]
 
 * The pet
