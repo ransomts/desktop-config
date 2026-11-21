@@ -189,9 +189,9 @@ code, v = e.run("validate", e.layout())
 check("desk as it is validates, no warnings", code == 0 and v["ok"] and not v["warnings"], v)
 code, lua = e.run("lua", e.layout())
 calls = lua_ok(lua, "desk lua")
-want = ['output = "desc:Dell Inc. DELL P2425HE 8BY1H14", mode = "1920x1080@60", position = "0x840", scale = 1, transform = 0',
-        'output = "desc:Dell Inc. DELL P2214H KW14V59N39RB", mode = "1920x1080@60", position = "1920x0", scale = 1, transform = 1',
-        'output = "desc:Samsung Electric Company S34J55x H4LR305255", mode = "3440x1440@59.973", position = "3000x480", scale = 1, transform = 0',
+want = ['output = "desc:Dell Inc. DELL P2425HE 0AAAA01", mode = "1920x1080@60", position = "0x840", scale = 1, transform = 0',
+        'output = "desc:Dell Inc. DELL P2214H 0BBBBBBBB002", mode = "1920x1080@60", position = "1920x0", scale = 1, transform = 1',
+        'output = "desc:Samsung Electric Company S34J55x 0CCCCCC003", mode = "3440x1440@59.973", position = "3000x480", scale = 1, transform = 0',
         'output = "eDP-1", mode = "1920x1080@60.049", position = "6440x840", scale = 1, transform = 0']
 check("desk lua = the rules in hyprland.lua, same order", calls == want, calls)
 check("lua sets DisplayLayout.rules for the laptop table", 'DisplayLayout.rules["eDP-1"] = { mode = "1920x1080@60.049", position = "6440x840", scale = 1, transform = 0 }' in lua)

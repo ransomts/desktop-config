@@ -1,0 +1,157 @@
+#+title: Key bindings
+
+Super is the Windows key. Generated from the bindings of a running session by =keybind-sheet --org=; edit the descriptions in =hyprland.lua=, not here.
+
+* Apps
+
+| Keys | Does |
+|------+------|
+| ~Super~ ~Enter~ | Emacs |
+| ~Super~ ~T~ | Terminal |
+| ~Super~ ~B~ | Firefox |
+| ~Super~ ~E~ | Files |
+| ~Super~ ~D~ | App launcher |
+
+* Recording and calls
+
+| Keys | Does |
+|------+------|
+| ~Super~ ~R~ | Record a region (again: stop) |
+| ~Super~ ~Shift~ ~R~ | Record this screen (again: stop) |
+| ~Super~ ~Ctrl~ ~R~ | Recording: what to record, sound, webcam bubble, GIF |
+| ~Super~ ~Ctrl~ ~Space~ | Push to talk (hold) |
+
+* Shell
+
+| Keys | Does |
+|------+------|
+| ~Super~ ~,~ | Settings |
+
+* Lecture tools
+
+| Keys | Does |
+|------+------|
+| ~Super~ ~Z~ | Lecture tools, then D draw, L spotlight, K keys, Z menu |
+| ~Super~ ~=~ | Lecture: zoom in |
+| ~Super~ ~-~ | Lecture: zoom out |
+| ~Super~ ~\~ | Lecture: zoom back to normal |
+
+* Windows
+
+| Keys | Does |
+|------+------|
+| ~Super~ ~Q~ | Close window |
+| ~Super~ ~M~ | Maximize (bar stays) |
+| ~Super~ ~F~ | Fullscreen |
+| ~Super~ ~Shift~ ~V~ | Float / tile window |
+| ~Super~ ~Shift~ ~P~ | Keep own size, centered (pseudotile) |
+| ~Super~ ~←↑↓→~ | Focus the window in that direction |
+| ~Super~ ~Shift~ ~←↑↓→~ | Move window (crosses monitors at the edge) |
+| ~Super~ ~Ctrl~ ~←↑↓→~ | Resize window |
+| ~Super~ ~left-drag~ | Move window; an orange outline shows where it will land |
+| ~Super~ ~right-drag~ | Resize window |
+| ~Alt~ ~Tab~ | Window switcher |
+
+* Layouts
+
+| Keys | Does |
+|------+------|
+| ~Super~ ~A~ | Pick this desktop's layout (remembered) |
+| ~Super~ ~J~ | Dwindle: flip a split side-by-side / stacked |
+| ~Super~ ~Shift~ ~Enter~ | Make this the main window |
+| ~Super~ ~Shift~ ~M~ | Focus the main window |
+| ~Super~ ~K~ ~H~ | Focus next / previous window |
+| ~Super~ ~Y~ | Move window down the stack (with Shift: up) |
+| ~Super~ ~Shift~ ~I~ ~U~ | One more / one fewer main window |
+| ~Super~ ~X~ | Move the main area: left, top, right, bottom, centre |
+
+* Desktops
+
+| Keys | Does |
+|------+------|
+| ~Super~ ~1–0~ | Go to desktop 1–10 (all screens together) |
+| ~Super~ ~Shift~ ~1–0~ | Send window to desktop 1–10 |
+| ~Super~ ~scroll~ | Next / previous desktop |
+| ~Super~ ~Tab~ | Overview of every desktop |
+| ~Super~ ~S~ | Show / hide scratchpad |
+| ~Super~ ~Shift~ ~S~ | Send window to scratchpad |
+
+* Tab groups
+
+| Keys | Does |
+|------+------|
+| ~Super~ ~G~ | Make / dissolve a tab group |
+| ~Super~ ~Alt~ ~←↑↓→~ | Join the group in that direction |
+| ~Super~ ~Alt~ ~G~ | Take window out of its group |
+| ~Super~ ~[~ ~]~ | Previous / next tab |
+
+* Capture and pickers
+
+| Keys | Does |
+|------+------|
+| ~PrtSc~ | Screenshot: pick a region, then mark it up |
+| ~Super~ ~Shift~ ~PrtSc~ | Screenshot: region, no editor |
+| ~Shift~ ~PrtSc~ | Screenshot: focused window |
+| ~Ctrl~ ~PrtSc~ | Screenshot: whole screen |
+| ~Super~ ~PrtSc~ | Screenshot menu |
+| ~Super~ ~R~ | Record a region (again: stop) |
+| ~Super~ ~Shift~ ~R~ | Record this screen (again: stop) |
+| ~Super~ ~O~ | Copy text from a screen region (OCR) |
+| ~Super~ ~V~ | Clipboard history |
+| ~Super~ ~.~ | Emoji and symbol picker |
+
+* Shell and session
+
+| Keys | Does |
+|------+------|
+| ~Super~ ~C~ | Control panel |
+| ~Super~ ~N~ | Recent notifications |
+| ~Super~ ~W~ | Wallpaper: scene, effects, mode, frame rate |
+| ~Super~ ~P~ | Displays: extend / mirror / projector |
+| ~Super~ ~Space~ | Switch keyboard layout (Dvorak / US) |
+| ~Super~ ~L~ | Lock screen |
+| ~Super~ ~Shift~ ~E~ | Log out of Hyprland (press twice) |
+| ~Super~ ~/~ | Show keybindings |
+
+* Other
+
+| Keys | Does |
+|------+------|
+| ~Super~ ~Super_L~ | App launcher (tap Super) |
+| ~Super~ ~Ctrl~ ~T~ | Dark / light theme |
+| ~Shift~ ~Alt~ ~Tab~ | Window switcher (backwards) |
+| ~Alt~ ~Alt_L~ | Window switcher: pick on Alt release |
+| ~Super~ ~`~ | Show / hide music (ncmpcpp) |
+| ~Super~ ~Shift~ ~`~ | Show / hide the music library (Emacs) |
+| ~Super~ ~I~ | Dashboard: the day at a glance |
+| ~Super~ ~Ctrl~ ~\~ | Reset window sizes on this desktop |
+| ~Super~ ~Ctrl~ ~W~ | Webcam bubble on / off |
+| ~Super~ ~Ctrl~ ~L~ | Video lights: open / focus / close the controls |
+| ~Super~ ~Shift~ ~Ctrl~ ~W~ | Webcam bubble: choose the camera |
+| ~Super~ ~Ctrl~ ~M~ | Mute / unmute the microphone |
+| ~Super~ ~Ctrl~ ~C~ | Color picker (copies hex) |
+| ~D~ | Lecture: draw on the screen (Tab holds the ink, Esc clears) |
+| ~L~ | Lecture: spotlight on the pointer |
+| ~K~ | Lecture: show the keys being pressed |
+| ~Z~ | Lecture: every tool (menu) |
+
+* Laptop keys
+
+| Keys | Does |
+|------+------|
+| Volume, mute, mic | Change level; a pop-up shows it |
+| Brightness | Screen brightness |
+| Media keys | Play/pause, next, previous |
+| Fn F5 | Displays menu (same as Super P) |
+| Lid | Closed while docked: laptop screen off |
+
+* Mouse
+
+| Keys | Does |
+|------+------|
+| Shake the pointer | It grows so you can find it |
+| Music pill | Click: play/pause · right: player · middle: previous · scroll: volume · hover: slide title |
+| Clock | Click: calendar · right: control panel |
+| Sound pill | Click: output · right: mute · middle: mixer · scroll: volume |
+| Desktop numbers | Click: go · scroll: next/previous |
+| Gap between windows | Drag to resize the windows either side |

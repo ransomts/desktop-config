@@ -33,9 +33,9 @@ hl.monitor({
 
 -- Desk layout, same as COSMIC (outputs.ron / dock-monitor-layout), left to right.
 -- Matched by description because the dock's DP-N numbers change on every attach.
-hl.monitor({ output = "desc:Dell Inc. DELL P2425HE 8BY1H14",                 mode = "1920x1080@60",     position = "0x840",    scale = 1 })
-hl.monitor({ output = "desc:Dell Inc. DELL P2214H KW14V59N39RB",             mode = "1920x1080@60",     position = "1920x0",   scale = 1, transform = 1 })  -- portrait
-hl.monitor({ output = "desc:Samsung Electric Company S34J55x H4LR305255",    mode = "3440x1440@59.973", position = "3000x480", scale = 1 })
+hl.monitor({ output = "desc:Dell Inc. DELL P2425HE 0AAAA01",                 mode = "1920x1080@60",     position = "0x840",    scale = 1 })
+hl.monitor({ output = "desc:Dell Inc. DELL P2214H 0BBBBBBBB002",             mode = "1920x1080@60",     position = "1920x0",   scale = 1, transform = 1 })  -- portrait
+hl.monitor({ output = "desc:Samsung Electric Company S34J55x 0CCCCCC003",    mode = "3440x1440@59.973", position = "3000x480", scale = 1 })
 hl.monitor({ output = "eDP-1",                                               mode = "1920x1080@60.049", position = "6440x840", scale = 1 })
 
 

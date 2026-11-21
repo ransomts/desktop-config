@@ -311,7 +311,7 @@ ShellRoot {
             const p = page()
             p.sel = 0
             row("Primary screen").edited(true)
-            check("primary is the left Dell", p.primary === "Dell Inc. DELL P2425HE 8BY1H14" && p.mapModel[0].primary && !p.mapModel[3].primary)
+            check("primary is the left Dell", p.primary === "Dell Inc. DELL P2425HE 0AAAA01" && p.mapModel[0].primary && !p.mapModel[3].primary)
             check("Save offered for a new primary", p.canSave)
             p.primary = "AU Optronics 0x683D"
             return 100

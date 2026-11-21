@@ -1,0 +1,315 @@
+#!/bin/bash
+# Screenshots of the desktop for the public repo's README, taken from a STAGED session: a nested
+# Hyprland running the published config with demo data, so nothing personal can be in a picture.
+#
+#   desktop-shots [-o OUTDIR] [-s SRC] [-k] [-v] [--only NAME[,NAME...]] [--dark-only|--light-only]
+#
+#   -o OUTDIR   where the PNGs go (default ~/Code/desktop-config/screenshots)
+#   -s SRC      the home tree to stage from (default ~/Code/desktop-config/home, the scrubbed public
+#               export, so the pictures show what is published; run desktop-export first)
+#   -k          keep the temporary directory (printed)
+#   -v          print the shell's log and the recorded commands at the end
+#   --only      only these shots (names below)
+#   --keys FILE also write the key-binding page (keybind-sheet --org) from the nested session's bindings
+#   PNGs are run through pngquant when it is installed (they are committed, so size matters).
+#
+# Shots (each in dark and light: NAME-dark.png, NAME-light.png):
+#   wallpaper     the empty desktop: wallpaper and bar
+#   desktop       wallpaper, bar and two tiled terminal windows
+#   launcher      the launcher over the desktop
+#   panel         the control panel
+#   notifications popups from a few demo notifications
+#   dashboard     the dashboard
+#   overview      the desktop overview
+#   settings      the settings window
+#   bar           a crop of the bar strip (from desktop)
+#
+# Isolation is shell-boot-test's: temporary HOME and XDG dirs, private session and "system" D-Bus
+# buses, a deny-by-default PATH where every program not on a short allow list is a recorder, every
+# ~/.local/bin script a recorder except a few offline status ones, Hyprland's own exec_cmd recorded.
+# Demo data: a calendar file with made-up events, made-up notifications, no mail, no network.
+# The nested Hyprland shows as a window on your desktop while it runs (about a minute).
+set -u
+out="$HOME/Code/desktop-config/screenshots"; src="$HOME/Code/desktop-config/home"
+keep=0; verbose=0; only=""; modes="dark light"; keys=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) out="$2"; shift ;;
+        -s) src="$2"; shift ;;
+        -k) keep=1 ;;
+        -v) verbose=1 ;;
+        --only) only=",$2,"; shift ;;
+        --keys) keys="$2"; shift ;;
+        --dark-only) modes=dark ;;
+        --light-only) modes=light ;;
+        *) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
+    esac
+    shift
+done
+want() { [ -z "$only" ] || [[ "$only" == *",$1,"* ]]; }
+
+QS="$HOME/.nix-profile/bin/qs"; GL="$HOME/.nix-profile/bin/nixGLIntel"
+qsrc="$src/.config/quickshell"; hsrc="$src/.config/hypr"; htests="$hsrc/tests"
+for need in Hyprland hyprctl jq dbus-daemon python3 grim ghostty; do
+    command -v "$need" >/dev/null || { echo "desktop-shots: needs $need" >&2; exit 2; }
+done
+[ -x "$QS" ] || { echo "desktop-shots: no qs at $QS" >&2; exit 2; }
+[ -f "$qsrc/shell.qml" ] && [ -f "$hsrc/hyprland.lua" ] && [ -d "$htests/stubs" ] \
+    || { echo "desktop-shots: $src does not hold .config/quickshell/shell.qml, .config/hypr/hyprland.lua and its tests/stubs" >&2; exit 2; }
+[ -n "${WAYLAND_DISPLAY:-}" ] && [ -n "${XDG_RUNTIME_DIR:-}" ] || { echo "desktop-shots: needs a Wayland session to open the nested one in" >&2; exit 2; }
+case "$WAYLAND_DISPLAY" in /*) live_wl="$WAYLAND_DISPLAY" ;; *) live_wl="$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ;; esac
+mkdir -p "$out" || exit 2
+out=$(realpath "$out")
+
+live_env() { systemctl --user show-environment 2>/dev/null | grep -E '^(WAYLAND_DISPLAY|DISPLAY|HYPRLAND_INSTANCE_SIGNATURE|PATH)=' | sort; }
+env_before=$(live_env)
+
+work=$(mktemp -d) || exit 2
+H="$work/home"; R="$work/run"; LOG="$work/exec.log"; P="$work/path"; QLOG="$work/qs.log"
+mkdir -p "$H/.config" "$H/.local/bin" "$H/.local/lib/hyprland" "$H/.local/state" "$H/.local/share" "$H/.cache" \
+         "$H/.nix-profile/bin" "$R" "$P" && chmod 700 "$R"
+cp -r "$hsrc" "$H/.config/hypr"
+mkdir -p "$H/.config/quickshell"
+( cd "$qsrc" && tar --exclude=./tests --exclude='*.orig' -cf - . ) | tar -C "$H/.config/quickshell" -xf -
+for d in ghostty gtk-3.0 gtk-4.0 qt5ct qt6ct fuzzel; do [ -d "$src/.config/$d" ] && cp -r "$src/.config/$d" "$H/.config/$d"; done
+[ -f "$HOME/.local/lib/hyprland/strict-resize.so" ] && ln -s "$HOME/.local/lib/hyprland/strict-resize.so" "$H/.local/lib/hyprland/"
+for d in fonts icons; do [ -d "$HOME/.local/share/$d" ] && ln -s "$HOME/.local/share/$d" "$H/.local/share/$d"; done
+ln -s "$QS" "$H/.nix-profile/bin/qs"
+: > "$LOG"; : > "$work/started"
+
+cat > "$work/rec" <<'EOF'
+#!/bin/sh
+printf '%s %s\n' "$(basename "$0")" "$*" >> "${SBT_LOG:-/dev/null}"
+exit 0
+EOF
+chmod +x "$work/rec"
+# ~/.local/bin: the published scripts, each a recorder except these offline status ones (they read
+# only the temporary HOME; anything they run goes through the PATH below)
+real_scripts="dnd-toggle notif-dnd drives agenda-day tz-now sunset-times shell-status"
+for f in "$src"/.local/bin/* "$HOME"/.local/bin/*; do
+    n=${f##*/}; [ -e "$H/.local/bin/$n" ] && continue
+    case " $real_scripts " in *" $n "*) cp "$f" "$H/.local/bin/$n" ;; *) ln -s "$work/rec" "$H/.local/bin/$n" ;; esac
+done
+rm -f "$H/.local/bin/shell-health"
+cat > "$H/.local/bin/shell-health" <<'CANNED'
+#!/bin/sh
+echo '{"worst": "ok", "jobs": []}'
+CANNED
+chmod +x "$H/.local/bin/shell-health"
+rm -f "$H/.local/bin/dashboard-data"       # made-up numbers, weather and mail for the dashboard
+cat > "$H/.local/bin/dashboard-data" <<'CANNED'
+#!/usr/bin/env python3
+import datetime as dt, json, sys
+if sys.argv[1:] == ["sys"]:
+    print(json.dumps({"cpu": 0.12, "mem": 0.31, "mem_gb": 12.2, "mem_total_gb": 39, "temp": 47, "load": "0.84",
+                      "uptime": "3d 4h", "disks": [{"name": "System", "used": 0.52, "free_gb": 220},
+                                                   {"name": "Data", "used": 0.38, "free_gb": 610}]}))
+    sys.exit()
+d = dt.date.today()
+days = [{"name": "Today" if i == 0 else (d + dt.timedelta(i)).strftime("%a"), "glyph": g, "words": w,
+         "hi": hi, "lo": lo, "rain": r} for i, (g, w, hi, lo, r) in enumerate(
+        [("", "Mostly clear", 64, 41, 0), ("", "Partly cloudy", 61, 44, 10),
+         ("", "Showers", 55, 46, 70), ("", "Clear", 59, 38, 0)])]
+tom = d + dt.timedelta(1)
+print(json.dumps({
+    "weather": {"ok": True, "temp": 58, "feels": 56, "words": "Mostly clear", "glyph": "", "wind": 6,
+                "humidity": 48, "sunrise": "07:12", "sunset": "17:28", "days": days},
+    "mail": {"boxes": [{"name": "Work", "unread": 3}, {"name": "Personal", "unread": 1}], "latest": []},
+    "tomorrow": {"name": tom.strftime("%A"), "events": [
+        {"start": "09:30", "end": "10:20", "title": "Algorithms lecture", "allday": False, "location": "Hall B 100",
+         "url": "", "date": tom.isoformat(), "id": "", "calendar": "demo", "tags": []},
+        {"start": "14:00", "end": "15:00", "title": "Student meetings", "allday": False, "location": "Room 210",
+         "url": "", "date": tom.isoformat(), "id": "", "calendar": "demo", "tags": []}]}}))
+CANNED
+chmod +x "$H/.local/bin/dashboard-data"
+mkdir -p "$H/.config/cosmic/com.system76.CosmicTheme.Mode/v1"
+dark_file="$H/.config/cosmic/com.system76.CosmicTheme.Mode/v1/is_dark"; echo true > "$dark_file"
+
+# ---- demo data ----
+# Calendar: a made-up teaching day, around the current time so the bar's "next" has something.
+mkdir -p "$H/.emacs.d/org/calendars"
+python3 -I - "$H/.emacs.d/org/calendars/demo.org" <<'EOF'
+import datetime as dt, sys
+now = dt.datetime.now().replace(second=0, microsecond=0)
+base = now.replace(minute=0)
+day = now.date(); dn = day.strftime("%a")
+def at(h, m=0): return (base + dt.timedelta(hours=h, minutes=m)).strftime("%H:%M")
+ev = [("Office hours", at(-2), at(-1), "Room 210"),
+      ("Data Structures lecture", at(1), at(1, 50), "Hall B 100"),
+      ("Lab: linked lists", at(3), at(4, 15), "Lab 112"),
+      ("Curriculum committee", at(5), at(6), "Conference room")]
+with open(sys.argv[1], "w") as f:
+    f.write("#+title: demo\n")
+    f.write(f"* Reading day\n<{day} {dn}>\n")
+    for t, s, e, loc in ev:
+        f.write(f"* {t}\n:PROPERTIES:\n:LOCATION: {loc}\n:END:\n<{day} {dn} {s}-{e}>\n")
+EOF
+# Text the terminals show
+mkdir -p "$H/demo"
+sed -n '/^local mainMod/,$p' "$hsrc/hyprland.lua" | head -48 > "$H/demo/keys.lua"
+[ -s "$H/demo/keys.lua" ] || head -48 "$hsrc/hyprland.lua" > "$H/demo/keys.lua"
+sed -n '/^Item\|^Rectangle\|^MouseArea/,$p' "$qsrc/Pill.qml" | head -48 > "$H/demo/Pill.qml"
+[ -s "$H/demo/Pill.qml" ] || head -48 "$qsrc/Pill.qml" > "$H/demo/Pill.qml"
+
+allow="sh dash bash env python3 jq sed awk gawk mawk grep cat date head tail tr cut sort uniq wc printf echo test [
+       basename dirname mkdir ls stat readlink realpath seq sleep true false findmnt hyprctl id uname nproc mktemp
+       touch rm mv cp ln tee xargs expr od md5sum find timeout"
+python3 -I - "$P" "$work/rec" $allow <<'EOF'
+import os, sys
+p, rec, allow = sys.argv[1], sys.argv[2], set(sys.argv[3:])
+for d in ("/usr/local/bin", "/usr/bin", "/bin"):
+    try: names = os.listdir(d)
+    except OSError: continue
+    for n in names:
+        dst = os.path.join(p, n)
+        if os.path.lexists(dst): continue
+        os.symlink(os.path.join(d, n) if n in allow else rec, dst)
+for n in ("qs", "quickshell", "nixGLIntel", "notify-send", "playerctl", "cava", "pw-play", "wpctl", "pactl"):
+    if not os.path.lexists(os.path.join(p, n)): os.symlink(rec, os.path.join(p, n))
+EOF
+
+pids=()
+cleanup() {
+    [ -n "${qs_pid:-}" ] && kill -9 "$qs_pid" 2>/dev/null
+    for p in "${pids[@]}"; do kill -9 "$p" 2>/dev/null; done
+    [ -n "${hypr_pid:-}" ] && kill -9 "$hypr_pid" 2>/dev/null
+    [ -n "${bus_pid:-}" ] && kill "$bus_pid" 2>/dev/null
+    [ -n "${sbus_pid:-}" ] && kill "$sbus_pid" 2>/dev/null
+    wait 2>/dev/null
+    if [ "$keep" = 1 ]; then echo "kept $work"; else rm -rf "$work"; fi
+}
+trap cleanup EXIT
+
+bus=$(dbus-daemon --session --fork --print-address=1 --print-pid=1 --nopidfile) || exit 2
+bus_addr=$(sed -n 1p <<<"$bus"); bus_pid=$(sed -n 2p <<<"$bus")
+sbus=$(dbus-daemon --session --fork --print-address=1 --print-pid=1 --nopidfile) || exit 2
+sbus_addr=$(sed -n 1p <<<"$sbus"); sbus_pid=$(sed -n 2p <<<"$sbus")
+
+base_env=(HOME="$H" USER=demo LOGNAME=demo LANG="${LANG:-C.UTF-8}"
+    XDG_RUNTIME_DIR="$R" XDG_CONFIG_HOME="$H/.config" XDG_STATE_HOME="$H/.local/state"
+    XDG_CACHE_HOME="$H/.cache" XDG_DATA_DIRS="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+    DBUS_SESSION_BUS_ADDRESS="$bus_addr" DBUS_SYSTEM_BUS_ADDRESS="$sbus_addr"
+    HYPR_TEST_LOG="$LOG" SBT_LOG="$LOG" NO_AT_BRIDGE=1 GTK_A11Y=none)
+
+env -i "${base_env[@]}" PATH="$htests/stubs:$PATH" XDG_DATA_HOME="$HOME/.local/share" \
+    WAYLAND_DISPLAY="$live_wl" LIBSEAT_BACKEND=seatd HYPRLAND_NO_SD_VARS=1 HYPRLAND_NO_SD_NOTIFY=1 \
+    Hyprland -c "$H/.config/hypr/hyprland.lua" > "$work/hyprland.out" 2>&1 &
+hypr_pid=$!
+
+die() { echo "desktop-shots: $*" >&2; [ "$verbose" = 1 ] && tail -20 "$QLOG" >&2; exit 1; }
+sig=""
+for _ in $(seq 150); do
+    s=$(/bin/ls "$R/hypr" 2>/dev/null | head -1)
+    [ -n "$s" ] && [ -S "$R/hypr/$s/.socket.sock" ] && { sig=$s; break; }
+    kill -0 "$hypr_pid" 2>/dev/null || break
+    sleep 0.1
+done
+[ -n "$sig" ] || die "nested Hyprland did not come up: $(tail -3 "$work/hyprland.out" | tr '\n' ' ')"
+hc() { env XDG_RUNTIME_DIR="$R" HYPRLAND_INSTANCE_SIGNATURE="$sig" hyprctl "$@"; }
+for _ in $(seq 100); do hc version >/dev/null 2>&1 && break; sleep 0.1; done
+nested_wl=$(cd "$R" && /bin/ls wayland-* 2>/dev/null | grep -v '\.lock$' | head -1)
+until_jq() { local cmd=$1 expr=$2 n=${3:-50}; for _ in $(seq "$n"); do hc -j "$cmd" 2>/dev/null | jq -e "$expr" >/dev/null 2>&1 && return 0; sleep 0.1; done; return 1; }
+mon=$(hc -j monitors | jq -r '.[0].name')
+
+# A fixed 1920x1080 screen to photograph; the nested window's own screen is switched off.
+SHOT=SHOT-1
+hc output create headless "$SHOT" >/dev/null
+until_jq monitors 'length == 2' 30
+hc eval "hl.monitor({ output = \"$SHOT\", mode = \"1920x1080@60\", position = \"0x0\", scale = 1 })" >/dev/null
+hc eval "hl.monitor({ output = \"$mon\", disabled = true })" >/dev/null
+until_jq monitors "length == 1 and .[0].name == \"$SHOT\" and .[0].width == 1920" 50 || die "headless $SHOT is not 1920x1080: $(hc -j monitors | jq -c '[.[] | {name,width,height}]')"
+
+qs_env=(env -i "${base_env[@]}" PATH="$P" XDG_DATA_HOME="$H/.local/share"
+        WAYLAND_DISPLAY="$nested_wl" HYPRLAND_INSTANCE_SIGNATURE="$sig" XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=Hyprland)
+if [ -x "$GL" ]; then "${qs_env[@]}" "$GL" "$QS" -n --no-color > "$QLOG" 2>&1 &
+else "${qs_env[@]}" QT_QUICK_BACKEND=software "$QS" -n --no-color > "$QLOG" 2>&1 & fi
+qs_pid=$!
+qsi() { "${qs_env[@]}" "$QS" ipc "$@" 2>&1; }
+alive() { kill -0 "$qs_pid" 2>/dev/null; }
+for _ in $(seq 150); do [ "$(qsi call bar status)" = shown ] && break; alive || die "the shell died at start"; sleep 0.1; done
+[ "$(qsi call bar status)" = shown ] || die "the shell did not answer qs ipc"
+layer_on() { hc -j layers 2>/dev/null | jq -e --arg m "$SHOT" --arg ns "$1" '.[$m].levels // {} | [.[][] | select(.namespace == $ns)] | length > 0' >/dev/null; }
+until_layer() { for _ in $(seq "${2:-50}"); do layer_on "$1" && return 0; sleep 0.1; done; return 1; }
+until_gone() { for _ in $(seq "${2:-30}"); do layer_on "$1" || return 0; sleep 0.1; done; return 1; }
+until_layer qs-bar 50 || die "no bar on $SHOT"
+hc eval 'hl.config({ cursor = { invisible = true } })' >/dev/null 2>&1
+hc eval 'hl.dispatch(hl.dsp.cursor.move({ x = 1919, y = 1079 }))' >/dev/null 2>&1
+
+# Demo windows: two terminals with published files in them (no prompt, no host name), in the
+# terminal theme for the mode; bat's "ansi" theme uses the terminal's own palette.
+tpids=()
+term() {   # term TITLE FILE THEME
+    env -i "${base_env[@]}" PATH="/usr/bin:/bin:$HOME/.local/bin" XDG_DATA_HOME="$H/.local/share" \
+        WAYLAND_DISPLAY="$nested_wl" GDK_BACKEND=wayland \
+        ghostty --gtk-single-instance=false --title="$1" --confirm-close-surface=false --theme="$3" \
+        -e sh -c "bat --paging=never --style=numbers --color=always --theme=ansi '$2' 2>/dev/null || cat '$2'; exec sleep 3600" \
+        >/dev/null 2>&1 &
+    tpids+=($!); pids+=($!)
+}
+terms_off() { for p in "${tpids[@]}"; do kill "$p" 2>/dev/null; done; tpids=(); until_jq clients 'length == 0' 50; }
+terms_on() {   # terms_on THEME
+    term "hyprland.lua" "$H/demo/keys.lua" "$1"; sleep 1.5
+    term "Pill.qml" "$H/demo/Pill.qml" "$1"
+    until_jq clients 'length >= 2' 100 || echo "desktop-shots: the demo terminals did not both open" >&2
+    sleep 1.5
+}
+sleep "${SHOTS_SETTLE:-6}"           # first polls, wallpaper fade-in
+
+shoot() { env XDG_RUNTIME_DIR="$R" WAYLAND_DISPLAY="$nested_wl" grim -o "$SHOT" "$out/$1.png" && echo "  $out/$1.png"; }
+notify() { env DBUS_SESSION_BUS_ADDRESS="$bus_addr" /usr/bin/notify-send "$@"; }
+
+for mode in $modes; do
+    [ "$mode" = dark ] && echo true > "$dark_file" || echo false > "$dark_file"
+    terms_off
+    sleep 2.5
+    echo "$mode:"
+    want wallpaper && shoot "wallpaper-$mode"
+    if [ "$mode" = dark ]; then terms_on "Clemson Dark"; else terms_on "Clemson Light"; fi
+    if want desktop || want bar; then
+        shoot "desktop-$mode"
+        want bar && python3 -I - "$out/desktop-$mode.png" "$out/bar-$mode.png" <<'EOF'
+import sys
+from PIL import Image
+im = Image.open(sys.argv[1]); w, h = im.size
+im.crop((0, 0, w, 56)).save(sys.argv[2]); print("  " + sys.argv[2])
+EOF
+        want desktop || rm -f "$out/desktop-$mode.png"
+    fi
+    view() {   # view NAME NAMESPACE OPEN... -- CLOSE...
+        local name=$1 ns=$2; shift 2; local open=() close=()
+        while [ $# -gt 0 ] && [ "$1" != -- ]; do open+=("$1"); shift; done; shift; close=("$@")
+        want "$name" || return 0
+        qsi call "${open[@]}" >/dev/null
+        if until_layer "$ns" 40; then sleep 0.9; shoot "$name-$mode"; else echo "  $name: no $ns layer" >&2; fi
+        qsi call "${close[@]}" >/dev/null; until_gone "$ns" 30; sleep 0.4
+    }
+    view launcher qs-launcher launcher toggle -- launcher toggle
+    view panel qs-panel panel toggle -- panel toggle
+    view dashboard qs-dashboard dashboard open -- dashboard close
+    view overview qs-overview overview toggle -- overview toggle
+    view settings qs-settings settings open appearance -- settings close
+    if want notifications; then
+        notify -a "Calendar" -i x-office-calendar "Data Structures lecture in 10 minutes" "Hall B 100"
+        sleep 0.4; notify -a "Build" -i emblem-ok "Lecture slides built" "week-12.pdf, 34 pages"
+        sleep 0.4; notify -a "Backup" -i drive-harddisk "Backup finished" "Nothing changed since yesterday"
+        sleep 1.2; shoot "notifications-$mode"
+        qsi call notif dismissAll >/dev/null; sleep 0.6
+    fi
+done
+
+if [ -n "$keys" ]; then   # the key-binding page, from the published config's bindings
+    hc -j binds > "$work/binds.json" && mkdir -p "$(dirname "$keys")" && "$HOME/.local/bin/keybind-sheet" --binds "$work/binds.json" --org "$keys"
+fi
+alive || echo "desktop-shots: the shell died during the run (pictures may be incomplete)" >&2
+if command -v pngquant >/dev/null; then   # palette PNGs, about a quarter of the size; they live in git
+    for f in "$out"/*-dark.png "$out"/*-light.png; do
+        [ -f "$f" ] && [ "$f" -nt "$work/started" ] && pngquant --quality 65-90 --speed 1 --strip -f --ext .png "$f" 2>/dev/null
+    done
+fi
+if [ "$verbose" = 1 ]; then
+    echo "--- shell log (warnings)"; grep -E 'WARN|ERROR' "$QLOG" | head -40
+    echo "--- recorded commands (counts)"; cut -d' ' -f1 "$LOG" | sort | uniq -c | sort -rn | head -30
+fi
+kill -9 "$qs_pid" 2>/dev/null; wait "$qs_pid" 2>/dev/null; qs_pid=""
+kill -9 "$hypr_pid" 2>/dev/null; wait "$hypr_pid" 2>/dev/null; hypr_pid=""
+[ "$(live_env)" = "$env_before" ] || echo "desktop-shots: WARNING the live systemd environment changed; fix with systemctl --user set-environment" >&2
