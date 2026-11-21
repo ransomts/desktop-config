@@ -41,6 +41,8 @@ The wallpaper is a set of animated shaders, here sped up:
 | Screenshot editor (Print): arrow, box, numbered steps, pixelate | |
 | [[file:screenshots/lecture-dark.png]] | [[file:screenshots/lecture-light.png]] |
 | Lecture tools: ink on the screen and a countdown | |
+| [[file:screenshots/spotlight-dark.png]] | [[file:screenshots/spotlight-light.png]] |
+| Lecture tools: the spotlight follows the pointer | |
 | [[file:screenshots/keys-dark.png]] | [[file:screenshots/keys-light.png]] |
 | Lecture tools: the keys being pressed, for screen recordings | |
 | [[file:screenshots/lock-dark.png]] | [[file:screenshots/lock-light.png]] |
