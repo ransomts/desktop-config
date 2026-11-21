@@ -79,6 +79,7 @@ PanelWindow {
                     horizontalAlignment: Text.AlignRight
                     elide: Text.ElideRight
                     text: WallState.cfg.hidden ? "plain wallpaper" : !WallState.cfg.running ? "still"
+                        : WallState.forced ? "forced on"
                         : WallState.moving ? "moving" + (WallState.cfg.heat && WallState.fanAvg > 0 ? "  fan " + Math.round(WallState.fanAvg) : "")
                         : WallState.hot ? "resting: fan busy" : "still: on battery"
                 }
@@ -186,7 +187,7 @@ PanelWindow {
                 }
             }
 
-            // Moving: animated (on mains). Still: this scene, frozen. Plain: the ordinary wallpaper image.
+            // Moving: animated (on mains, heat guard allowing). Forced: animated on battery and through the heat guard too, until the power source or the mode changes. Still: this scene, frozen. Plain: the ordinary wallpaper image.
             ColumnLayout {
                 Layout.fillWidth: true
                 spacing: 8
@@ -196,8 +197,13 @@ PanelWindow {
                     spacing: 8
                     Chip {
                         label: "Moving"
-                        on: !WallState.cfg.hidden && WallState.cfg.running
-                        onClicked: { WallState.cfg.hidden = false; WallState.cfg.running = true }
+                        on: !WallState.cfg.hidden && WallState.cfg.running && !WallState.forced
+                        onClicked: { WallState.force(false); WallState.cfg.hidden = false; WallState.cfg.running = true }
+                    }
+                    Chip {
+                        label: "Forced"
+                        on: WallState.forced
+                        onClicked: WallState.force(!on)
                     }
                     Chip {
                         label: "Still"

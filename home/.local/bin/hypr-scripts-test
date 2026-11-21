@@ -50,7 +50,7 @@ H="$work/home"; HS="$work/hypr"; rt="$work/rt"; calls="$work/calls"; state="$wor
 mkdir -p "$H/.local/bin" "$H/.nix-profile/bin" "$H/.config/quickshell" "$H/.config/hypr" \
          "$H/.local/share/applications" "$HS" "$rt" "$state" "$work/cache"
 chmod 700 "$rt"
-cp "$lib/home-stubs/"{session-save,notif-dnd,bar-refresh,gvm-gui,qs-pick,hypr-window-list} "$H/.local/bin/"
+cp "$lib/home-stubs/"{session-save,notif-dnd,bar-refresh,gvm,gvm-gui,qs-pick,hypr-window-list} "$H/.local/bin/"
 cp "$lib/home-stubs/qs" "$H/.nix-profile/bin/qs"
 
 npass=0; nfail=0
@@ -281,6 +281,7 @@ eq "running, hidden: show and centre" "$(HC)" "$TG;$CG;"
 : > "$calls"; run "$bin/gvm-lights"
 eq "running, showing: hide (gvm-gui keeps running)" "$(HC)" "$TG;"
 hasnt "  nothing started or killed" "$(C)" "gvm-gui"
+hasnt "  and no link release (gvm-gui owns the links)" "$(C)" "gvm release"
 gvm_fresh special:lights
 run "$bin/gvm-lights" hide
 eq "hide while showing: hides" "$(HC)" "$TG;"
@@ -290,6 +291,8 @@ eq "hide while hidden: nothing" "$(HC)" ""
 gvm_fresh; echo '[]' > "$HS/clients.json"
 run "$bin/gvm-lights"
 has "not running: starts \$HOME/.local/bin/gvm-gui" "$(C)" "gvm-gui"
+{ grep -n "^gvm release" "$calls" | head -1 | cut -d: -f1; grep -n "^gvm-gui" "$calls" | head -1 | cut -d: -f1; } | tr '\n' ' ' | { read r g; [ -n "$r" ] && [ -n "$g" ] && [ "$r" -lt "$g" ]; }
+check "  after dropping leftover links (gvm release first)" $? "$(C)"
 eq "  then shows and centres it" "$(HC)" "$TG;$CG;"
 gvm_fresh; echo '[]' > "$HS/clients.json"; : > "$work/no-window"
 run "$bin/gvm-lights"

@@ -212,6 +212,16 @@ Singleton {
         running: sys.player !== null && sys.player.isPlaying
         onTriggered: sys.player.positionChanged()
     }
+    // "Stop and clear" in the music card: stop the player and hide the pill until something
+    // plays again (MPD keeps the stopped song's title, so the pill would otherwise stay).
+    property bool mediaCleared: false
+    readonly property bool anyPlaying: realPlayers.some(p => p.isPlaying)
+    onAnyPlayingChanged: if (anyPlaying && player && player.isPlaying) mediaCleared = false
+    function stopMedia() {
+        const p = player
+        if (p) { if (p.canControl) p.stop(); else if (p.canPause) p.pause() }
+        mediaCleared = true
+    }
     readonly property var player: {
         const ps = realPlayers
         const pinned = playerPin !== "" ? ps.find(p => p.identity === playerPin) : null

@@ -206,7 +206,7 @@ PanelWindow {
                 readonly property int room: rightRow.x - (clockPill.x + clockPill.width) - 12 - 24 - 22 - 20 - 16
                 readonly property real progress: player && player.lengthSupported && player.length > 0
                                                  ? Math.max(0, Math.min(1, player.position / player.length)) : 0
-                visible: !bar.compact && what !== "" && room >= 70
+                visible: !bar.compact && what !== "" && room >= 70 && !(Sys.mediaCleared && !playing)
                 tip: !player ? "" : "<b>" + (player.trackTitle || "") + "</b>"
                      + (player.trackArtist ? "\n" + player.trackArtist : "") + (player.trackAlbum ? "\n" + player.trackAlbum : "")
                      + "\n(" + player.identity + ")\nClick: player controls\nRight-click: play / pause\nMiddle-click or click the cover: open the player"
@@ -468,6 +468,17 @@ PanelWindow {
                 Connections { target: petFriend; function onRang() { bellSwing.restart() } }
             }
 
+            Pill {    // the GVM video lights (Lights.qml): last known on / off; presets on click, all on / off on right-click, the full controls on middle-click
+                id: lightsPill
+                visible: !bar.compact && Lights.present
+                text: (Lights.anyOn ? Icons.lightOn : Icons.lightOff) + (Lights.busy ? " …" : "")
+                ink: Lights.error !== "" ? Theme.warn : Lights.anyOn ? Theme.accent : Theme.fg
+                tip: Lights.tip()
+                onClicked: bar.togglePopup("lights", lightsPill)
+                onRightClicked: Lights.quick()
+                onMiddleClicked: Lights.openWindow()
+            }
+
             Pill {    // dark / light
                 visible: !bar.compact
                 text: Theme.dark ? "◑" : "◐"
@@ -594,7 +605,7 @@ PanelWindow {
         }
     }
 
-    // ---- popups that drop from a pill: calendar, mixer, Wi-Fi, Bluetooth, power profile, power, notifications ----
+    // ---- popups that drop from a pill: calendar, mixer, Wi-Fi, Bluetooth, power profile, power, notifications, lights ----
     property string popup: ""
     property Item popupAnchor: null
     function togglePopup(name, item) {
@@ -610,7 +621,8 @@ PanelWindow {
         function onPopupRequest(name) {
             if (!bar.visible || !bar.monitor || !Hyprland.focusedMonitor || Hyprland.focusedMonitor.name !== bar.monitor.name) return
             const at = { mixer: vol, wifi: netPill, bluetooth: btPill.visible ? btPill : netPill, profile: profilePill, power: powerPill, notifs: notifPill, health: healthPill.visible ? healthPill : notifPill, pet: petSprite.active ? petSprite : clockPill,
-                         media: media.visible ? media : clockPill, teams: teamsPill.visible ? teamsPill : notifPill }
+                         media: media.visible ? media : clockPill, teams: teamsPill.visible ? teamsPill : notifPill,
+                         lights: lightsPill.visible ? lightsPill : clockPill }
             bar.togglePopup(name, at[name] || clockPill)
         }
     }
@@ -621,7 +633,7 @@ PanelWindow {
         anchor.edges: Edges.Bottom
         anchor.gravity: Edges.Bottom
         color: "transparent"
-        implicitWidth: (bar.popup === "calendar" ? 300 : bar.popup === "media" ? 320 : bar.popup === "notifs" ? 360 : bar.popup === "health" ? 380 : bar.popup === "pet" ? 290 : bar.popup === "power" || bar.popup === "profile" ? 220 : bar.popup === "teams" ? 340 : 300) + 32
+        implicitWidth: (bar.popup === "calendar" ? 300 : bar.popup === "media" ? 320 : bar.popup === "notifs" ? 360 : bar.popup === "health" ? 380 : bar.popup === "pet" ? 290 : bar.popup === "power" || bar.popup === "profile" || bar.popup === "lights" ? 220 : bar.popup === "teams" ? 340 : 300) + 32
         implicitHeight: popBody.implicitHeight + 32 + 8
         Rectangle {
             anchors.fill: parent
@@ -644,13 +656,13 @@ PanelWindow {
                 id: popBody
                 anchors { left: parent.left; right: parent.right; top: parent.top; margins: 16 }
                 sourceComponent: ({ calendar: calendarView, mixer: mixerView, wifi: wifiView, bluetooth: bluetoothView,
-                                    profile: profileView, power: powerView, media: mediaView, notifs: notifsView, pet: petView, health: healthView, teams: teamsView })[bar.popup] || null
+                                    profile: profileView, power: powerView, media: mediaView, notifs: notifsView, pet: petView, health: healthView, teams: teamsView, lights: lightsView })[bar.popup] || null
             }
         }
     }
     Component { id: calendarView; Calendar { today: Sys.now } }
     Component { id: mixerView; Mixer {} }
-    Component { id: mediaView; MediaPop {} }
+    Component { id: mediaView; MediaPop { onDone: bar.popup = "" } }
     Component { id: notifsView; NotifList {} }
     Component { id: healthView; HealthList { onDone: bar.popup = "" } }
     Component { id: petView; PetMenu { screenKey: Pet.screenKey(bar.modelData); onDone: bar.popup = "" } }
@@ -659,6 +671,7 @@ PanelWindow {
     Component { id: profileView; ProfileList { onDone: bar.popup = "" } }
     Component { id: teamsView; TeamsList { onDone: bar.popup = "" } }
     Component { id: powerView; PowerMenu { onDone: bar.popup = "" } }
+    Component { id: lightsView; LightsList { onDone: bar.popup = "" } }
     // Click-outside-to-close. The grab is switched on a moment after the popup is
     // shown: armed in the same instant, the popup's surface doesn't exist yet, isn't
     // on the grab's list, and a click inside the popup closes it (seen 2026-11-10).

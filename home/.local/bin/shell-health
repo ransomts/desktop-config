@@ -7,13 +7,40 @@
   shell-health --refresh    also ask updates-check to look again now (otherwise its cache is used)
 
 Each job: {id, name, state, since, why, unit, log, run}
-  state  ok | stale | failed | off      off = the unit does not exist here; left out of "worst"
+  state  ok | healing | stale | failed | off
+         off = the unit does not exist here; left out of "worst"
+         healing = not proven working, but already on its way back and inside its grace: a timer job
+         that has not run since the laptop started or woke (counted from then, not from the last
+         success), a run that failed once below the job's own threshold with the retry scheduled,
+         a service starting or restarting, a network job while offline, a network job whose failures
+         all came in the 5 minutes since a wake (the network coming back), Microsoft 365 down only
+         since such a wake.  why says what it is waiting
+         for and when the next try is due.  Left out of "worst"; it turns stale or failed when the
+         grace runs out.
   since  ISO time of the last success ("" when unknown)
   why    one short plain sentence
   log    shell command that shows the job's log;  run  shell command that runs it now ("")
 
+Guards against false alarms (2026-11-20; `health-report` shows how noisy the pill has been):
+  confirm   a job is raised (stale/failed) only once it has not been ok for CONFIRM (100 s, two
+            polls); until then it is healing, "checking again".  Time already spent healing
+            counts, so a grace that ends in a real failure is raised at once.
+  online    means usable: a default route AND NetworkManager connectivity not none/portal/limited
+            (a wake has a route before DNS; campus Wi-Fi has a portal).  nmcli unsure: the route.
+  wake      every network job that went bad only since the last wake (WAKE_SLACK early) is
+            healing for WAKE_GRACE; timer jobs with a streak file and Microsoft date their own
+            failures and do this themselves.
+  unknown   a probe that timed out (systemd, Docker, gsettings) keeps the job's last known state
+            and says "could not check just now"; it never turns a job off or green.
+  restarts  counted over the last hour (history in seen.json), not over the unit's lifetime.
+  units     any other failed user unit is amber, not red (fumon has already announced it), after
+            the same confirmation; IGNORE_UNITS and health.json "ignoreUnits" (globs) leave it out.
+  repairs   a job's script may fix things itself (pull-mail restarts a stuck DavMail); the stamp
+            file is shown in why for 6 h ("restarted DavMail itself 10 min ago, which fixed it").
+
 "stale" means a timer job whose last success is older than about three times its period
-(a floor for the fast ones; weekly jobs are stale after two periods and a day).  A job that
+(a floor for the fast ones; weekly jobs are stale after two periods and a day), counted from the
+last start or wake when that is later.  A job that
 reports its own failures is failed from the same count its own watcher uses.  Offline, the
 network jobs get a grace period before they count (why says "offline").
 
@@ -30,11 +57,11 @@ background at most every 6 hours).  Disk rows use os.statvfs on the real mounted
 
 Settings: ~/.config/shell/health.json (all keys optional)
   {"updatesNag": 50, "staleListDays": 14, "diskPercent": 10, "diskGB": 5, "espMB": 20,
-   "hidden": ["calibre-backup"], "notices": {"updates": true, "firmware": true, "disk": true, "reboot": true}}
+   "hidden": ["calibre-backup"], "ignoreUnits": ["some-flaky@*.service"], "notices": {"updates": true, "firmware": true, "disk": true, "reboot": true}}
 A job or notice id in "hidden" is left out of jobs and worst altogether.
 
 Read-only: it reads systemd's state, the streak files the sync scripts leave under
-$XDG_STATE_HOME, backup folders, gsettings and findmnt.  It never lists or reads inside the
+$XDG_STATE_HOME, backup folders, gsettings, findmnt, nmcli, docker inspect and stat -f on the music card.  It never lists or reads inside the
 Box mount.  Its only write is $XDG_STATE_HOME/shell-health/seen.json (when each job was last
 seen working, and since when the network has been down).  Every subprocess has a timeout;
 the whole run is bounded by about 3 seconds.
@@ -42,11 +69,15 @@ the whole run is bounded by about 3 seconds.
 Test hooks (environment): SHELL_HEALTH_NOW (epoch), SHELL_HEALTH_ROUTE (stand-in for
 /proc/net/route), SHELL_HEALTH_NETDIR (stand-in for /proc/net), HOME, XDG_STATE_HOME,
 XDG_RUNTIME_DIR, XDG_CURRENT_DESKTOP, PATH, SHELL_HEALTH_CONFIG (stand-in for health.json),
-SHELL_HEALTH_DISKS (a JSON file {mountpoint: {fstype, total, free}} in place of /proc/self/mountinfo
-and statvfs), SHELL_HEALTH_UPDATES (the updates-check program; "none" for no notices).
+SHELL_HEALTH_WAKE (epoch of the last start or wake, in place of /proc/stat btime and
+the journal; empty reads them), SHELL_HEALTH_PROCSTAT (stand-in for /proc/stat), SHELL_HEALTH_DISKS (a JSON file {mountpoint: {fstype, total, free}} in place of /proc/self/mountinfo
+and statvfs), SHELL_HEALTH_UPDATES (the updates-check program; "none" for no notices), SHELL_HEALTH_CONFIRM
+(seconds; 0 turns confirmation off), SHELL_HEALTH_CONNECTIVITY (in place of nmcli's answer),
+SHELL_HEALTH_ARCHIVE_DEV and SHELL_HEALTH_ARCHIVE_DIR (the music card's device and mount point).
 """
 import concurrent.futures as cf
 import datetime
+import fnmatch
 import json
 import os
 import subprocess
@@ -58,6 +89,15 @@ STATE = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local/state")
 RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
 NOW = float(os.environ.get("SHELL_HEALTH_NOW") or time.time())
 GRACE = 30 * 60               # offline this long before a network job counts as bad
+WAKE_GRACE = 5 * 60           # a network job's failures this soon after a wake are the network coming back
+WAKE_SLACK = 60               # the journal logs the wake a few seconds after resumed jobs already ran
+# A job turns stale or failed only once it has looked bad this long (two polls of the pill, which runs
+# this every 2 min); until then it is healing, "checking again".  Of the alerts between 2026-11-15
+# and 11-20, 7 in 10 cleared on their own within 2-4 minutes.
+CONFIRM = float(os.environ.get("SHELL_HEALTH_CONFIRM") or 100)
+RESTART_WINDOW = 3600   # restarts counted over the last hour, not since the unit started
+RESTARTS_STALE = 3                       # this many in the window: stale
+SEEN = {}                                # seen.json, loaded before the judges run (restart history)
 MIN, H, D = 60, 3600, 86400
 SYSCTL = ["systemctl", "--user"]
 
@@ -67,6 +107,8 @@ def run(argv, env=None, timeout=1.8):
     try:
         p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
         return p.returncode, p.stdout
+    except subprocess.TimeoutExpired:
+        return 124, ""                   # did not answer in time: unknown, not absent
     except (OSError, subprocess.SubprocessError):
         return 255, ""
 
@@ -123,6 +165,97 @@ def usec_of(v):
     return ts_of(v)
 
 
+def when_of(v):
+    """@epoch, or the dated form some timer properties keep despite --timestamp=unix
+    ("Thu 2026-11-19 08:20:00 EST", local time); 0.0 when empty or unreadable."""
+    v = (v or "").strip()
+    if v.startswith("@"):
+        return ts_of(v)
+    parts = v.split()
+    for i in range(len(parts) - 1):
+        try:
+            return datetime.datetime.strptime(parts[i] + " " + parts[i + 1], "%Y-%m-%d %H:%M:%S").timestamp()
+        except ValueError:
+            continue
+    return 0.0
+
+
+SPAN_UNITS = {"us": 1e-6, "ms": 1e-3, "s": 1, "min": MIN, "h": H, "d": D, "w": 7 * D, "month": 30.44 * D, "y": 365.25 * D}
+
+
+def span_of(v):
+    """a systemd timespan ("10min 32.540477s") in seconds; None when empty, 0 or infinity"""
+    v = (v or "").strip()
+    if not v or v in ("0", "infinity"):
+        return None
+    total = 0.0
+    for tok in v.split():
+        num = tok.rstrip("abcdefghijklmnopqrstuvwxyz")
+        unit = tok[len(num):] or "s"
+        if unit not in SPAN_UNITS:
+            return None
+        try:
+            total += float(num) * SPAN_UNITS[unit]
+        except ValueError:
+            return None
+    return total
+
+
+def next_run(ti):
+    """when the timer fires next (epoch), 0.0 when unknown"""
+    t = when_of(ti.get("NextElapseUSecRealtime"))
+    if t:
+        return t
+    mono = span_of(ti.get("NextElapseUSecMonotonic"))
+    if mono is not None and "SHELL_HEALTH_NOW" not in os.environ:
+        return NOW + mono - time.clock_gettime(time.CLOCK_MONOTONIC)
+    return 0.0
+
+
+def due(t):
+    """'in 3 min' / 'any moment' for an epoch in the future"""
+    if not t:
+        return ""
+    left = t - NOW
+    if left < 45:
+        return "any moment"
+    return "in " + span(left)
+
+
+def last_wake():
+    """when the laptop last started or woke from sleep (epoch); 0.0 when unknown"""
+    if os.environ.get("SHELL_HEALTH_WAKE"):
+        try:
+            return float(os.environ["SHELL_HEALTH_WAKE"])
+        except ValueError:
+            return 0.0
+    boot = 0.0
+    for line in read(os.environ.get("SHELL_HEALTH_PROCSTAT") or "/proc/stat").splitlines():
+        if line.startswith("btime "):
+            try:
+                boot = float(line.split()[1])
+            except ValueError:
+                pass
+    # The journal is the record that holds: systemd garbage-collects sleep.target once it is inactive,
+    # and the reloaded unit has no timestamps, so a wake read from it alone is lost after a few seconds
+    # (2026-11-19: every job asleep through a suspend showed stale instead of healing).  The last
+    # line a sleep service logs this boot is written as it finishes, that is, on resume.
+    woke = 0.0
+    rc, out = run(["journalctl", "-b", "-q", "--no-pager", "-o", "short-unix", "-n", "1"]
+                  + [a for u in ("suspend", "hibernate", "hybrid-sleep", "suspend-then-hibernate")
+                     for a in ("-u", "systemd-%s.service" % u)])
+    if rc == 0 and out.strip():
+        try:
+            woke = float(out.strip().splitlines()[-1].split()[0])
+        except ValueError:
+            woke = 0.0
+    if not woke:
+        rc, out = run(["systemctl", "--timestamp=unix", "show", "-p", "InactiveEnterTimestamp", "sleep.target"])
+        woke = ts_of(out.strip().partition("=")[2]) if rc == 0 else 0.0
+    w = max(boot, woke)
+    return w if w <= NOW else 0.0
+
+
 def count(path):
     try:
         return int((read(path).strip() or "0").split()[0])
@@ -132,8 +265,10 @@ def count(path):
 
 # ---------------------------------------------------------------- data gathering
 def systemd_show(units):
-    props = "Id,LoadState,ActiveState,SubState,Result,ExecMainStatus,UnitFileState,NRestarts,ActiveEnterTimestamp,LastTriggerUSec,ExecMainExitTimestamp"
+    props = "Id,LoadState,ActiveState,SubState,Result,ExecMainStatus,UnitFileState,NRestarts,ActiveEnterTimestamp,LastTriggerUSec,ExecMainExitTimestamp,NextElapseUSecRealtime,NextElapseUSecMonotonic"
     rc, out = run(SYSCTL + ["--timestamp=unix", "show", "-p", props] + units)
+    if rc != 0 or not out.strip():
+        return None                      # systemd did not answer (slow right after a wake): unknown
     info = {}
     for block in out.split("\n\n"):
         d = {}
@@ -179,13 +314,27 @@ def listening(port):
     return False
 
 
-def online():
+def has_route():
     route = os.environ.get("SHELL_HEALTH_ROUTE") or "/proc/net/route"
     for line in read(route).splitlines()[1:]:
         f = line.split("\t") if "\t" in line else line.split()
         if len(f) > 3 and f[1] == "00000000" and int(f[3], 16) & 1:
             return True
     return False
+
+
+def online():
+    """Is the internet actually usable?  A default route alone is not enough: after a wake the route
+    is back before DNS, and a captive portal (campus Wi-Fi) has a route but no internet.
+    NetworkManager's own connectivity state (cached, no request) settles it; when NetworkManager
+    cannot say ("unknown", or no nmcli), the route decides."""
+    if not has_route():
+        return False
+    c = os.environ.get("SHELL_HEALTH_CONNECTIVITY")
+    if c is None:
+        rc, out = run(["nmcli", "-t", "networking", "connectivity"], timeout=1.0)
+        c = out.strip() if rc == 0 else ""
+    return c not in ("none", "portal", "limited")
 
 
 # ---------------------------------------------------------------- job table
@@ -208,11 +357,14 @@ def restart(unit):
 TIMERS = [
     # id, name, timer, service, period, floor, state dir, bad_at, stale_at (streak), net, extra log
     dict(id="pull-mail", name="Mail sync", timer="pull-mail.timer", service="pull-mail.service",
-         period=2 * MIN, floor=15 * MIN, streak="pull-mail", bad_at=2, net=True),
+         period=2 * MIN, floor=15 * MIN, streak="pull-mail", bad_at=2, net=True,
+         repair=("pull-mail/davmail-restarted", "restarted DavMail itself")),
     dict(id="pull-calendars", name="Calendar sync", timer="pull-calendars.timer", service="pull-calendars.service",
          period=10 * MIN, floor=30 * MIN, streak="pull-calendars", bad_at=6, warn_at=3, net=True),
     dict(id="push-roam", name="Notes push to homeserver", timer="push-roam.timer", service="push-roam.service",
          period=10 * MIN, floor=30 * MIN, streak="push-roam", bad_at=2, net=True),
+    dict(id="teams-refresh", name="Teams sign-in refresh", timer="teams-refresh.timer", service="teams-refresh.service",
+         period=8 * H, net=True, log="journalctl --user -u teams-refresh.service -n 80 --no-pager"),
     dict(id="calibre-backup", name="Calibre database backup", timer="calibre-db-backup.timer",
          service="calibre-db-backup.service", period=7 * D, net=False,
          artifact=("glob", HOME + "/.local/share/calibre-db-backups", "metadata-", ".db"),
@@ -228,12 +380,40 @@ REASONS = {
 }
 
 
-def mk(job, state, why, since=0.0, unit="", log="", run_cmd=""):
+def mk(job, state, why, since=0.0, unit="", log="", run_cmd="", own_wake=False):
+    """own_wake: the judge already knows when the trouble began and applied the wake grace itself"""
     return dict(id=job[0], name=job[1], state=state, since=iso(since), why=why, unit=unit,
-                log=log, run=run_cmd, _net=job[2], _since=since)
+                log=log, run=run_cmd, _net=job[2], _since=since, _own_wake=own_wake, _unknown="")
 
 
-def judge_timer(t, info):
+def judge_timer(t, info, wake=0.0):
+    j = _judge_timer(t, info, wake)
+    j["_own_wake"] = bool(t.get("streak"))       # its streak file dates the failures
+    if t.get("repair"):
+        note = repair_note(*t["repair"])
+        if note:
+            j["why"] += "; " + note
+    return j
+
+
+REPAIR_SHOWN = 6 * H
+
+
+def repair_note(path, what):
+    """A repair the job's script made by itself (a stamp file: epoch, then the retry's exit code),
+    shown for a few hours so a fixed-itself problem is visible instead of silent."""
+    lines = read(os.path.join(STATE, path)).split()
+    try:
+        when = float(lines[0])
+    except (IndexError, ValueError):
+        return ""
+    if NOW - when > REPAIR_SHOWN or when > NOW + 60:
+        return ""
+    res = lines[1] if len(lines) > 1 else ""
+    return "%s %s%s" % (what, ago(NOW - when), ", which fixed it" if res == "0" else ", which did not help" if res else "")
+
+
+def _judge_timer(t, info, wake=0.0):
     ti, si = info.get(t["timer"], {}), info.get(t["service"], {})
     ident = (t["id"], t["name"], t["net"])
     log = t.get("log") or jrn(t["service"])
@@ -263,6 +443,15 @@ def judge_timer(t, info):
 
     result = si.get("Result", "success")
     active = si.get("ActiveState")
+    nxt = next_run(ti)
+    running = active in ("active", "activating")
+    # Failed only since the laptop woke a few minutes ago: Wi-Fi and DNS are still coming up
+    # (2026-11-19: mail failed twice in the 3 minutes after a resume, then ran fine)
+    if failures and t["net"] and wake and last_run >= wake - WAKE_SLACK and NOW - wake <= WAKE_GRACE:
+        why = "%s since waking %s, while the network comes back; %s" % (
+            "last run failed" if failures == 1 else "%d runs failed" % failures, ago(NOW - wake),
+            "running again now" if running else "trying again " + (due(nxt) or "on its next run"))
+        return mk(ident, "healing", why, since, unit, log, runc)
     if active == "failed" or (result not in ("success", "") and active not in ("active", "activating")):
         why = "the last run failed (exit %s)" % si.get("ExecMainStatus", "?")
         if failures:
@@ -277,13 +466,37 @@ def judge_timer(t, info):
     if failures and reason:
         return mk(ident, "stale", "last run failed; " + reason, since, unit, log, runc)
 
+    if failures:
+        left = t.get("warn_at", t.get("bad_at", 99)) - failures
+        why = "%s failed; %s" % ("last run" if failures == 1 else "%d runs in a row" % failures,
+                                  "running again now" if running else "trying again " + (due(nxt) or "on its next run"))
+        if left > 0 and left < 90:
+            why += " (%d more before it counts)" % left
+        return mk(ident, "healing", why, since, unit, log, runc)
+
     period = t["period"]
     limit = max(3 * period, t.get("floor", 0)) if period < D else 2 * period + D
+    # overdue by the clock, but the laptop was off or asleep for it: graded from the start or wake
+    fresh = wake and wake > since and NOW - since > limit and NOW - wake <= limit
+    if fresh or (not since and running):
+        if running:
+            why = "running now"
+        else:
+            why = "waiting for its first run since start-up or wake, due " + (due(nxt) or "soon")
+        if since:
+            why += "; last worked " + ago(NOW - since)
+        return mk(ident, "healing", why, since, unit, log, runc)
     if not since:
         return mk(ident, "stale", "no completed run on record", 0.0, unit, log, runc)
     age = NOW - since
-    if age > limit:
-        return mk(ident, "stale", "last worked %s, runs every %s" % (ago(age), span(period)), since, unit, log, runc)
+    if NOW - max(since, wake or 0.0) > limit:
+        if wake and wake > since:
+            why = "no run since start-up or wake %s; last worked %s, runs every %s" % (ago(NOW - wake), ago(NOW - since), span(period))
+        else:
+            why = "last worked %s, runs every %s" % (ago(age), span(period))
+        if running:
+            why += "; running now"
+        return mk(ident, "stale", why, since, unit, log, runc)
     return mk(ident, "ok", ("ran " + ago(age)) if period < D else ("backed up " + ago(age)), since, unit, log, runc)
 
 
@@ -323,10 +536,10 @@ def judge_service(ident, name, unit, info, net=False, log=None, run_cmd=None, ex
         if desktop_only and os.environ.get("XDG_CURRENT_DESKTOP", "") != "Hyprland":
             return mk(ident, "off", "only runs under Hyprland", unit=unit)
         return mk(ident, "failed", "not running", since, unit, log, run_cmd)
+    n = recent_restarts(ident[0], int(i.get("NRestarts") or 0))
     if act == "activating":
-        n = int(i.get("NRestarts") or 0)
-        return mk(ident, "stale" if n < 3 else "failed", "starting or restarting (%d restarts)" % n, since, unit, log, run_cmd)
-    n = int(i.get("NRestarts") or 0)
+        return mk(ident, "healing" if n < 3 else "failed",
+                  "starting or restarting (%s in the last hour)" % times(n), since, unit, log, run_cmd)
     if extra:
         r = extra(since)
         if r:
@@ -334,8 +547,32 @@ def judge_service(ident, name, unit, info, net=False, log=None, run_cmd=None, ex
             return mk(ident, state, why, since, unit, log, run_cmd)
     why = "running since " + ago(NOW - since).replace(" ago", "") if since else "running"
     if n:
-        why += ", restarted %d times" % n
-    return mk(ident, "stale" if n >= 5 else "ok", why, since or NOW, unit, log, run_cmd)
+        why += ", restarted %s in the last hour" % times(n)
+    return mk(ident, "stale" if n >= RESTARTS_STALE else "ok", why, since or NOW, unit, log, run_cmd)
+
+
+def times(n):
+    return "once" if n == 1 else "%d times" % n
+
+
+def recent_restarts(jid, total):
+    """How many of the unit's NRestarts came in the last hour.  NRestarts only grows while the unit
+    lives (OneDrive's twice-daily restart would read stale after a few days), so keep a short history
+    of it in seen.json.  With no history yet, nothing is known to be recent: 0."""
+    s = SEEN.setdefault("jobs", {}).setdefault(jid, {})
+    hist = [h for h in s.get("restarts", []) if isinstance(h, list) and len(h) == 2 and NOW - h[0] <= 2 * RESTART_WINDOW]
+    if hist and hist[-1][1] > total:
+        hist = []                        # the counter went back: the unit was started afresh
+    base = None
+    for t, n in hist:
+        if NOW - t >= RESTART_WINDOW:
+            base = n                     # the newest sample at least an hour old
+    if base is None:
+        base = hist[0][1] if hist else total
+    if not hist or hist[-1][1] != total or NOW - hist[-1][0] >= 10 * MIN:
+        hist.append([NOW, total])
+    s["restarts"] = hist[-40:]
+    return max(0, total - base)
 
 
 def judge_onedrive(info):
@@ -354,7 +591,7 @@ def judge_rclone(info):
     def mount_ok(since):
         if not mounted(os.path.join(RUNTIME, "Box")):
             if NOW - since < 60:
-                return ("stale", "starting; the mount is not up yet")
+                return ("healing", "starting; the mount is not up yet")
             return ("failed", "running but the Box mount is gone")
         return None
     j = judge_service("rclone-box", "Box mount", "rclone-box.service", info, net=True, extra=mount_ok)
@@ -367,7 +604,7 @@ def judge_davmail(info):
     def port(since):
         if not listening(1143):
             if NOW - since < 90:
-                return ("stale", "starting; nothing on port 1143 yet")
+                return ("healing", "starting; nothing on port 1143 yet")
             return ("failed", "running but nothing answers on port 1143")
         return None
     return judge_service("davmail", "DavMail", "davmail.service", info, net=True, extra=port)
@@ -375,12 +612,16 @@ def judge_davmail(info):
 
 def judge_matrix():
     """The local Matrix stack (~/Docker/matrix): Synapse and its bridges, by container health."""
-    ident = ("matrix", "Matrix server and bridges", False)
+    ident = ("matrix", "Matrix server and bridges", True)
     names = ["synapse", "mautrix-teams", "mautrix-gmessages"]
     log = "cd ~/Docker/matrix && docker compose logs --tail 80"
     runc = "cd ~/Docker/matrix && docker compose up -d"
     rc, out = run(["docker", "inspect", "-f", "{{.Name}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} {{.State.StartedAt}}"] + names)
     rows = [l.split() for l in out.splitlines() if l.strip()]
+    if rc == 124:
+        j = mk(ident, "healing", "", 0.0, "", log, runc)
+        j["_unknown"] = "Docker did not answer in time"
+        return j
     if not rows:
         return mk(ident, "off", "not set up, or Docker is not running", unit="")
     seen = {r[0].lstrip("/"): r for r in rows if len(r) >= 3}
@@ -398,8 +639,29 @@ def judge_matrix():
     if bad:
         return mk(ident, "failed", ", ".join(bad), 0.0, "", log, runc)
     if starting:
-        return mk(ident, "stale", "starting: " + ", ".join(starting), 0.0, "", log, runc)
+        return mk(ident, "healing", "starting: " + ", ".join(starting), 0.0, "", log, runc)
     return mk(ident, "ok", "%d containers healthy" % len(seen), NOW, "", log, runc)
+
+
+def judge_archive():
+    """The SD card that holds ~/Music (/mnt/archive, an automount).  It slips out in the bag; then mpd
+    pins the dead filesystem and remounting says "File exists" (see the archive automount notes).
+    Never touches the automount unless the card is there, so a missing card cannot hang the check."""
+    ident = ("archive", "Music card (/mnt/archive)", False)
+    dev = os.environ.get("SHELL_HEALTH_ARCHIVE_DEV") or "/dev/disk/by-label/archive"
+    mp = os.environ.get("SHELL_HEALTH_ARCHIVE_DIR") or "/mnt/archive"
+    log = "journalctl -u mnt-archive.mount -u mnt-archive.automount -n 40 --no-pager; findmnt " + mp
+    runc = "systemctl --user restart mpd.service; sudo systemctl reset-failed mnt-archive.automount mnt-archive.mount; ls " + mp
+    if not os.path.isdir(mp):
+        return mk(ident, "off", "not set up here", unit="")
+    if not os.path.exists(dev):
+        return mk(ident, "stale", "the SD card is not detected; reseat it", 0.0, "", log, runc)
+    rc, out = run(["stat", "-f", "-c", "%T", mp + "/"], timeout=1.5)
+    if rc == 124:
+        return mk(ident, "failed", "the card is in, but /mnt/archive does not answer (dead mount)", 0.0, "", log, runc)
+    if rc != 0:
+        return mk(ident, "failed", "the card is in, but /mnt/archive will not mount", 0.0, "", log, runc)
+    return mk(ident, "ok", "mounted", NOW, "", log, runc)
 
 
 def judge_dejadup(profiles):
@@ -435,7 +697,7 @@ def judge_dejadup(profiles):
     return mk(ident, "ok", "last backup " + ago(age), best, "", log, runc)
 
 
-def judge_microsoft():
+def judge_microsoft(wake=0.0):
     ident = ("microsoft", "Microsoft 365 link", True)
     path = os.path.join(STATE, "microsoft/health.json")
     log = MAIL_SCRIPTS + "ms-health status"
@@ -454,7 +716,12 @@ def judge_microsoft():
         return mk(ident, "ok", "offline (Microsoft unreachable from here)", since, "", log, runc)
     if st == "auth":
         return mk(ident, "failed", "sign-in needed: run exchange-rules.py login", since, "", log, runc)
-    return mk(ident, "failed", "Microsoft 365 is failing" + (": " + detail if detail else ""), since, "", log, runc)
+    # Down only since the laptop woke a few minutes ago: Wi-Fi and DNS are still coming up, the same
+    # grace the timer jobs get (2026-11-20: the pill went red for a minute after every wake)
+    if wake and since >= wake - WAKE_SLACK and NOW - wake <= WAKE_GRACE:
+        return mk(ident, "healing", "no answer since waking %s, while the network comes back; checked again on the next sync%s"
+                  % (ago(NOW - wake), " (" + detail + ")" if detail else ""), 0.0, "", log, runc, own_wake=True)
+    return mk(ident, "failed", "Microsoft 365 is failing" + (": " + detail if detail else ""), since, "", log, runc, own_wake=True)
 
 
 KNOWN = {t["service"] for t in TIMERS} | {t["timer"] for t in TIMERS} | {
@@ -463,56 +730,97 @@ KNOWN = {t["service"] for t in TIMERS} | {t["timer"] for t in TIMERS} | {
 
 
 # ---------------------------------------------------------------- run
-def collect():
+def collect(cfg):
     units = []
     for t in TIMERS:
         units += [t["timer"], t["service"]]
     units += ["davmail.service", "onedrive.service", "onedrive-restart.timer", "onedrive-restart.service",
-              "rclone-box.service", "qs-socket-watch.service"]
+              "rclone-box.service", "qs-socket-watch.service", "mpd.service"]
     with cf.ThreadPoolExecutor(max_workers=6) as ex:
         f_show = ex.submit(systemd_show, units)
         f_failed = ex.submit(failed_units)
         f_def = ex.submit(gsettings, "")
         f_cos = ex.submit(gsettings, "/usr/share/dconf/profile/cosmic")
+        f_wake = ex.submit(last_wake)
         try:
             info = f_show.result(timeout=2.6)
         except Exception:
-            info = {}
+            info = None
+        unknown = "" if info is not None else "systemd did not answer in time"
+        info = info or {}
         try:
             failed = f_failed.result(timeout=2.0)
         except Exception:
             failed = []
-        profiles = []
+        try:
+            wake = f_wake.result(timeout=2.0)
+        except Exception:
+            wake = 0.0
+        profiles, gs_unknown = [], ""
         for f in (f_def, f_cos):
             try:
                 profiles.append(f.result(timeout=2.0))
             except Exception:
+                gs_unknown = "gsettings did not answer in time"
                 profiles.append({"last-backup": None, "periodic": None, "periodic-period": None})
-    jobs = [judge_timer(t, info) for t in TIMERS]
+    jobs = [judge_timer(t, info, wake) for t in TIMERS]
     jobs.append(judge_davmail(info))
     jobs.append(judge_onedrive(info))
     jobs.append(judge_rclone(info))
     jobs.append(judge_dejadup(profiles))
-    jobs.append(judge_microsoft())
+    jobs.append(judge_microsoft(wake))
     jobs.append(judge_matrix())
     jobs.append(judge_service("qs-socket-watch", "Shell restart watchdog", "qs-socket-watch.service", info, desktop_only=True))
+    jobs.append(judge_service("mpd", "Music player (mpd)", "mpd.service", info))
+    jobs.append(judge_archive())
+    if unknown:
+        for j in jobs:
+            if j["unit"].endswith((".service", ".timer")):
+                j["_unknown"] = unknown
+    if gs_unknown:
+        for j in jobs:
+            if j["id"] == "dejadup":
+                j["_unknown"] = gs_unknown
+    ignore = ignored_units(cfg)
     for u in failed:
-        if u in KNOWN:
+        if u in KNOWN or any(fnmatch.fnmatchcase(u, g) for g in ignore):
             continue
-        jobs.append(mk(("unit:" + u, u, False), "failed", "unit failed", unit=u, log=jrn(u),
+        # amber, not red: an unknown unit may not matter, and uwsm's fumon has already said it failed
+        jobs.append(mk(("unit:" + u, u, False), "stale", "unit failed", unit=u, log=jrn(u),
                        run_cmd="systemctl --user reset-failed %s; systemctl --user restart %s" % (u, u)))
-    return jobs
+    return jobs, wake
+
+
+# Failed units that are not worth a light, as fnmatch globs; health.json "ignoreUnits" adds to them.
+IGNORE_UNITS = [
+    "dbus-:*",              # D-Bus activation attempts (a second notification daemon asked for the name)
+    "desktop-test.service",  # the test run that sends its own notification when it is red
+]
+
+
+def ignored_units(cfg):
+    return IGNORE_UNITS + list(cfg.get("ignoreUnits", []))
 
 
 def seen_path():
     return os.path.join(STATE, "shell-health/seen.json")
 
 
-def apply_memory_and_offline(jobs, only_write=True):
+def load_seen():
     try:
         seen = json.loads(read(seen_path()) or "{}")
     except ValueError:
         seen = {}
+    return seen if isinstance(seen, dict) else {}
+
+
+def apply_memory_and_offline(jobs, seen, wake=0.0):
+    """Everything that needs memory across runs, in order:
+    1. unknown (a probe timed out): the last known state, saying so, never a quiet "off" or green;
+    2. offline: network jobs get GRACE before they count;
+    3. a network job that went bad only since a wake gets WAKE_GRACE (judges that date their own
+       failures, own_wake, already did this better);
+    4. confirmation: bad for less than CONFIRM is healing, "checking again"."""
     on = online()
     if on:
         seen.pop("offline_since", None)
@@ -521,21 +829,48 @@ def apply_memory_and_offline(jobs, only_write=True):
     off_for = NOW - seen["offline_since"] if not on else 0
     for j in jobs:
         s = seen.setdefault("jobs", {}).setdefault(j["id"], {})
+        if j["_unknown"]:
+            last = s.get("last")
+            if isinstance(last, dict) and last.get("state") in ("ok", "healing", "stale", "failed", "off"):
+                j["state"] = last["state"]
+                j["why"] = "could not check just now (%s); last known: %s" % (j["_unknown"], last.get("why", ""))
+            else:
+                j["state"] = "healing"
+                j["why"] = "could not check yet (%s); trying again" % j["_unknown"]
+            if s.get("ok") and j["state"] != "ok":
+                j["since"] = iso(s["ok"])
+            continue
+        raw = j["state"]
+        # bad_since: when the job last stopped being ok.  Healing counts too, so a grace period that
+        # ends in a real failure raises it at once instead of starting the confirmation over.
+        if raw in ("ok", "off"):
+            s.pop("bad_since", None)
+        elif not s.get("bad_since"):
+            s["bad_since"] = NOW
+        s["last"] = {"state": raw, "why": j["why"]}
         if j["state"] == "ok" and j["_since"]:
             s["ok"] = max(s.get("ok", 0), j["_since"])
         elif j["state"] == "ok":
             s["ok"] = NOW
-        if not j["since"] and s.get("ok") and j["state"] in ("stale", "failed"):
+        if not j["since"] and s.get("ok") and j["state"] in ("stale", "failed", "healing"):
             j["since"] = iso(s["ok"])
         if not on and j["_net"]:
-            if j["state"] in ("stale", "failed"):
+            if j["state"] in ("stale", "failed", "healing"):
                 if off_for < GRACE:
-                    j["state"] = "ok"
-                    j["why"] = "offline for %s; waiting before flagging (%s)" % (span(off_for), j["why"])
+                    j["state"] = "healing"
+                    j["why"] = "offline for %s; will try again once back online (%s)" % (span(off_for), j["why"])
                 else:
                     j["why"] = "offline for %s; %s" % (span(off_for), j["why"])
             elif j["state"] == "ok" and "offline" not in j["why"]:
                 j["why"] += " (offline now)"
+        bad_since = s.get("bad_since") or NOW
+        if (j["state"] in ("stale", "failed") and j["_net"] and not j["_own_wake"] and wake
+                and bad_since >= wake - WAKE_SLACK and NOW - wake <= WAKE_GRACE):
+            j["state"] = "healing"
+            j["why"] = "since waking %s, while the network comes back (%s)" % (ago(NOW - wake), j["why"])
+        if j["state"] in ("stale", "failed") and NOW - bad_since < CONFIRM:
+            j["state"] = "healing"
+            j["why"] = "just went wrong, checking again before raising it (%s)" % j["why"]
     return seen
 
 
@@ -551,7 +886,7 @@ def save_seen(seen):
 
 
 # ---------------------------------------------------------------- notices and settings
-CFG_DEFAULT = dict(updatesNag=50, staleListDays=14, diskPercent=10, diskGB=5, espMB=20, hidden=[],
+CFG_DEFAULT = dict(updatesNag=50, staleListDays=14, diskPercent=10, diskGB=5, espMB=20, hidden=[], ignoreUnits=[],
                    notices=dict(updates=True, firmware=True, disk=True, reboot=True))
 
 
@@ -569,6 +904,8 @@ def load_config():
             cfg[k] = d[k]
     if isinstance(d.get("hidden"), list):
         cfg["hidden"] = [str(x) for x in d["hidden"]]
+    if isinstance(d.get("ignoreUnits"), list):
+        cfg["ignoreUnits"] = [str(x) for x in d["ignoreUnits"]]
     if isinstance(d.get("notices"), dict):
         for k in cfg["notices"]:
             if isinstance(d["notices"].get(k), bool):
@@ -734,10 +1071,12 @@ def main(argv):
             return 2
         i += 1
     cfg = load_config()
-    jobs = collect()
-    seen = apply_memory_and_offline(jobs)
+    global SEEN
+    SEEN = load_seen()
+    jobs, wake = collect(cfg)
+    seen = apply_memory_and_offline(jobs, SEEN, wake)
     save_seen(seen)
-    order = {"failed": 0, "stale": 1, "ok": 2, "off": 3}
+    order = {"failed": 0, "stale": 1, "healing": 2, "ok": 3, "off": 4}
     jobs.sort(key=lambda j: order[j["state"]])
     notes = notices_for(cfg, refresh)
     everything = [{k: v for k, v in j.items() if not k.startswith("_")} for j in jobs] + notes

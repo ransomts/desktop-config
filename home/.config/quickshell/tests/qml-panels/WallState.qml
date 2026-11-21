@@ -28,6 +28,13 @@ Singleton {
         property bool season: true
         property bool sharp: true
     }
+    property bool forced: false
+    function force(on) { calls = calls.concat(["force " + on]); forced = on; if (on) { cfg.hidden = false; cfg.running = true } }
+    Connections {
+        target: cfg
+        function onRunningChanged() { if (!cfg.running) forced = false }
+        function onHiddenChanged() { if (cfg.hidden) forced = false }
+    }
     readonly property bool moving: cfg.running && !cfg.hidden
     property bool hot: false
     property real fanAvg: 0

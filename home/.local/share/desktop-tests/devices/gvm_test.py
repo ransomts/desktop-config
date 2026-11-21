@@ -147,6 +147,33 @@ os.environ.pop("GVM_ADDR", None)
 gvm = load(GVM, "gvm_under_test")
 gvm.WRITE_GAP = 0
 
+# fake BlueZ for the stale-link guard: addresses BlueZ says are connected, calls logged
+BZ = {"connected": set(), "calls": [], "others": []}
+
+
+def fake_bluez(*args):
+    BZ["calls"].append(args)
+    if args[0] == "info":
+        return f"Device {args[1]}\n\tConnected: {'yes' if args[1] in BZ['connected'] else 'no'}\n"
+    if args[0] == "disconnect":
+        BZ["connected"].discard(args[1])
+    return ""
+
+
+real_other_gvm_pids = gvm.other_gvm_pids
+
+
+def patch_bluez(mod):
+    mod.bluez = fake_bluez
+    mod.other_gvm_pids = lambda: list(BZ["others"])
+
+
+def bz_reset(connected=(), others=()):
+    BZ["connected"], BZ["calls"], BZ["others"] = set(connected), [], list(others)
+
+
+patch_bluez(gvm)
+
 
 def run(*argv):
     """gvm main() in-process: (exit code, stdout, stderr)."""
@@ -386,6 +413,170 @@ W.adverts = {}
 code, out, _ = run("scan")
 check("scan with nothing advertising says so", "no GVM lights advertising" in out)
 
+print("case: gvm state file and the open window")
+import socket, threading
+check("state file under XDG_STATE_HOME, socket under XDG_RUNTIME_DIR",
+      gvm.STATE_FILE.startswith(os.environ.get("XDG_STATE_HOME", HOME)) and gvm.SOCKET.startswith(os.environ.get("XDG_RUNTIME_DIR", "/nonexistent")),
+      (gvm.STATE_FILE, gvm.SOCKET))
+os.makedirs(os.path.dirname(gvm.SOCKET), exist_ok=True)
+check("regs_to_state: register units to K, degrees, words",
+      gvm.regs_to_state({0: 1, 2: 40, 3: 44, 4: 5, 5: 90, 6: 2}) == {"on": 1, "bright": 40, "cct": 4400, "hue": 25, "sat": 90, "mode": "colour"}
+      and gvm.regs_to_state({6: 1}) == {"mode": "white"} and gvm.regs_to_state({}) == {})
+
+
+def state():
+    try:
+        return json.load(open(gvm.STATE_FILE))["lights"]
+    except (OSError, ValueError, KeyError):
+        return {}
+
+
+with contextlib.suppress(FileNotFoundError):
+    os.remove(gvm.STATE_FILE)
+fresh(**{L1: {"on": 0, "bright": 70, "cct": 32}, L2: {}})
+bz_reset()
+run("on")
+st = state()
+check("gvm on: the state file has light1 on, with what the status said", st.get("light1", {}).get("on") == 1
+      and st["light1"].get("by") == "gvm" and "light2" not in st, st)
+run("-l", "light1", "status")
+check("gvm status: full settings recorded", {k: st2 for k, st2 in state()["light1"].items() if k in ("bright", "cct", "mode")}
+      == {"bright": 70, "cct": 3200, "mode": "white"}, state())
+run("-l", "light2", "off")
+st = state()
+check("another light merges in; the first is kept", st.get("light2", {}).get("on") == 0 and st.get("light1", {}).get("on") == 1, st)
+open(gvm.STATE_FILE, "w").write("{broken")
+run("-l", "light1", "on")
+check("a broken state file is replaced, not a crash", state().get("light1", {}).get("on") == 1, open(gvm.STATE_FILE).read()[:80])
+W.__init__(); W.missing.update([L1])
+code, _, _ = run("-l", "light1", "off")
+check("a light that wasn't reached leaves its record alone", code == 1 and state()["light1"]["on"] == 1, state())
+
+
+class FakeWindow:
+    """A listening gvm-gui: records requests, answers with `reply` (or a function of the request)."""
+    def __init__(self, reply):
+        self.reply, self.reqs = reply, []
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(gvm.SOCKET)
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.bind(gvm.SOCKET)
+        self.sock.listen(4)
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+        self.thread.start()
+
+    def serve(self):
+        while True:
+            try:
+                c, _ = self.sock.accept()
+            except OSError:
+                return
+            with c:
+                buf = b""
+                while not buf.endswith(b"\n"):
+                    b = c.recv(4096)
+                    if not b:
+                        break
+                    buf += b
+                req = json.loads(buf)
+                self.reqs.append(req)
+                r = self.reply(req) if callable(self.reply) else self.reply
+                c.sendall((json.dumps(r) + "\n").encode())
+
+    def close(self):
+        self.sock.close()
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(gvm.SOCKET)
+
+
+fresh(**{L1: {}, L2: {}})
+fw = FakeWindow({"ok": True, "out": [["light1", "on"]], "errors": [], "missing": []})
+try:
+    code, out, err = run("-l", "all", "toggle")
+    check("window open: toggle goes to the window, every light named", fw.reqs[-1:] == [{"cmd": "toggle", "lights": ["light1", "light2"]}], fw.reqs)
+    check("  ... nothing connects directly", not [e for _, e, _ in W.log if e in ("find", "connect")] and code == 0, W.log)
+    check("  ... its answer printed with light names", out.strip() == "light1: on", out)
+    fw.reply = {"ok": True, "out": [], "errors": [], "missing": ["light2"]}
+    W.log.clear()
+    code, out, _ = run("-l", "all", "on")
+    check("window lacks light2: light2 goes direct, light1 does not", {a for a, e, _ in W.log if e == "connect"} == {L2} and code == 0, W.log)
+    fw.reply = {"ok": False, "out": [], "errors": [["light1", "still connecting in the lights window"]], "missing": []}
+    code, _, err = run("on")
+    check("window error: printed, exit 1", code == 1 and "light1: still connecting" in err, (code, err))
+    fw.reply = {"ok": True, "out": [["light1", "not in this preset, left alone"]], "missing": []}
+    code, out, _ = run("preset", "camera")
+    check("preset goes to the window under its own spelling", fw.reqs[-1] == {"cmd": "preset", "lights": ["light1", "light2"], "name": "Camera"}, fw.reqs[-1])
+    n = len(fw.reqs)
+    W.log.clear()
+    run("bright", "40")
+    check("other commands (bright) don't ask the window", len(fw.reqs) == n and any(e == "connect" for _, e, _ in W.log), fw.reqs[n:])
+finally:
+    fw.close()
+W.log.clear()
+code, _, _ = run("on")
+check("socket gone: straight to the light", code == 0 and any(e == "connect" for _, e, _ in W.log))
+open(gvm.SOCKET, "w").close()
+code, _, _ = run("on")
+check("a stale socket file (nobody listening) is ignored", code == 0, code)
+os.remove(gvm.SOCKET)
+
+print("case: gvm stale BlueZ links")
+fresh(**{L1: {}, L2: {}})
+bz_reset(connected=[L1])
+code, out, err = run("status")
+calls = [e for a, e, _ in W.log if a == L1]
+check("connect: a leftover BlueZ link is dropped before scanning", ("disconnect", L1) in BZ["calls"]
+      and L1 not in BZ["connected"] and calls[:1] == ["find"] and code == 0, (BZ["calls"], calls, code))
+check("  ... and says so on stderr, by light name", "leftover Bluetooth link to light1" in err, err)
+bz_reset()
+run("status")
+check("connect: no link, no disconnect", not any(c[0] == "disconnect" for c in BZ["calls"]), BZ["calls"])
+bz_reset(connected=[L1], others=[4242])
+run("status")
+check("connect: another gvm/gvm-gui running owns the link, left alone",
+      L1 in BZ["connected"] and not any(c[0] == "disconnect" for c in BZ["calls"]), BZ["calls"])
+bz_reset(connected=[L2])
+code, out, _ = run("release")
+check("release: every light in the file checked, the held one dropped", code == 0
+      and {c[1] for c in BZ["calls"] if c[0] == "info"} == {L1, L2} and BZ["calls"].count(("disconnect", L2)) == 1
+      and "dropped leftover links: light2" in out, (BZ["calls"], out))
+bz_reset()
+_, out, _ = run("release")
+check("release: nothing held says so", "no leftover links" in out, out)
+bz_reset(connected=[L1, L2])
+_, out, _ = run("-l", "light1", "release")
+check("release -l light1: only that light", L2 in BZ["connected"] and L1 not in BZ["connected"], BZ["calls"])
+bz_reset(connected=[L1], others=[4242])
+_, out, _ = run("release")
+check("release: skipped while gvm-gui runs", L1 in BZ["connected"] and "left alone" in out, out)
+W.__init__(); bz_reset(connected=[L1])
+_, out, _ = run("scan")
+check("scan: drops leftover links first", L1 not in BZ["connected"] and "dropped leftover links: light1" in out, out)
+
+import subprocess, tempfile
+bindir = tempfile.mkdtemp(dir=HOME)
+for n in ("gvm-gui", "gvm-lights"):
+    # python with a flag in the shebang, like the real "python -I": the script is argv[2]
+    with open(os.path.join(bindir, n), "w") as f:
+        f.write(f"#!{sys.executable} -I\nimport time; time.sleep(30)\n")
+    os.chmod(os.path.join(bindir, n), 0o755)
+p_gui = subprocess.Popen([os.path.join(bindir, "gvm-gui")])
+p_lights = subprocess.Popen([os.path.join(bindir, "gvm-lights")])
+# a wrapper naming gvm (gvm-lights runs `timeout 25 gvm release`) is not a gvm
+p_wrap = subprocess.Popen(["sh", "-c", "sleep 30", "gvm"])
+p_timeout = subprocess.Popen(["timeout", "30", "sleep", "30", "gvm"])
+time.sleep(0.4)
+try:
+    seen = real_other_gvm_pids()
+    check("other_gvm_pids: gvm-gui under python -I counts", p_gui.pid in seen, seen)
+    check("other_gvm_pids: gvm-lights (the launcher) does not", p_lights.pid not in seen, seen)
+    check("other_gvm_pids: a non-python wrapper naming gvm (timeout, sh) does not",
+          p_wrap.pid not in seen and p_timeout.pid not in seen, seen)
+    check("other_gvm_pids: this process does not", os.getpid() not in seen, seen)
+finally:
+    for pr in (p_gui, p_lights, p_wrap, p_timeout):
+        pr.kill()
+
 check("no real bleak was used", gvm.BleakScanner is FakeScanner and gvm.BleakClient is FakeClient)
 
 # ------------------------------------------------------------------ gvm-gui (no window: that needs a display)
@@ -411,6 +602,7 @@ else:
         check("gvm-gui imports without a display (GTK4/Adw, fake bleak)", False, repr(e))
 if GUI and have_gi and gui:
     from gi.repository import GLib
+    patch_bluez(gui.gvm)
     check("gvm-gui uses ~/.local/bin/gvm from HOME", gui.gvm.__file__ == os.path.join(HOME, ".local/bin/gvm"), gui.gvm.__file__)
     sys.argv = ["gvm-gui"]
     check("targets(): no arguments = every light in the file", gui.targets() == [("light1", L1), ("light2", L2)], gui.targets())
@@ -469,9 +661,95 @@ if GUI and have_gi and gui:
     check("Link.close: queued writes go out first, then disconnect",
           [e for _, e, _ in W.log if e in ("set", "disconnect")][-2:] == ["set", "disconnect"] and W.regs[L1][0] == 0 and link.client is None,
           W.log[-3:])
+    fresh(**{L1: {}}); bz_reset(connected=[L1])
+    panel = Panel(); link = gui.Link(panel, L1); link.connect()
+    ok = pump(lambda: ("state", "connected") in panel.events, 5)
+    check("Link: a leftover BlueZ link is dropped, then it connects", ok and ("disconnect", L1) in BZ["calls"], (BZ["calls"], panel.events))
+    link.close()
     fresh(**{L1: {}}); W.missing.add(L1)
     panel = Panel(); link = gui.Link(panel, L1); link.connect()
     check("Link: a light that is not found reports 'notfound'", pump(lambda: ("state", "notfound") in panel.events, 5), panel.events)
+
+    # ---- the control socket and Window.remote, without a display ----
+    import concurrent.futures
+    asked = []
+    ctl = gui.Control(lambda req: asked.append(req) or {"ok": True, "out": [["light1", "on"]]})
+    started = asyncio.run_coroutine_threadsafe(ctl.start(), gui.LOOP).result(5)
+    holder = {}
+    th = threading.Thread(target=lambda: holder.update(r=gui.gvm.ask_window({"cmd": "on", "lights": ["light1"]}, 5)))
+    th.start()
+    pump(lambda: not th.is_alive(), 5)
+    check("Control: listens on gvm.SOCKET and answers on the GTK loop", started and holder.get("r") == {"ok": True, "out": [["light1", "on"]]}
+          and asked == [{"cmd": "on", "lights": ["light1"]}], (started, holder, asked))
+    ctl2 = gui.Control(lambda req: {"ok": True})
+    th = threading.Thread(target=lambda: holder.update(second=asyncio.run_coroutine_threadsafe(ctl2.start(), gui.LOOP).result(5)))
+    th.start(); pump(lambda: not th.is_alive(), 5)
+    check("Control: a second window leaves the first one's socket alone", holder.get("second") is False and os.path.exists(gui.gvm.SOCKET))
+    th = threading.Thread(target=lambda: holder.update(bad=gui.gvm.ask_window({"cmd": "boom"}, 5)))
+    ctl.handle = lambda req: 1 / 0
+    th.start(); pump(lambda: not th.is_alive(), 5)
+    check("Control: a failing request answers with the error", "ZeroDivisionError" in json.dumps(holder.get("bad")), holder.get("bad"))
+    gui.LOOP.call_soon_threadsafe(ctl.stop); time.sleep(0.2)
+    check("Control.stop: the socket is removed", not os.path.exists(gui.gvm.SOCKET))
+    open(gui.gvm.SOCKET, "w").close()
+    ctl3 = gui.Control(lambda req: {"ok": True})
+    th = threading.Thread(target=lambda: holder.update(stale=asyncio.run_coroutine_threadsafe(ctl3.start(), gui.LOOP).result(5)))
+    th.start(); pump(lambda: not th.is_alive(), 5)
+    check("Control: a stale socket file is replaced", holder.get("stale") is True)
+    gui.LOOP.call_soon_threadsafe(ctl3.stop); time.sleep(0.2)
+
+    class FakeSwitch:
+        def __init__(self, v): self.v = v
+        def get_active(self): return self.v
+        def set_active(self, v): self.v = v
+
+    class FakePanel:
+        def __init__(self, name, known=True, failed=False, on=False):
+            self.name, self.known, self._failed, self.power = name, known, failed, FakeSwitch(on)
+            self.applied = []
+        def failed(self): return self._failed
+        def apply(self, what, v):
+            self.applied.append((what, v))
+            if what == "power": self.power.v = v
+        def apply_settings(self, st): self.applied.append(("settings", st))
+        def register_values(self):
+            return {0: int(self.power.v), 2: 50, 3: 44, 4: 0, 5: 0, 6: 1}
+
+    def fake_window(*panels):
+        return types.SimpleNamespace(panels=list(panels), fx_task=None, fx_run=None, synced=FakeSwitch(True),
+                                     save_state_soon=lambda: None)
+    remote = gui.Window.remote
+    a, b = FakePanel("light1", on=True), FakePanel("light2")
+    r = remote(fake_window(a, b), {"cmd": "toggle", "lights": None})
+    check("remote toggle: each light flips, both reported", a.power.v is False and b.power.v is True
+          and r["out"] == [["light1", "off"], ["light2", "on"]] and r["ok"], r)
+    r = remote(fake_window(a, b), {"cmd": "on", "lights": ["light2", "light9"]})
+    check("remote on: only the named light; one it doesn't have is 'missing'", ("power", True) in b.applied and a.applied[-1] != ("power", True)
+          and r["missing"] == ["light9"], (a.applied, r))
+    c, d = FakePanel("light1", known=False, failed=True), FakePanel("light2", known=False)
+    r = remote(fake_window(c, d), {"cmd": "off", "lights": None})
+    check("remote: a failed light is 'missing' (gvm goes direct), a connecting one an error", r["missing"] == ["light1"]
+          and r["errors"] and r["errors"][0][0] == "light2" and not c.applied and not d.applied and r["ok"] is False, r)
+    a, b = FakePanel("light1"), FakePanel("light2")
+    win = fake_window(a, b)
+    r = remote(win, {"cmd": "preset", "name": "Camera", "lights": None})
+    check("remote preset: each light gets its own settings, Sync switched off (they differ)",
+          a.applied == [("settings", {"on": 1, "mode": "white", "cct": 4400, "bright": 100})]
+          and b.applied == [("settings", {"on": 1, "mode": "white", "cct": 4400, "bright": 20})] and win.synced.v is False, (a.applied, b.applied))
+    r = remote(fake_window(a, b), {"cmd": "preset", "name": "KeyOnly", "lights": None})
+    check("remote preset: a light not in it is left alone and said so", ["light1", "not in this preset, left alone"] in r["out"], r)
+    r = remote(fake_window(a), {"cmd": "preset", "name": "Nope"})
+    check("remote preset: unknown preset is an error", r.get("errors") and "Nope" in r["errors"][0][1], r)
+    cancelled = []
+    win = fake_window(a)
+    win.fx_task = types.SimpleNamespace(cancel=lambda: cancelled.append(1)); win.fx_run = {"restore": True}
+    remote(win, {"cmd": "off", "lights": None})
+    check("remote off during an effect: effect stopped without its restore", cancelled == [1] and win.fx_run["restore"] is False)
+    r = remote(fake_window(a), {"cmd": "status", "lights": None})
+    check("remote status: one line per light", len(r["out"]) == 1 and r["out"][0][1].startswith("off  bright 50%  white 4400K"), r)
+    r = remote(fake_window(a), {"cmd": "set"})
+    check("remote: anything else is refused", r.get("errors") and "set" in r["errors"][0][1], r)
+    check("remote ping", remote(fake_window(), {"cmd": "ping"}) == {"ok": True})
     print("SKIP gvm-gui window (LightPanel/Window need a Wayland or X display; not built here)")
 
 print(f"python: pass {npass} fail {nfail}")

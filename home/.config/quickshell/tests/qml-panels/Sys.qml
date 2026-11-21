@@ -45,6 +45,8 @@ Singleton {
     property string playerPin: ""
     property var realPlayers: []
     property var player: null
+    property bool mediaCleared: false
+    function stopMedia() { if (player) player.stop(); mediaCleared = true }
     property string profileCls: "balanced"
     function setProfile(name) { rec("setProfile " + name); profileCls = name }
     readonly property QtObject profile: QtObject { readonly property string cls: sys.profileCls }

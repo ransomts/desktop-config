@@ -1,7 +1,8 @@
 // The popup under the health pill: one row per background job. The ones that are failing
 // or stale come first, each with why and when it last worked, and buttons: Log (the job's
 // log in a terminal), Run now (when the job has a way to run it), Ignore (until it works
-// again). Jobs that are fine are listed compactly below. Under them "Worth knowing": updates, a
+// again). Then the ones recovering by themselves (Health.healing), each with what it waits for.
+// Jobs that are fine are listed compactly below. Under them "Worth knowing": updates, a
 // restart, low disk (Health.notices), each with a button that opens its command in a terminal.
 // Data and actions: Health.qml.
 import QtQuick
@@ -113,6 +114,32 @@ ColumnLayout {
                 text: "Watch"
                 color: watchTap.containsMouse ? Theme.accent : Theme.faint
                 MouseArea { id: watchTap; anchors.fill: parent; anchors.margins: -4; hoverEnabled: true; onClicked: Health.unignore(modelData.id) }
+            }
+        }
+    }
+
+    // on their way back by themselves: what each waits for, and its log
+    Repeater {
+        model: Health.healing
+        RowLayout {
+            id: hrow
+            required property var modelData
+            Layout.fillWidth: true
+            spacing: 6
+            Text { text: "↻"; color: Theme.accent; font { family: Theme.font; pixelSize: 12; bold: true } }
+            Text {
+                Layout.fillWidth: true
+                text: "<b>" + hrow.modelData.name + "</b>  " + hrow.modelData.why
+                textFormat: Text.StyledText
+                wrapMode: Text.Wrap
+                color: Theme.fg
+                font { family: Theme.font; pixelSize: 11 }
+            }
+            Caption {
+                text: "Log"
+                visible: hrow.modelData.log !== ""
+                color: hlogTap.containsMouse ? Theme.accent : Theme.faint
+                MouseArea { id: hlogTap; anchors.fill: parent; anchors.margins: -4; hoverEnabled: true; onClicked: { Health.openLog(hrow.modelData); list.done() } }
             }
         }
     }

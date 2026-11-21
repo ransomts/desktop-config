@@ -128,6 +128,132 @@ def describe(v: list[int]) -> str:
     return "  ".join(parts) + f"  raw {v}"
 
 
+# --- stale links -----------------------------------------------------------------
+# The light takes one connection and stops advertising while it has one, so a
+# BlueZ link that nothing uses any more hides it from every scan ("not found").
+# Seen 2026-11-19: BlueZ brought both lights back up by itself on resume from
+# suspend with no gvm process running. Before connecting, drop links to our
+# lights unless another gvm or gvm-gui process is alive (that one owns them).
+
+def bluez(*args: str) -> str:
+    """bluetoothctl ARGS -> its stdout, "" on any failure. Tests replace this."""
+    import subprocess
+    try:
+        return subprocess.run(["bluetoothctl", *args], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def other_gvm_pids() -> list[int]:
+    """Other running gvm / gvm-gui processes (not gvm-lights, not this one).
+    Only python processes count, with the script as argv[1] or argv[2] (after the
+    shebang's -I): a wrapper like `timeout 25 gvm release` must not."""
+    me, pids = os.getpid(), []
+    for d in os.listdir("/proc"):
+        if not d.isdigit() or int(d) == me:
+            continue
+        try:
+            if "python" not in os.path.basename(os.readlink(f"/proc/{d}/exe")):
+                continue
+            argv = open(f"/proc/{d}/cmdline", "rb").read().split(b"\0")
+        except OSError:
+            continue
+        if any(os.path.basename(a) in (b"gvm", b"gvm-gui") for a in argv[1:3]):
+            pids.append(int(d))
+    return pids
+
+
+def release_stale(addrs) -> list[str]:
+    """Disconnect BlueZ links to these lights that no gvm process holds; the addresses freed."""
+    if other_gvm_pids():
+        return []
+    freed = []
+    for addr in addrs:
+        if "Connected: yes" in bluez("info", addr):
+            bluez("disconnect", addr)
+            freed.append(addr)
+    return freed
+
+
+def label_of(addr: str) -> str:
+    return next((n for n, a in LIGHTS.items() if a == addr), addr)
+
+
+# --- last-known state and the open window ------------------------------------------
+# The bar's light pill can't ask the lights how they are (that takes a connection), so
+# whatever last talked to them leaves what it knows here: gvm after each command,
+# gvm-gui while it is open. {"lights": {name: {on, bright, mode, cct, hue, sat, at, by}}}
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "gvm")
+STATE_FILE = os.path.join(STATE_DIR, "lights.json")
+# gvm-gui listens here while open; it holds the lights, so gvm hands it on/off/toggle/preset/status
+SOCKET = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/gvm-{os.getuid()}", "gvm-gui.sock")
+REMOTE_CMDS = ("on", "off", "toggle", "preset", "status")
+
+
+def regs_to_state(regs: dict) -> dict:
+    """Register values -> the state file's words (cct in K, hue in degrees, mode white/colour)."""
+    out = {}
+    if ON in regs:
+        out["on"] = int(bool(regs[ON]))
+    if BRIGHT in regs:
+        out["bright"] = int(regs[BRIGHT])
+    if CCT in regs:
+        out["cct"] = int(regs[CCT]) * 100
+    if HUE in regs:
+        out["hue"] = int(regs[HUE]) * 5
+    if SAT in regs:
+        out["sat"] = int(regs[SAT])
+    if MODE in regs:
+        out["mode"] = "colour" if regs[MODE] == MODE_COLOUR else "white"
+    return out
+
+
+def record_state(updates: dict, source: str) -> None:
+    """Merge {light name: state} into STATE_FILE. Never raises: the lights matter more than the record."""
+    import json, tempfile, time
+    try:
+        try:
+            d = json.load(open(STATE_FILE))
+        except (OSError, ValueError):
+            d = {}
+        lights = d.get("lights") if isinstance(d, dict) and isinstance(d.get("lights"), dict) else {}
+        now = int(time.time())
+        for name, st in updates.items():
+            if st:
+                lights[name] = {**(lights.get(name) or {}), **st, "at": now, "by": source}
+        os.makedirs(STATE_DIR, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=STATE_DIR, prefix=".lights-")
+        with os.fdopen(fd, "w") as f:
+            json.dump({"lights": lights}, f, indent=1)
+        os.replace(tmp, STATE_FILE)
+    except OSError:
+        pass
+
+
+def ask_window(req: dict, timeout: float = 12) -> dict | None:
+    """Send one request to an open gvm-gui; its reply, or None when no window is listening."""
+    import json, socket
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(SOCKET)
+    except OSError:
+        return None
+    buf = b""
+    try:
+        with s:
+            s.sendall((json.dumps(req) + "\n").encode())
+            while not buf.endswith(b"\n"):
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        reply = json.loads(buf)
+        return reply if isinstance(reply, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
 _connecting: asyncio.Lock | None = None
 
 
@@ -141,6 +267,9 @@ async def connect(addr: str, tries: int = 3) -> BleakClient:
 
 
 async def _connect(addr: str, tries: int) -> BleakClient:
+    if release_stale([addr]):
+        print(f"gvm: dropped a leftover Bluetooth link to {label_of(addr)}", file=sys.stderr)
+        await asyncio.sleep(1)  # let the light start advertising again
     last = None
     for _ in range(tries):
         dev = await BleakScanner.find_device_by_address(addr, timeout=8)
@@ -162,6 +291,7 @@ WRITE_GAP = 0.15  # seconds after each write; the light drops writes sent too cl
 async def session(addr: str, verbose: bool, plan) -> None:
     """Connect, subscribe, read the status, then let `plan(status, write)` act."""
     status: dict = {}
+    regs: dict = {}  # what we learnt or set, for the state file
     got = asyncio.Event()
 
     def note(_, d: bytearray) -> None:
@@ -170,6 +300,7 @@ async def session(addr: str, verbose: bool, plan) -> None:
         for item in parse(bytes(d)):
             if item[0] == "status":
                 status["v"] = item[1]
+                regs.update(enumerate(item[1][:7]))
                 got.set()
 
     c = await connect(addr)
@@ -180,6 +311,7 @@ async def session(addr: str, verbose: bool, plan) -> None:
             if verbose:
                 print(">> reg", reg, "=", val, file=sys.stderr)
             await c.write_gatt_char(CH, setreg(reg, val), response=False)
+            regs[reg] = val
             await asyncio.sleep(WRITE_GAP)
 
         async def read() -> list[int]:
@@ -195,6 +327,7 @@ async def session(addr: str, verbose: bool, plan) -> None:
         await asyncio.sleep(0.3)
     finally:
         await c.disconnect()
+        record_state({label_of(addr): regs_to_state(regs)}, "gvm")
 
 
 
@@ -455,6 +588,7 @@ def main() -> None:
   gvm -l all off      every light in the lights file
   gvm -l fill bright 20
   gvm scan            find lights in range and their addresses
+  gvm release         drop leftover Bluetooth links that hide the lights (also done before connecting)
   gvm preset camera   the saved webcam look (gvm preset: list presets)
   gvm -l all effect tiger-rag      Clemson orange/purple swap until Ctrl-C
   gvm effect touchdown -s 1.5      a one-shot celebration, 1.5x speed
@@ -472,6 +606,7 @@ Each command connects, acts, and disconnects (about 3-5 s).""",
     sub = p.add_subparsers(dest="cmd", required=True, metavar="command")
     sub.add_parser("status", help="show the light's current state")
     sub.add_parser("scan", help="list GVM lights in range (closed by the app or gvm-gui: hidden)")
+    sub.add_parser("release", help="drop leftover BlueZ links to the lights (skipped while gvm-gui runs)")
     sub.add_parser("on", help="turn the light on")
     sub.add_parser("off", help="turn the light off")
     sub.add_parser("toggle", help="turn it off if on, on if off")
@@ -494,6 +629,7 @@ Each command connects, acts, and disconnects (about 3-5 s).""",
     r.add_argument("value", type=int, help="value 0-255")
     a = p.parse_args()
     clamp = lambda v, lo, hi: max(lo, min(hi, v))  # noqa: E731
+    name = None  # the preset, by its own spelling
 
     if a.cmd == "preset":
         presets = load_presets()
@@ -513,6 +649,7 @@ Each command connects, acts, and disconnects (about 3-5 s).""",
             a.light = "all" if len(names) != 1 else names[0]
     targets = resolve(a.light)
     multi = len(targets) > 1
+    failed_in_window = False
 
     async def plan(read, write, label):
         cmd = {"colour": "color"}.get(a.cmd, a.cmd)
@@ -549,12 +686,45 @@ Each command connects, acts, and disconnects (about 3-5 s).""",
                 return
             await FX([write], [60]).set(0, **settings)
 
+    if a.cmd == "release":
+        # every light in the file unless -l names some
+        given = any(f in sys.argv for f in ("-l", "-a", "--light"))
+        addrs = [ad for _, ad in targets] if given else (list(LIGHTS.values()) or [DEFAULT_ADDR])
+        if other_gvm_pids():
+            print("gvm: gvm-gui or another gvm is running and owns the links; left alone")
+            return
+        freed = release_stale(addrs)
+        print("dropped leftover links: " + ", ".join(map(label_of, freed)) if freed else "no leftover links")
+        return
     if a.cmd == "scan":
+        freed = release_stale(LIGHTS.values())
+        if freed:
+            print("dropped leftover links:", ", ".join(map(label_of, freed)))
+            asyncio.run(asyncio.sleep(1))
         asyncio.run(scan())
         return
     if a.cmd == "effect":
         asyncio.run(effect_cli(targets, a.name, a.speed, a.seconds, a.verbose))
         return
+
+    # gvm-gui open: it holds the lights, so it carries out what it can; the rest go direct
+    if a.cmd in REMOTE_CMDS:
+        req = {"cmd": a.cmd, "lights": [n for n, _ in targets]}
+        if a.cmd == "preset":
+            req["name"] = name
+        reply = ask_window(req)
+        if reply is not None:
+            say = (lambda lb, t: print(f"{lb}: {t}")) if multi else (lambda lb, t: print(t))
+            for lb, t in reply.get("out", []):
+                say(lb, t)
+            for lb, t in reply.get("errors", []):
+                print(f"gvm: {lb}: {t}", file=sys.stderr)
+            rest = set(reply.get("missing", []))
+            targets = [t for t in targets if t[0] in rest]
+            if not targets:
+                sys.exit(1 if reply.get("errors") else 0)
+            if reply.get("errors"):
+                failed_in_window = True
 
     async def one(label, addr):
         try:
@@ -567,7 +737,7 @@ Each command connects, acts, and disconnects (about 3-5 s).""",
     async def every():
         return await asyncio.gather(*(one(n, ad) for n, ad in targets))
 
-    sys.exit(0 if all(asyncio.run(every())) else 1)
+    sys.exit(0 if all(asyncio.run(every())) and not failed_in_window else 1)
 
 
 async def scan() -> None:

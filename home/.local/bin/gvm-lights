@@ -31,6 +31,10 @@ case "${1:-toggle}" in
             toggle
             showing && centre
         else
+            # Drop leftover BlueZ links first: a light still "connected" to nothing
+            # (BlueZ can bring it back up on resume) stops advertising and shows as
+            # not found.  gvm-gui also checks each light as it connects.
+            [ -x "$HOME/.local/bin/gvm" ] && timeout 25 "$HOME/.local/bin/gvm" release >/dev/null 2>&1
             setsid -f "$HOME/.local/bin/gvm-gui" >/dev/null 2>&1
             # Show the workspace once the window has landed on it.
             for _ in $(seq 50); do running && break; sleep 0.1; done

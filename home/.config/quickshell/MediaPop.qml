@@ -9,6 +9,7 @@ import Quickshell.Services.Mpris
 ColumnLayout {
     id: card
     readonly property var player: Sys.player
+    signal done()           // the bar closes the card (after Stop and clear)
     spacing: 12
 
     function clock(s) {
@@ -121,6 +122,21 @@ ColumnLayout {
                 }
             }
         }
+    }
+
+    // stop the player and take the pill off the bar until something plays again
+    Rectangle {
+        Layout.fillWidth: true
+        visible: card.player !== null
+        implicitHeight: 28; radius: 7
+        color: stopTap.containsMouse ? Theme.hover : Theme.track
+        Text {
+            anchors.centerIn: parent
+            text: "■  Stop and clear"
+            color: Theme.fg
+            font { family: Theme.font; pixelSize: 11 }
+        }
+        MouseArea { id: stopTap; anchors.fill: parent; hoverEnabled: true; onClicked: { Sys.stopMedia(); card.done() } }
     }
 
     // the player's own volume (not the system's)

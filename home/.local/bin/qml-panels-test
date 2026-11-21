@@ -1,7 +1,7 @@
 #!/bin/sh
 # Tests for the bar's popups and the small Quickshell panel pieces no other suite covers: Mixer,
 # WifiList, BluetoothList, TeamsList, MediaCard, MediaPop, PowerMenu, BatteryWarn, ProfileList,
-# WallMenu, MsgIcon, Slider, ScriptSource; plus one pass that builds every Settings*.qml page on its
+# LightsList (with the real Lights.qml), WallMenu, MsgIcon, Slider, ScriptSource; plus one pass that builds every Settings*.qml page on its
 # own (dark and light) and fails on any error it logs (settings-test does the deep page checks).
 #
 #   qml-panels-test             run everything; PASS/FAIL lines, then RESULT pass N fail M; exit 1 on a failure
@@ -47,9 +47,14 @@ mkdir -m 700 "$work/run"
 echo true > "$fake/.config/cosmic/com.system76.CosmicTheme.Mode/v1/is_dark"
 [ -e "$HOME/.local/share/fonts" ] && ln -s "$HOME/.local/share/fonts" "$fake/.local/share/fonts"
 printf 'listener {\n    timeout = 1800\n    on-timeout = loginctl lock-session\n}\n' > "$fake/.config/hypr/hypridle.conf"
+# the GVM lights (Lights.qml): two named, two presets, light1 last known on
+mkdir -p "$fake/.config/gvm" "$work/state/gvm"
+printf '# GVM lights\nlight1  A4:C1:38:00:00:01   # key\nlight2  A4:C1:38:00:00:02\nbroken\n' > "$fake/.config/gvm/lights"
+echo '{"Camera": {"note": "webcam look", "all": {"on": 1}}, "Orange": {"all": {"hue": 25}}}' > "$fake/.config/gvm/presets.json"
+echo '{"lights": {"light1": {"on": 1, "bright": 100, "at": 1763600000, "by": "gvm"}, "light2": {"on": 0, "at": 1763600000}}}' > "$work/state/gvm/lights.json"
 
 # ---- the real files ----
-under="Mixer WifiList BluetoothList TeamsList MediaCard MediaPop PowerMenu BatteryWarn ProfileList WallMenu MsgIcon Slider ScriptSource"
+under="Mixer WifiList BluetoothList TeamsList MediaCard MediaPop PowerMenu BatteryWarn ProfileList LightsList Lights WallMenu MsgIcon Slider ScriptSource"
 for f in $under MenuRow Caption Theme Icons SaverRow Fit; do cp "$src/$f.qml" "$cfg/" || exit 2; done
 pages=""
 for f in "$src"/Settings*.qml; do
@@ -111,6 +116,9 @@ printf '#!/bin/sh\necho "wifi-qr $*" >> "%s/calls"\necho "%s/qr.png"\necho "hunt
 printf '#!/bin/sh\necho "sunset-times $*" >> "%s/calls"\necho %s\n' "$work" "'{\"light\": \"07:00\", \"dark\": \"20:00\", \"temp\": 4500}'" > "$pbin/sunset-times"
 printf '#!/bin/sh\necho "palette $*" >> "%s/calls"\n[ "$1" = list ] && echo "* clemson          primary #f56600  secondary #522d80  the hand-made plan"\nexit 0\n' "$work" > "$pbin/palette"
 printf '#!/bin/sh\necho "input-settings $*" >> "%s/calls"\n[ "$1" = get ] && echo %s\nexit 0\n' "$work" "'{\"values\":{},\"saved\":{},\"deviceSaved\":{},\"devices\":[]}'" > "$pbin/input-settings"
+# gvm (Lights.qml): logs its arguments; sleeps while gvm.slow has text; fails with gvm.fail's text on stderr
+printf '#!/bin/sh\necho "$*" >> "%s/gvm.log"\n[ -s "%s/gvm.slow" ] && sleep 0.5\nif [ -s "%s/gvm.fail" ]; then echo "connecting..." >&2; cat "%s/gvm.fail" >&2; exit 1; fi\nexit 0\n' "$data" "$data" "$data" "$data" > "$pbin/gvm"
+: > "$data/gvm.log"
 for c in wifi-menu anim-preset tz-now display-layout teams-unread run-logged charge-profile; do
     printf '#!/bin/sh\necho "%s $*" >> "%s/calls"\n' "$c" "$work" > "$pbin/$c"
 done
@@ -146,16 +154,18 @@ want = [
     ("profile pill: click = profiles, right = next profile", "profile",
      [r'onClicked: bar\.togglePopup\("profile", profilePill\)', r'onRightClicked: Sys\.nextProfile\(\)']),
     ("power pill: click = power menu", "power", [r'onClicked: bar\.togglePopup\("power"']),
+    ("lights pill: click = list, right = all on/off, middle = the lights window", "lights",
+     [r'onClicked: bar\.togglePopup\("lights", lightsPill\)', r'onRightClicked: Lights\.quick\(\)', r'onMiddleClicked: Lights\.openWindow\(\)']),
 ]
 for label, name, pats in want:
     b = pill(name)
     miss = [p for p in pats if not re.search(p, b)]
     print(("PASS " if b and not miss else "FAIL ") + "Bar: " + label + ("" if b and not miss else "   [" + ("no pill opens " + name if not b else "missing: " + "; ".join(miss)) + "]"))
-for name, comp in [("mixer", "Mixer"), ("wifi", "WifiList"), ("bluetooth", "BluetoothList"), ("profile", "ProfileList"), ("teams", "TeamsList"), ("power", "PowerMenu"), ("media", "MediaPop")]:
+for name, comp in [("mixer", "Mixer"), ("wifi", "WifiList"), ("bluetooth", "BluetoothList"), ("profile", "ProfileList"), ("teams", "TeamsList"), ("power", "PowerMenu"), ("media", "MediaPop"), ("lights", "LightsList")]:
     m = re.search(r"Component \{ id: (\w+); %s \{" % comp, s)
     ok = m and re.search(r"\b%s: %s\b" % (name, m.group(1)), s)
     print(("PASS " if ok else "FAIL ") + "Bar: popup \"%s\" loads %s" % (name, comp))
-for comp in ["WifiList", "BluetoothList", "ProfileList", "TeamsList", "PowerMenu"]:
+for comp in ["WifiList", "BluetoothList", "ProfileList", "TeamsList", "PowerMenu", "LightsList"]:
     ok = re.search(r"%s \{ onDone: bar\.popup = \"\" \}" % comp, s)
     print(("PASS " if ok else "FAIL ") + "Bar: %s closes the popup when done" % comp)
 PY
