@@ -1,0 +1,222 @@
+# Sourced by desktop-shots (not run on its own): the gallery, every interactive view of the shell,
+# into $out/gallery/. Uses desktop-shots' helpers (qsi, hc, ptr, kbd, shoot, notify, record, ...).
+#
+#   gallery_main   pointer-only views: bar popups, launcher modes, settings pages, overlays, pet, wallpaper
+#   gallery_keys   views that need the virtual keyboard (after the editor): share picker, drag-to-place
+#   gallery_late   the break reminder (waits for the shell's one-minute tick)
+#
+# Each still is cropped to what the view added: a picture of the screen just before opening it
+# (gbase) is compared with the one after (gshot), and the picture is cut to the changed area plus a
+# margin, taken up to the top edge when it comes from the bar. The wallpaper is held still meanwhile.
+
+G="$out/gallery"; mkdir -p "$G"
+grab() { env XDG_RUNTIME_DIR="$R" WAYLAND_DISPLAY="$nested_wl" grim -o "$SHOT" "$1"; }
+gbase() { grab "$work/gbase.png"; }
+gshot() {   # gshot NAME [full | right | box:X0,Y0,X1,Y1]: crop to the change since gbase, or as asked
+    grab "$work/gnow.png" || return
+    python3 -I - "$work/gbase.png" "$work/gnow.png" "$work/gcrop.png" "${2:-}" <<'EOF'
+import sys
+from PIL import Image, ImageChops, ImageFilter
+base, now, outp, mode = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+a = Image.open(now).convert("RGB"); W, H = a.size
+if mode == "right":
+    a = a.crop((W // 2, 0, W, H))
+elif mode.startswith("box:"):
+    a = a.crop(tuple(int(v) for v in mode[4:].split(",")))
+elif mode != "full":
+    d = ImageChops.difference(Image.open(base).convert("RGB"), a).convert("L").point(lambda v: 255 if v > 28 else 0)
+    d = d.filter(ImageFilter.MaxFilter(7)).filter(ImageFilter.MinFilter(13))   # thicken then erode: dense text (dark menus on dark windows) becomes a block that stays; thin lines (borders changing colour with focus) and specks go
+    d.paste(0, (0, 0, W, 56))                       # the bar row (clock, pet walking) never decides the crop
+    box = d.getbbox()
+    if box:
+        m = 40
+        x0, y0, x1, y1 = max(0, box[0] - m), max(0, box[1] - m), min(W, box[2] + m), min(H, box[3] + m)
+        if y0 < 120: y0 = 0                         # under the bar: keep the bar in the picture
+        if x1 - x0 < 560: c = (x0 + x1) // 2; x0, x1 = max(0, c - 280), min(W, c + 280)
+        if y1 - y0 < 300: y1 = min(H, y0 + 300)
+        a = a.crop((x0, y0, x1, y1))
+a.save(outp)
+EOF
+    # AVIF, full colour resolution (4:4:4) so coloured text stays sharp: about a sixth of a PNG
+    ffmpeg -v error -y -i "$work/gcrop.png" -c:v libaom-av1 -still-picture 1 -crf 20 -cpu-used 6 -pix_fmt yuv444p10le \
+        "$G/$1.avif" 2>/dev/null && echo "  gallery/$1.avif" || { cp "$work/gcrop.png" "$G/$1.png"; echo "  gallery/$1.png"; }
+}
+gchanged() {   # gchanged [REF]: did the screen change since REF (default gbase), outside the bar row?
+    grab "$work/gtry.png"
+    python3 -I - "${1:-$work/gbase.png}" "$work/gtry.png" <<'EOF'
+import sys
+from PIL import Image, ImageChops, ImageFilter
+d = ImageChops.difference(Image.open(sys.argv[1]).convert("L"), Image.open(sys.argv[2]).convert("L"))
+d = d.point(lambda v: 255 if v > 28 else 0).filter(ImageFilter.MinFilter(3)); d.paste(0, (0, 0, d.size[0], 56))
+sys.exit(0 if d.getbbox() else 1)
+EOF
+}
+gview() {   # gview NAME SECONDS OPEN-ARGS... -- CLOSE-ARGS...   (qs ipc calls)
+    # Popups toggle: a request for an open one closes it. When nothing changed, the view was open
+    # already and this closed it; the closed screen becomes the "before" picture and it opens again.
+    local name=$1 wait=$2; shift 2; local open=() close=()
+    while [ $# -gt 0 ] && [ "$1" != -- ]; do open+=("$1"); shift; done; shift; close=("$@")
+    gbase; qsi call "${open[@]}" >/dev/null; sleep "$wait"
+    if ! gchanged; then cp "$work/gtry.png" "$work/gbase.png"; qsi call "${open[@]}" >/dev/null; sleep "$wait"; fi
+    gshot "$name"
+    [ ${#close[@]} -gt 0 ] && qsi call "${close[@]}" >/dev/null; sleep 1.3   # closed before the next "before" picture
+}
+gpop() {   # gpop NAME OPEN-ARGS...: a bar popup. Requests toggle, so every popup is closed with
+    # `bar popup ""` (a switch to no popup: closes whatever is open, and does nothing when none is),
+    # and each one opens from a closed bar.
+    local name=$1; shift
+    qsi call bar popup "" >/dev/null; sleep 1.2
+    gbase; qsi call "$@" >/dev/null; sleep 1.3; gshot "$name"
+    qsi call bar popup "" >/dev/null; sleep 1.2
+}
+mockcall() {   # mockcall OBJECT-PATH METHOD ARGS-PYTHON: a call on a stand-in system service's Mock interface
+    "$venv/bin/python" -c "import dbus; b = dbus.bus.BusConnection('$sbus_addr'); o = b.get_object('$1', '$2'); getattr(dbus.Interface(o, 'org.freedesktop.DBus.Mock'), '$3')($4)" 2>/dev/null
+}
+
+gallery_main() {
+    echo "gallery:"
+    echo true > "$dark_file"; terms_off; sleep 1
+    qsi call wallpaper season none >/dev/null; qsi call wallpaper speed 0 >/dev/null
+    terms_on "Clemson Dark"; ptr m 1919 1079; sleep 1.5
+    # join: a meeting with a link nine minutes ahead (read on the shell's next minute tick; too far
+    # off for calendar-aware Do Not Disturb, and removed again right after its picture)
+    python3 -I - "$H/.emacs.d/org/calendars/demo-meeting.org" <<'EOF'
+import datetime as dt, sys
+s = dt.datetime.now() + dt.timedelta(minutes=9); e = s + dt.timedelta(minutes=30)
+open(sys.argv[1], "w").write(f"* Advising meeting\n:PROPERTIES:\n:MEETING_URL: https://example.edu/meet/advising\n:END:\n"
+                             f"<{s:%Y-%m-%d %a %H:%M}-{e:%H:%M}>\n")
+EOF
+
+    # ---- bar popups ----
+    notify -a "Calendar" -i x-office-calendar "Data Structures lecture in 10 minutes" "Hall B 100"
+    notify -a "Build" -i emblem-ok "Lecture slides built" "week-12.pdf, 34 pages"
+    notify -a "Backup" -i drive-harddisk "Backup finished" "Nothing changed since yesterday"
+    sleep 1; qsi call notif dismissAll >/dev/null 2>&1; sleep 0.8
+    qsi call clock timer "25m Grading" >/dev/null; qsi call clock alarm "16:30 Leave for the meeting" >/dev/null
+    touch "$H/demo/health-stale"; qsi call health refresh >/dev/null; sleep 1.5
+    for p in calendar notifs media mixer wifi bluetooth profile power health lights teams pet; do gpop "bar-$p" bar popup "$p"; done
+    rm -f "$H/demo/health-stale"; qsi call health refresh >/dev/null
+
+    # ---- launcher: every mode ----
+    lmode() { gbase; qsi call launcher openWith "$2" >/dev/null; sleep 1.4; gshot "launcher-$1"; qsi call launcher toggle >/dev/null; until_gone qs-launcher 30; sleep 0.4; }
+    lmode apps ""; lmode calc "=2^10 + 3*7"; lmode emoji ":tiger"; lmode clipboard "v "; lmode windows "w "
+    lmode files "/teaching"; lmode keys "?"; lmode org "o Grade quiz 4 by Friday"; lmode mail "m "
+    lmode notes "n "; lmode tabs "t "; lmode qr "qr https://example.edu/cs2120"; lmode event "event Lunch with Sam tomorrow 12-1"
+
+    # ---- settings: every page ----
+    # opened once first: the window dims the screen behind it, which must be in every "before" picture
+    qsi call settings open about >/dev/null; sleep 1.5
+    for pg in appearance bar notifications quiet clock saver lecture recording pet launcher power displays input health session focus about; do
+        gbase; qsi call settings open "$pg" >/dev/null; sleep 1.2; gshot "settings-$pg"
+    done
+    qsi call settings close >/dev/null; until_gone qs-settings 30; sleep 0.5
+    for _ in $(seq 70); do [ "$(qsi call join status)" != none ] && break; sleep 1; done
+    lmode join ""; rm -f "$H/.emacs.d/org/calendars/demo-meeting.org"
+
+    # ---- overlays ----
+    gbase; qsi call switcher next >/dev/null; sleep 1; gshot switcher; qsi call switcher commit >/dev/null; sleep 0.6
+    gview wallpaper-menu 1.2 wallpaper menu -- wallpaper menu
+    gbase; qsi call osd level volume "" 60 >/dev/null; sleep 0.5; gshot osd-volume; sleep 2
+    gbase; qsi call osd level brightness "" 35 >/dev/null; sleep 0.5; gshot osd-brightness; sleep 2
+    gbase; qsi call cursor flash 700 600 >/dev/null; sleep 0.25; gshot cursor-find box:380,380,1020,820; sleep 1.5
+    gbase; qsi call lecture zoomin >/dev/null; qsi call lecture zoomin >/dev/null; sleep 1; gshot lecture-zoom full
+    qsi call lecture zoomreset >/dev/null; qsi call lecture off >/dev/null; sleep 0.8
+    gbase; printf 'Draw on the screen   D\nSpotlight   L\nShow keys   K\nZoom in   =\nTimer   T\n' > "$work/lect-items"
+    qsi call picker open "$work/lect-items" "$work/lect-out" "Lecture tools" >/dev/null; sleep 1; gshot lecture-menu
+    qsi call picker open "$work/lect-items" "$work/lect-out" "Lecture tools" >/dev/null; sleep 0.6
+    gbase; qsi call cam on >/dev/null; touch "$H/demo/recording"; sleep 2.5; gshot recording right
+    qsi call cam off >/dev/null; rm -f "$H/demo/recording"; sleep 1.5
+
+    # ---- the pet ----
+    for pg in focus remind journal tricks looks say habits settings; do gpop "pet-$pg" pet menu "$pg"; done
+    gbase; qsi call pet focus 25 >/dev/null; qsi call pet remind "20m" "Grade quiz 4" >/dev/null; sleep 1.5
+    gshot pet-focus-bar box:0,0,1920,140; qsi call pet stopfocus >/dev/null
+    terms_off; sleep 1.5
+
+    # ---- screensaver (empty desktop) ----
+    gbase; qsi call saver preview >/dev/null; sleep 3; gshot screensaver full; qsi call saver stop >/dev/null; sleep 1.5
+
+    # ---- wallpaper: light scenes, and the effects over one scene ----
+    qsi call wallpaper force true >/dev/null      # the stand-in battery says "on battery", which holds the scene still
+    effgrid() {   # effgrid OUT NAME:IPC-CALL...
+        local outname=$1; shift; mkdir -p "$work/eff"; rm -f "$work/eff"/*.png; local names=()
+        for spec in "$@"; do
+            local n=${spec%%:*} c=${spec#*:}
+            eval "qsi call $c" >/dev/null; sleep 2.4
+            if [ "$outname" = scenes-light ]; then
+                env XDG_RUNTIME_DIR="$R" WAYLAND_DISPLAY="$nested_wl" grim -o "$SHOT" -s 0.25 "$work/eff/$n.png"
+            elif [ "${c#wallpaper weather}" != "$c" ]; then   # rain and snow are fine lines: a full-resolution piece
+                env XDG_RUNTIME_DIR="$R" WAYLAND_DISPLAY="$nested_wl" grim -g "640,300 640x360" "$work/eff/$n.png"
+            else   # leaves, petals, fireflies are few and far between: the whole screen, a third the size
+                sleep 2; env XDG_RUNTIME_DIR="$R" WAYLAND_DISPLAY="$nested_wl" grim -o "$SHOT" -s 0.3333 "$work/eff/$n.png"
+            fi; names+=("$n")
+        done
+        python3 -I - "$work/eff" "$G/$outname.png" "${names[@]}" <<'EOF'
+import sys
+from PIL import Image, ImageDraw, ImageFont
+d, outp, names = sys.argv[1], sys.argv[2], sys.argv[3:]
+ims = [Image.open(f"{d}/{n}.png").convert("RGB") for n in names]
+ims = [im if im.size == ims[0].size else im.resize(ims[0].size) for im in ims]
+w, h = ims[0].size; cols = 4; rows = (len(ims) + cols - 1) // cols; gap = 6
+sheet = Image.new("RGB", (cols * w + (cols + 1) * gap, rows * h + (rows + 1) * gap), (14, 12, 20))
+try: font = ImageFont.truetype("DejaVuSansMono-Bold.ttf", 15)
+except OSError: font = ImageFont.load_default()
+for i, (n, im) in enumerate(zip(names, ims)):
+    x, y = gap + (i % cols) * (w + gap), gap + (i // cols) * (h + gap)
+    sheet.paste(im, (x, y)); dr = ImageDraw.Draw(sheet)
+    dr.rounded_rectangle((x + 8, y + h - 30, x + 16 + dr.textlength(n, font=font), y + h - 8), 5, fill=(14, 12, 20))
+    dr.text((x + 12, y + h - 28), n, fill=(245, 102, 0), font=font)
+sheet.save(outp)
+EOF
+    }
+    echo false > "$dark_file"; sleep 2.5
+    local sc=(); for n in silk aurora contours ink ridges sky terrain flow ripples field pulsar depths; do sc+=("$n:wallpaper scene $n"); done
+    effgrid scenes-light "${sc[@]}"
+    echo true > "$dark_file"; sleep 2
+    effavif() { ffmpeg -v error -y -i "$G/$1.png" -c:v libaom-av1 -still-picture 1 -crf 20 -cpu-used 6 -pix_fmt yuv444p10le "$G/$1.avif" 2>/dev/null && rm -f "$G/$1.png"; echo "  gallery/$1.avif"; }
+    effavif scenes-light
+    qsi call wallpaper scene ridges >/dev/null
+    effgrid wallpaper-effects "rain:wallpaper weather rain" "fog:wallpaper weather fog" "snow:wallpaper weather snow" \
+        "clear:wallpaper weather none" "leaves:wallpaper season leaves" "snowflakes:wallpaper season snow" \
+        "petals:wallpaper season petals" "fireflies:wallpaper season fireflies" "game day:wallpaper gameday true"
+    effavif wallpaper-effects
+    qsi call wallpaper gameday false >/dev/null; qsi call wallpaper season none >/dev/null; qsi call wallpaper weather none >/dev/null
+    qsi call wallpaper scene silk >/dev/null; sleep 1
+
+    # ---- polkit prompt: auth-test's own pictures (the real AuthView with a stand-in agent) ----
+    if [ -x "$src/.local/bin/auth-test" ]; then
+        "$src/.local/bin/auth-test" -o "$work/auth" -d "$qsrc" -b "$src/.local/bin" >/dev/null 2>&1
+        for k in dark-idle dark-error light-idle; do [ -f "$work/auth-$k.png" ] && ffmpeg -v error -y -i "$work/auth-$k.png" -c:v libaom-av1 -still-picture 1 -crf 20 -cpu-used 6 -pix_fmt yuv444p10le "$G/polkit-$k.avif" 2>/dev/null && echo "  gallery/polkit-$k.avif"; done
+    fi
+
+    # ---- interaction clips (pointer only) ----
+    terms_on "Clemson Dark"; ptr m 1919 1079; sleep 1
+    a_resize() { sleep 0.6; ptr m 1055 540 s 300 d s 200 m 1150 540 s 60 m 1250 540 s 60 m 1350 540 s 400 m 1150 540 s 60 m 1000 540 s 400 u s 200 m 1919 1079; }
+    record gallery/resize 5 "fps=24,scale=1280:-2:flags=lanczos" a_resize
+    a_pills() {   # hover the clock (tooltip), click it (calendar), click again, right-click the music pill (pause)
+        sleep 0.6; ptr m 960 24 s 1800; ptr d s 80 u s 1800; ptr d s 80 u s 700
+        ptr m 1160 24 s 900; ptr D s 80 U s 1500; ptr D s 80 U s 600; ptr m 1919 1079
+    }
+    record gallery/pills 9 "crop=1280:620:640:0,fps=20" a_pills
+    a_dnd() { sleep 0.8; qsi call quiet on >/dev/null; sleep 1.8; notify -a "Chat" "Sam Rivera" "Are office hours still on?"; sleep 2.4; qsi call quiet off >/dev/null; }
+    record gallery/dnd 7 "crop=1280:420:640:0,fps=20" a_dnd
+}
+
+gallery_keys() {   # after the editor: the virtual keyboard is in use from here on
+    qsi call island off >/dev/null
+    # screen-share picker: lists made by the real qs-share-pick --parse from the nested session's windows
+    if [ -x "$src/.local/bin/qs-share-pick" ]; then
+        wl=$(hc -j clients | jq -r '.[] | "\(.pid)[HC>]\(.class)[HT>]\(.title)[HE>]\(.address)[HA>]"' | tr -d '\n')
+        env XDPH_WINDOW_SHARING_LIST="$wl" XDG_RUNTIME_DIR="$R" HYPRLAND_INSTANCE_SIGNATURE="$sig" PATH="$P" \
+            sh "$src/.local/bin/qs-share-pick" --parse > "$work/share.json" 2>/dev/null
+        mkfifo "$work/share.fifo" 2>/dev/null; ( cat "$work/share.fifo" > /dev/null & )
+        gbase; qsi call sharepick open "$work/share.json" "$work/share.fifo" >/dev/null; sleep 2.5; gshot share-picker
+        kbd t 1 s 300; sleep 0.8
+    fi
+    # drag-to-place: hold Super, drag a window across the other (the plugin's preview outline)
+    a_drag() { sleep 0.5; kbd d 125 s 4200 u 125 & ptr m 400 500 s 300 d s 200 m 700 520 s 80 m 1100 540 s 80 m 1500 560 s 900 m 1600 300 s 900 u s 300; wait; ptr m 1919 1079; }
+    record gallery/drag-to-place 6 "fps=24,scale=1280:-2:flags=lanczos" a_drag
+    qsi call island on >/dev/null
+}
+
+gallery_late() { :; }   # (the break reminder counts active minutes, which a staged session never has)

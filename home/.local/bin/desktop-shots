@@ -33,6 +33,12 @@
 # Dark only:
 #   calc, emoji   launcher modes with a query typed
 #   scenes        a grid of every wallpaper scene
+# Gallery (--gallery-only for just these; into OUTDIR/gallery/, dark, each cropped to what it shows):
+#   every bar popup, launcher mode and settings page, the switcher, wallpaper menu, OSD, screensaver,
+#   lecture zoom and menu, webcam bubble and recording, share picker, polkit prompt (auth-test's
+#   pictures), battery warning, break reminder, pet pages and game, wallpaper effects, and four
+#   interaction clips (drag-to-place, border resize, pill clicks, Do Not Disturb). Bluetooth, Wi-Fi,
+#   battery, power profiles and music come from desktop-shots-fakes; sound from a private PipeWire.
 # Animations (animated AVIF, recorded with wf-recorder; --no-anim skips them):
 #   anim-wallpaper  anim-island  anim-pet  anim-theme
 #
@@ -54,6 +60,7 @@ while [ $# -gt 0 ]; do
         --keys) keys="$2"; shift ;;
         --hold) hold=1; keep=1 ;;
         --no-anim) anim=0 ;;
+        --gallery-only) only=",gallery," ;;
         --dark-only) modes=dark ;;
         --light-only) modes=light ;;
         *) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
@@ -136,6 +143,79 @@ print(json.dumps({
          "url": "", "date": tom.isoformat(), "id": "", "calendar": "demo", "tags": []}]}}))
 CANNED
 chmod +x "$H/.local/bin/dashboard-data"
+# ---- made-up data for the gallery views (bar popups, launcher modes) ----
+canned() { rm -f "$H/.local/bin/$1"; cat > "$H/.local/bin/$1"; chmod +x "$H/.local/bin/$1"; }
+canned screen-record <<'CANNED'
+#!/bin/sh
+[ "$1" = status ] && [ -e "$HOME/demo/recording" ] && echo '{"text": "REC 0:42", "tooltip": "<b>Recording</b> this screen, 0:42\nClick: stop", "class": "recording"}'
+exit 0
+CANNED
+canned charge-profile <<'CANNED'
+#!/bin/sh
+[ "$1" = status ] && echo '{"profile": "balanced", "start": 86, "end": 90}'
+exit 0
+CANNED
+canned cams <<'CANNED'
+#!/bin/sh
+[ -z "$1" ] && printf '/dev/v4l/by-id/demo-camera\tDemo camera\t/dev/video9\n'
+exit 0
+CANNED
+canned teams-unread <<'CANNED'
+#!/bin/sh
+# one line: the bar escapes newlines before parsing
+[ -z "$1" ] && echo '{"text": "3", "tooltip": "<b>Teams</b>: 3 unread in 2 chats", "class": "unread", "rooms": [{"id": "a", "name": "CS 2120 TAs", "count": 2, "mentions": 1, "preview": "Lab 7 grading is done, posting tonight"}, {"id": "b", "name": "Curriculum committee", "count": 1, "mentions": 0, "preview": "Agenda for Thursday attached"}]}'
+exit 0
+CANNED
+canned mu <<'CANNED'
+#!/bin/sh
+[ "$1" = find ] || exit 0
+printf '%s\t%s\t%s\t%s\n' "Today 09:12" "Sam Rivera <sam@example.edu>" "Question about the linked list lab" "m1@example" \
+    "Today 08:40" "Department office <office@example.edu>" "Room change for Thursday" "m2@example" \
+    "Yesterday" "Library <library@example.edu>" "Your reserve items are ready" "m3@example"
+CANNED
+canned tabs-list <<'CANNED'
+#!/bin/sh
+cat <<'EOF'
+[{"title": "Course syllabus", "url": "https://example.edu/cs2120/syllabus", "host": "example.edu", "window": 1, "index": 1, "active": true, "pinned": false},
+ {"title": "Quickshell documentation", "url": "https://quickshell.org/docs/", "host": "quickshell.org", "window": 1, "index": 2, "active": false, "pinned": true},
+ {"title": "Hyprland wiki", "url": "https://wiki.hypr.land/", "host": "wiki.hypr.land", "window": 1, "index": 3, "active": false, "pinned": false},
+ {"title": "Org mode manual", "url": "https://orgmode.org/manual/", "host": "orgmode.org", "window": 2, "index": 1, "active": true, "pinned": false}]
+EOF
+CANNED
+mkdir -p "$H/demo/real"; cp "$src/.local/bin/quick-event" "$H/demo/real/quick-event" 2>/dev/null
+canned quick-event <<'CANNED'
+#!/bin/sh
+# only `parse` reaches the real script; adding an event never runs here
+[ "$1" = parse ] && exec python3 "$HOME/demo/real/quick-event" "$@"
+exit 0
+CANNED
+canned shell-health <<'CANNED'
+#!/bin/sh
+if [ -e "$HOME/demo/health-stale" ]; then cat <<'EOF'
+{"worst": "stale", "jobs": [
+ {"id": "mail", "name": "Mail sync", "state": "stale", "since": "2026-11-21T08:10:00-05:00", "why": "last good run 52 min ago", "unit": "pull-mail.service", "log": "", "run": ""},
+ {"id": "backup", "name": "Backups", "state": "ok", "since": "2026-11-21T02:00:00-05:00", "why": "", "unit": "backup.service", "log": "", "run": ""},
+ {"id": "calendar", "name": "Calendar pull", "state": "ok", "since": "2026-11-21T09:00:00-05:00", "why": "", "unit": "pull-calendars.service", "log": "", "run": ""},
+ {"id": "updates", "name": "Updates", "state": "ok", "since": "2026-11-21T07:00:00-05:00", "why": "", "unit": "", "log": "", "run": ""}]}
+EOF
+else echo '{"worst": "ok", "jobs": []}'; fi
+CANNED
+mkdir -p "$H/.config/gvm" "$H/.local/state/gvm"
+printf 'key 00:11:22:33:44:5a\nfill 00:11:22:33:44:5b\n' > "$H/.config/gvm/lights"
+cat > "$H/.config/gvm/presets.json" <<'EOF'
+{"Camera": {"note": "Key light left, soft fill right"}, "Reading": {"note": "Both warm and dim"}, "Off": {"note": "Both off"}}
+EOF
+cat > "$H/.local/state/gvm/lights.json" <<EOF
+{"lights": {"key": {"on": 1, "bright": 80, "cct": 4400, "mode": "white", "at": $(date +%s), "by": "window", "hue": 30, "sat": 100},
+            "fill": {"on": 1, "bright": 25, "cct": 4400, "mode": "white", "at": $(date +%s), "by": "window", "hue": 30, "sat": 100}}}
+EOF
+echo '{"captureKey": "j"}' > "$H/.local/state/launcher.json"
+mkdir -p "$H/.emacs.d/org/roam"
+for n in "Linked lists:linked-lists" "Lecture plan, week 12:week-12" "Office hours notes:office-hours"; do
+    printf '#+title: %s\n' "${n%%:*}" > "$H/.emacs.d/org/roam/${n##*:}.org"
+    printf '%s\t%s\t%s\n' "$H/.emacs.d/org/roam/${n##*:}.org" "${n%%:*}" "$(date +%s)" >> "$H/.cache/launcher-roam.tsv"
+done
+mkdir -p "$H/Documents/teaching"; for f in syllabus.org week-12-slides.pdf quiz-4.tex grades.csv; do : > "$H/Documents/teaching/$f"; done
 rm -f "$H/.local/bin/lecture-keys"         # the key display reads evdev; here it gets a few made-up presses
 cat > "$H/.local/bin/lecture-keys" <<'CANNED'
 #!/bin/sh
@@ -154,10 +234,10 @@ mkdir -p "$H/.emacs.d/org/calendars"
 python3 -I - "$H/.emacs.d/org/calendars/demo.org" <<'EOF'
 import datetime as dt, sys
 now = dt.datetime.now().replace(second=0, microsecond=0)
-base = now.replace(minute=0)
+base = now.replace(minute=0) + dt.timedelta(hours=1)   # next whole hour: the lecture is 1-2 h off, never under way
 day = now.date(); dn = day.strftime("%a")
 def at(h, m=0): return (base + dt.timedelta(hours=h, minutes=m)).strftime("%H:%M")
-ev = [("Office hours", at(-2), at(-1), "Room 210"),
+ev = [("Office hours", at(-3), at(-2), "Room 210"),
       ("Data Structures lecture", at(1), at(1, 50), "Hall B 100"),
       ("Lab: linked lists", at(3), at(4, 15), "Lab 112"),
       ("Curriculum committee", at(5), at(6), "Conference room")]
@@ -178,7 +258,7 @@ sed -n '/^Item\|^Rectangle\|^MouseArea/,$p' "$qsrc/Pill.qml" | head -48 > "$H/de
 
 allow="sh dash bash env python3 jq sed awk gawk mawk grep cat date head tail tr cut sort uniq wc printf echo test [
        basename dirname mkdir ls stat readlink realpath seq sleep true false findmnt hyprctl id uname nproc mktemp
-       touch rm mv cp ln tee xargs expr od md5sum find timeout qalc"
+       touch rm mv cp ln tee xargs expr od md5sum find timeout qalc qrencode fd fdfind notify-send"
 python3 -I - "$P" "$work/rec" $allow <<'EOF'
 import os, sys
 p, rec, allow = sys.argv[1], sys.argv[2], set(sys.argv[3:])
@@ -189,9 +269,34 @@ for d in ("/usr/local/bin", "/usr/bin", "/bin"):
         dst = os.path.join(p, n)
         if os.path.lexists(dst): continue
         os.symlink(os.path.join(d, n) if n in allow else rec, dst)
-for n in ("qs", "quickshell", "nixGLIntel", "notify-send", "playerctl", "cava", "pw-play", "wpctl", "pactl"):
+for n in ("qs", "quickshell", "nixGLIntel", "playerctl", "cava", "pw-play", "wpctl", "pactl"):
     if not os.path.lexists(os.path.join(p, n)): os.symlink(rec, os.path.join(p, n))
 EOF
+
+# made-up answers for programs the shell asks directly
+rm -f "$P/nmcli" "$P/cliphist"
+cat > "$P/nmcli" <<'EOF'
+#!/bin/sh
+case "$*" in
+    *"dev wifi list"*) printf '*:82:WPA2:Campus\n :64:WPA2:Library-5G\n :41::Coffee Shop\n :23::Lab Guest\n' ;;
+    *connectivity*) echo full ;;
+esac
+EOF
+cat > "$P/cliphist" <<'EOF'
+#!/bin/sh
+case "$1" in
+    list) printf '3\tgit push origin main\n2\thttps://example.edu/cs2120/syllabus\n1\tGrade quiz 4 by Friday\n' ;;
+    decode) read -r l; case "${l%%	*}" in 3) echo "git push origin main" ;; 2) echo "https://example.edu/cs2120/syllabus" ;; *) echo "Grade quiz 4 by Friday" ;; esac ;;
+esac
+EOF
+cat > "$P/ffmpeg" <<'EOF'
+#!/bin/sh
+# stand-in for the webcam reader: never opens a device, keeps the made-up frame in place
+case "$*" in *v4l2*) while :; do cp "$HOME/demo/cam.jpg" "$XDG_RUNTIME_DIR/qs-cam/frame.jpg.part" 2>/dev/null &&
+    mv "$XDG_RUNTIME_DIR/qs-cam/frame.jpg.part" "$XDG_RUNTIME_DIR/qs-cam/frame.jpg"; sleep 0.5; done ;; esac
+exit 0
+EOF
+chmod +x "$P/nmcli" "$P/cliphist" "$P/ffmpeg"
 
 pids=()
 cleanup() {
@@ -244,6 +349,72 @@ hc eval "hl.monitor({ output = \"$SHOT\", mode = \"1920x1080@60\", position = \"
 hc eval "hl.monitor({ output = \"$mon\", disabled = true })" >/dev/null
 until_jq monitors "length == 1 and .[0].name == \"$SHOT\" and .[0].width == 1920" 50 || die "headless $SHOT is not 1920x1080: $(hc -j monitors | jq -c '[.[] | {name,width,height}]')"
 
+# ---- stand-in services, before the shell so it finds them at start ----
+# Made-up pictures: an album cover for the music card and a webcam frame for the bubble (the
+# bubble shows $XDG_RUNTIME_DIR/qs-cam/frame.jpg; the ffmpeg that would fill it from the real
+# camera is a recorder here, so no camera is ever opened).
+mkdir -p "$R/qs-cam"
+python3 -I - "$H/demo/cover.png" "$R/qs-cam/frame.jpg" "$H/demo/cam.jpg" <<'EOF'
+import math, sys
+from PIL import Image, ImageDraw, ImageFilter
+w = 480
+cov = Image.new("RGB", (w, w)); d = ImageDraw.Draw(cov)
+for y in range(w):                                  # purple to orange
+    t = y / w; d.line([(0, y), (w, y)], fill=(int(82 + (245 - 82) * t), int(45 + (102 - 45) * t), int(128 - 128 * t)))
+for r in range(200, 20, -30):
+    d.ellipse((w / 2 - r, w / 2 - r, w / 2 + r, w / 2 + r), outline=(255, 240, 230), width=3)
+cov.save(sys.argv[1])
+cam = Image.new("RGB", (w, w), (58, 52, 70)); d = ImageDraw.Draw(cam)
+for y in range(w):                                  # a soft wall
+    d.line([(0, y), (w, y)], fill=(70 + y // 12, 62 + y // 14, 84 + y // 16))
+d.ellipse((150, 90, 330, 290), fill=(214, 170, 140))                     # head
+d.pieslice((60, 300, 420, 700), 180, 360, fill=(245, 102, 0))            # orange shirt
+d.ellipse((140, 70, 340, 200), fill=(70, 48, 38)); d.rectangle((150, 130, 330, 170), fill=(214, 170, 140))   # hair
+cam = cam.filter(ImageFilter.GaussianBlur(1.2)); cam.save(sys.argv[2], quality=90); cam.save(sys.argv[3], quality=90)
+EOF
+venv="$HOME/.local/share/desktop-shots/venv"
+if [ ! -x "$venv/bin/python" ] || ! "$venv/bin/python" -c 'import dbusmock' 2>/dev/null; then
+    echo "desktop-shots: setting up $venv (python-dbusmock)" >&2
+    python3 -m venv --system-site-packages "$venv" && "$venv/bin/pip" install -q python-dbusmock >&2
+fi
+fakes_ok=0
+if "$venv/bin/python" -c 'import dbusmock' 2>/dev/null; then
+    "$venv/bin/python" "$HOME/.local/bin/desktop-shots-fakes" "$sbus_addr" "$bus_addr" "$H/demo/cover.png" > "$work/fakes.out" 2> "$work/fakes.err" &
+    pids+=($!)
+    for _ in $(seq 100); do grep -q ready "$work/fakes.out" 2>/dev/null && { fakes_ok=1; break; }; sleep 0.1; done
+    [ "$fakes_ok" = 1 ] || echo "desktop-shots: stand-in services did not start: $(tail -2 "$work/fakes.err")" >&2
+fi
+# Sound: a private PipeWire in the temporary runtime directory, with WirePlumber's device monitors
+# off (no ALSA, Bluetooth, V4L2 or libcamera: it cannot open a real device), and made-up devices.
+mkdir -p "$H/.config/wireplumber/wireplumber.conf.d"
+cat > "$H/.config/wireplumber/wireplumber.conf.d/90-no-devices.conf" <<'EOF'
+wireplumber.profiles = {
+  main = {
+    monitor.alsa = disabled
+    monitor.alsa-midi = disabled
+    monitor.bluez = disabled
+    monitor.bluez-midi = disabled
+    monitor.v4l2 = disabled
+    monitor.libcamera = disabled
+  }
+}
+EOF
+pw_env=(env -i "${base_env[@]}" PATH="/usr/bin:/bin" XDG_DATA_HOME="$H/.local/share")
+if command -v pipewire >/dev/null && command -v wireplumber >/dev/null; then
+    "${pw_env[@]}" pipewire > "$work/pw.log" 2>&1 & pids+=($!)
+    for _ in $(seq 50); do [ -S "$R/pipewire-0" ] && break; sleep 0.1; done
+    "${pw_env[@]}" wireplumber > "$work/wp.log" 2>&1 & pids+=($!)
+    "${pw_env[@]}" pipewire-pulse > "$work/pwp.log" 2>&1 & pids+=($!)
+    for _ in $(seq 50); do [ -S "$R/pulse/native" ] && break; sleep 0.1; done
+    pa() { "${pw_env[@]}" pactl "$@" >/dev/null 2>&1; }
+    pa load-module module-null-sink sink_name=speakers 'sink_properties=device.description="Laptop speakers"'
+    pa load-module module-null-sink sink_name=headphones 'sink_properties=device.description="Headphones"'
+    pa load-module module-null-sink sink_name=mic media.class=Audio/Source/Virtual 'sink_properties=device.description="Built-in microphone"'
+    pa set-default-sink headphones; pa set-sink-volume headphones 55%; pa set-default-source mic; pa set-source-volume mic 70%
+    python3 -I -c "import wave; f = wave.open('$work/silence.wav', 'wb'); f.setnchannels(2); f.setsampwidth(2); f.setframerate(48000); f.writeframes(bytes(48000 * 4 * 600))"
+    "${pw_env[@]}" pw-play --target headphones -P '{ application.name = "Firefox" media.name = "Lecture video" }' "$work/silence.wav" >/dev/null 2>&1 & pids+=($!)
+fi
+
 qs_env=(env -i "${base_env[@]}" PATH="$P" XDG_DATA_HOME="$H/.local/share"
         WAYLAND_DISPLAY="$nested_wl" HYPRLAND_INSTANCE_SIGNATURE="$sig" XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=Hyprland)
 if [ -x "$GL" ]; then "${qs_env[@]}" "$GL" "$QS" -n --no-color > "$QLOG" 2>&1 &
@@ -266,7 +437,7 @@ tpids=()
 term() {   # term TITLE FILE THEME
     env -i "${base_env[@]}" PATH="/usr/bin:/bin:$HOME/.local/bin" XDG_DATA_HOME="$H/.local/share" \
         WAYLAND_DISPLAY="$nested_wl" GDK_BACKEND=wayland \
-        ghostty --gtk-single-instance=false --title="$1" --confirm-close-surface=false --theme="$3" \
+        ghostty --gtk-single-instance=false --title="$1" --confirm-close-surface=false --theme="$3" --cursor-style-blink=false --cursor-opacity=0 \
         -e sh -c "bat --paging=never --style=numbers --color=always --theme=ansi '$2' 2>/dev/null || cat '$2'; exec sleep 3600" \
         >/dev/null 2>&1 &
     tpids+=($!); pids+=($!)
@@ -295,8 +466,9 @@ kbd() { [ -n "$ptests" ] && env -i XDG_RUNTIME_DIR="$R" WAYLAND_DISPLAY="$nested
 notify() { env DBUS_SESSION_BUS_ADDRESS="$bus_addr" /usr/bin/notify-send "$@"; }
 
 if [ "$hold" = 1 ]; then
-    { declare -p R sig nested_wl bus_addr H P QS SHOT out work ptests base_env qs_env
-      declare -f hc qsi shoot ptr kbd notify layer_on until_layer until_gone until_jq term terms_on terms_off; } > "$work/env.sh"
+    { declare -p R sig nested_wl bus_addr sbus_addr H P QS GL SHOT out work ptests base_env qs_env venv dark_file src only anim
+      declare -f hc qsi shoot ptr kbd notify layer_on until_layer until_gone until_jq term terms_on terms_off want record
+      echo ". $(dirname "$(readlink -f "$0")")/desktop-shots-gallery"; } > "$work/env.sh"
     echo "holding: source $work/env.sh; touch $work/stop to end"
     until [ -e "$work/stop" ]; do sleep 1; alive || break; done
     exit 0
@@ -397,8 +569,9 @@ done
 # ---- animations (dark): wf-recorder for SECONDS, then animated WebP ----
 record() {   # record NAME SECONDS FILTER ACTION...: ACTION runs in the background while recording
     local name=$1 secs=$2 vf=$3; shift 3
-    want "$name" || return 0
+    want "${name%%/*}" || return 0
     command -v wf-recorder >/dev/null || { echo "  $name: no wf-recorder" >&2; return 0; }
+    mkdir -p "$(dirname "$work/$name.mkv")" "$(dirname "$out/$name")"
     env XDG_RUNTIME_DIR="$R" WAYLAND_DISPLAY="$nested_wl" timeout -s INT "$secs" \
         wf-recorder -o "$SHOT" -r 30 -c libx264rgb -p crf=0 -p preset=ultrafast -f "$work/$name.mkv" >/dev/null 2>&1 &
     local rp=$!; sleep 0.6; "$@" & local ap=$!; wait "$rp"; wait "$ap" 2>/dev/null
@@ -430,6 +603,9 @@ if [ "$anim" = 1 ]; then
     record anim-island 6 "crop=960:200:480:0,fps=24" a_island
 fi
 
+# ---- the gallery: every other view (desktop-shots-gallery) ----
+if want gallery; then . "$(dirname "$(readlink -f "$0")")/desktop-shots-gallery"; gallery_main; fi
+
 # ---- the editor: needs the virtual keyboard, whose US keymap shows in the bar's layout pill from
 # here on, so it comes after everything else (the island is off meanwhile: it would announce the keymap)
 if want editor; then
@@ -452,6 +628,7 @@ if want editor; then
     done
     qsi call island on >/dev/null
 fi
+want gallery && gallery_keys
 
 if [ -n "$keys" ]; then   # the key-binding page, from the published config's bindings
     hc -j binds > "$work/binds.json" && mkdir -p "$(dirname "$keys")" && "$HOME/.local/bin/keybind-sheet" --binds "$work/binds.json" --org "$keys"
@@ -459,6 +636,7 @@ fi
 alive || echo "desktop-shots: the shell died during the run (pictures may be incomplete)" >&2
 # ---- the lock screen, last: there is no unlocking it. It reads the theme once at start, so one lock
 # per mode (allow_session_lock_restore lets a new lock client take over from a killed one).
+want gallery && gallery_late
 if want lock; then
     for mode in $modes; do
         [ "$mode" = dark ] && echo true > "$dark_file" || echo false > "$dark_file"
@@ -468,7 +646,7 @@ if want lock; then
     done
 fi
 if command -v pngquant >/dev/null; then   # palette PNGs, about a quarter of the size; they live in git
-    for f in "$out"/*-dark.png "$out"/*-light.png; do
+    for f in "$out"/*-dark.png "$out"/*-light.png "$out"/gallery/*.png; do
         [ -f "$f" ] && [ "$f" -nt "$work/started" ] && pngquant --quality 65-90 --speed 1 --strip -f --ext .png "$f" 2>/dev/null
     done
 fi

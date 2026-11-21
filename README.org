@@ -19,7 +19,7 @@ The wallpaper is a set of animated shaders, here sped up:
 
 #+HTML: <img src="screenshots/anim-wallpaper.avif" alt="wallpaper animation">
 
- Every picture and animation is taken by =desktop-shots= in a staged session with made-up data; see [[#how-the-screenshots-are-made][how the screenshots are made]]. More pictures (launcher modes, every wallpaper scene, the island, the pet) are in [[file:docs/shell.org][docs/shell.org]].
+ Every picture and animation is taken by =desktop-shots= in a staged session with made-up data; see [[#how-the-screenshots-are-made][how the screenshots are made]]. The [[file:docs/gallery.org][gallery]] has the rest: about 75 pictures and clips, one for every popup, mode, page and overlay.
 
 | Dark | Light |
 |------+-------|
@@ -52,6 +52,7 @@ The wallpaper is a set of animated shaders, here sped up:
 
 | Page | About |
 |------+-------|
+| [[file:docs/gallery.org][docs/gallery.org]] | A picture of every interactive part: each bar popup, launcher mode and settings page, the overlays, the pet, and clips of drag-to-place, resizing and the pill buttons |
 | [[file:docs/shell.org][docs/shell.org]] | The Quickshell shell, piece by piece: bar and pills, launcher, notifications, panel, settings, dashboard, wallpaper, lock screen, lecture tools, the pet |
 | [[file:docs/keybindings.org][docs/keybindings.org]] | Every key binding, grouped (generated from the config) |
 | [[file:docs/theming.org][docs/theming.org]] | Colours: the palette, dark and light by time of day, recolouring everything with =palette= |

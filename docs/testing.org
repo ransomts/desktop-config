@@ -44,6 +44,19 @@ Each suite runs in its own temporary =HOME=, runtime directory and D-Bus session
 
 * Screenshots
 
+The staged session has stand-ins for everything the shell would otherwise read from the machine:
+
+| What | Stand-in |
+|------+----------|
+| Battery, power profiles, Wi-Fi, Bluetooth | =desktop-shots-fakes=: python-dbusmock's UPower, power-profiles, NetworkManager and BlueZ templates, on a private bus that only looks like the system bus |
+| Music | the same script's made-up MPRIS player, with a generated cover |
+| Sound | a private PipeWire and WirePlumber in the temporary runtime directory, with the ALSA, Bluetooth and camera monitors switched off, and virtual speakers, headphones, microphone and one app playing silence |
+| Webcam | a generated picture where the bubble expects its frames; the camera reader is a stub, so no camera is opened |
+| Calendar, mail, Teams, tabs, clipboard, notes, lights, health | made-up files and small scripts in the temporary home |
+| Wi-Fi list, clipboard history | stub =nmcli= and =cliphist= that print made-up lines |
+
+python-dbusmock lives in a virtualenv (=~/.local/share/desktop-shots/venv=), made on first use.
+
 =desktop-shots= takes the pictures in =screenshots/= and writes =docs/keybindings.org=:
 
 1. It copies the config from this repo's =home/= (what is published, not my live files) into a temporary home.
@@ -54,7 +67,8 @@ Each suite runs in its own temporary =HOME=, runtime directory and D-Bus session
 6. Animations: =wf-recorder= records the nested screen for a few seconds while a script does something (sends a notification, switches the theme, has the island speak), and =ffmpeg= turns the clip into an animated WebP, which GitHub shows like a picture.
 7. The screenshot editor, driven by =vptr= and =vkbd= (a virtual keyboard: real key presses, so tool keys work). It comes late because the virtual keyboard's US keymap shows in the bar's layout pill from then on.
 8. The lock screen, last, since nothing unlocks it: one lock per mode, killing the first and starting the second (=allow_session_lock_restore=).
-9. It dumps the nested session's bindings and runs =keybind-sheet --org= on them, then shrinks the PNGs with =pngquant=.
+9. The gallery (=desktop-shots-gallery=): every bar popup, launcher mode and settings page, the overlays, the pet's pages, the wallpaper effects, and four interaction clips. Each still is cropped to what the view added: a picture from just before it opened is compared with one after. Stills are AVIF at full colour resolution, a sixth the size of a PNG.
+10. It dumps the nested session's bindings and runs =keybind-sheet --org= on them, then shrinks the PNGs with =pngquant=.
 
 #+begin_src sh
 desktop-shots                      # all shots, both modes

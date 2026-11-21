@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""Stand-in system services for desktop-shots' staged session, so the Wi-Fi, Bluetooth, battery,
+power-profile and music views have something made-up to show.
+
+    desktop-shots-fakes SYSTEM_BUS_ADDRESS SESSION_BUS_ADDRESS ART.png
+
+Runs until killed. On the stand-in "system" bus (a private dbus-daemon, never the real one):
+python-dbusmock's upower, networkmanager, bluez5 and power_profiles_daemon templates, filled
+with demo devices. On the private session bus: an MPRIS player ("Demo Player") that claims to be
+playing a made-up track with ART.png as its cover. Nothing here touches real hardware.
+Needs python-dbusmock; desktop-shots keeps it in ~/.local/share/desktop-shots/venv.
+"""
+import json, os, subprocess, sys, time
+import dbus, dbus.service, dbus.mainloop.glib
+from gi.repository import GLib
+
+sysbus_addr, sesbus_addr, art = sys.argv[1], sys.argv[2], sys.argv[3]
+MOCK = "org.freedesktop.DBus.Mock"
+procs = []
+
+
+def spawn(template, name, path, params=None, iface=MOCK):
+    """Start one dbusmock template on the stand-in system bus; return its Mock interface."""
+    env = dict(os.environ, DBUS_SYSTEM_BUS_ADDRESS=sysbus_addr)
+    args = [sys.executable, "-m", "dbusmock", "--system", "--template", template]
+    if params:
+        args += ["--parameters", json.dumps(params)]
+    procs.append(subprocess.Popen(args, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+    bus = dbus.bus.BusConnection(sysbus_addr)
+    for _ in range(100):
+        try:
+            return bus, dbus.Interface(bus.get_object(name, path), iface)
+        except dbus.exceptions.DBusException:
+            time.sleep(0.05)
+    raise SystemExit(f"desktop-shots-fakes: {template} did not start")
+
+
+def battery():          # 64 %, discharging, about 3 h 20 min left
+    _, up = spawn("upower", "org.freedesktop.UPower", "/org/freedesktop/UPower", {"OnBattery": True})
+    up.AddDischargingBattery("BAT0", "Demo battery", 64.0, 12000)
+    up.SetupDisplayDevice(2, 2, 64.0, 50.0, 80.0, 10.0, 12000, 0, True, "battery-good-symbolic", 1)
+    # properties the template leaves out; without them the shell does not count the device as ready, so
+    # the low-battery warning never fires. Each on its own: some exist on one device and not the other.
+    bus = dbus.bus.BusConnection(sysbus_addr)
+    extra = {"PowerSupply": True, "Capacity": dbus.Double(96.0), "NativePath": "BAT0", "Model": "Demo battery",
+             "Vendor": "Demo", "EnergyRate": dbus.Double(10.0), "TimeToFull": dbus.Int64(0), "IconName": "battery-good-symbolic"}
+    for path in ("/org/freedesktop/UPower/devices/DisplayDevice", "/org/freedesktop/UPower/devices/BAT0"):
+        mock = dbus.Interface(bus.get_object("org.freedesktop.UPower", path), MOCK)
+        for k, v in extra.items():
+            try:
+                mock.AddProperty("org.freedesktop.UPower.Device", k, v)
+            except dbus.exceptions.DBusException:
+                pass                                  # already there
+
+
+def profiles():
+    spawn("upower_power_profiles_daemon", "org.freedesktop.UPower.PowerProfiles", "/org/freedesktop/UPower/PowerProfiles")
+
+
+def wifi():             # one card, four networks, connected to the first
+    _, nm = spawn("networkmanager", "org.freedesktop.NetworkManager", "/org/freedesktop/NetworkManager")
+    dev = nm.AddWiFiDevice("wlan0", "wlan0", 100)                    # 100: activated
+    aps = []
+    for i, (ssid, strength, sec) in enumerate([("Campus", 82, 0x100), ("Library-5G", 64, 0x100),
+                                              ("Coffee Shop", 41, 0x0), ("Lab Guest", 23, 0x0)]):
+        aps.append(nm.AddAccessPoint(dev, f"ap{i}", ssid, f"00:11:22:33:44:5{i}", 2,
+                                     5180 if "5G" in ssid else 2437, 54000, strength, sec))
+    conn = nm.AddWiFiConnection(dev, "campus", "Campus", "wpa-psk")
+    nm.AddActiveConnection([dev], conn, aps[0], "campusactive", 2)
+    nm.SetConnectivity(4)                                             # full
+    # Quickshell asks for GetAllDevices, which the template lacks
+    nm.AddMethod("org.freedesktop.NetworkManager", "GetAllDevices", "", "ao",
+                 "ret = self.Get('org.freedesktop.NetworkManager', 'Devices')")
+
+
+def bluetooth():        # one adapter, three devices, the headphones connected
+    _, bz = spawn("bluez5", "org.bluez", "/", iface="org.bluez.Mock")
+    bz.AddAdapter("hci0", "demo-laptop")
+    for i, alias in enumerate(["Headphones", "Keyboard", "Trackball"]):
+        bz.AddDevice("hci0", f"00:11:22:33:44:5{i + 4}", alias)
+        if i == 0:
+            for call in (bz.PairDevice, bz.ConnectDevice):
+                try:
+                    call("hci0", f"00:11:22:33:44:5{i + 4}")
+                except dbus.exceptions.DBusException:
+                    pass
+
+
+for part in (battery, profiles, wifi, bluetooth):    # each on its own: one failing leaves the others
+    try:
+        part()
+    except Exception as e:                            # noqa: BLE001
+        print(f"desktop-shots-fakes: {part.__name__}: {e}", file=sys.stderr, flush=True)
+
+
+# Music: an MPRIS player on the private session bus.
+class Player(dbus.service.Object):
+    IF, PL, PROPS = "org.mpris.MediaPlayer2", "org.mpris.MediaPlayer2.Player", "org.freedesktop.DBus.Properties"
+
+    def __init__(self, bus):
+        self.name = dbus.service.BusName("org.mpris.MediaPlayer2.demo", bus)
+        super().__init__(bus, "/org/mpris/MediaPlayer2")
+        self.t0 = time.time() - 74
+        self.props = {
+            self.IF: {"Identity": "Demo Player", "CanQuit": False, "CanRaise": False, "HasTrackList": False,
+                      "DesktopEntry": "", "SupportedUriSchemes": dbus.Array([], "s"),
+                      "SupportedMimeTypes": dbus.Array([], "s")},
+            self.PL: {"PlaybackStatus": "Playing", "LoopStatus": "None", "Rate": 1.0, "Shuffle": False,
+                      "Volume": 0.8, "MinimumRate": 1.0, "MaximumRate": 1.0,
+                      "CanGoNext": True, "CanGoPrevious": True, "CanPlay": True, "CanPause": True,
+                      "CanSeek": True, "CanControl": True,
+                      "Metadata": dbus.Dictionary({
+                          "mpris:trackid": dbus.ObjectPath("/demo/track/1"),
+                          "mpris:length": dbus.Int64(214_000_000),
+                          "mpris:artUrl": "file://" + os.path.abspath(art),
+                          "xesam:title": "Orange Evening", "xesam:artist": dbus.Array(["The Demo Band"], "s"),
+                          "xesam:album": "Made-up Songs"}, "sv")}}
+
+    @dbus.service.method(PROPS, in_signature="ss", out_signature="v")
+    def Get(self, iface, prop):
+        if iface == self.PL and prop == "Position":
+            return dbus.Int64(int((time.time() - self.t0) * 1e6) % 214_000_000)
+        return self.props[iface][prop]
+
+    @dbus.service.method(PROPS, in_signature="s", out_signature="a{sv}")
+    def GetAll(self, iface):
+        d = dict(self.props.get(iface, {}))
+        if iface == self.PL:
+            d["Position"] = self.Get(iface, "Position")
+        return d
+
+    @dbus.service.method(PROPS, in_signature="ssv")
+    def Set(self, iface, prop, value):
+        pass
+
+    @dbus.service.signal(PROPS, signature="sa{sv}as")
+    def PropertiesChanged(self, iface, changed, invalidated):
+        pass
+
+    @dbus.service.signal(PL, signature="x")
+    def Seeked(self, pos):
+        pass
+
+    @dbus.service.method(PL)
+    def Next(self): pass
+
+    @dbus.service.method(PL)
+    def Previous(self): pass
+
+    def status(self, st):
+        self.props[self.PL]["PlaybackStatus"] = st
+        self.PropertiesChanged(self.PL, {"PlaybackStatus": st}, [])
+
+    @dbus.service.method(PL)
+    def Pause(self): self.status("Paused")
+
+    @dbus.service.method(PL)
+    def PlayPause(self):
+        self.status("Paused" if self.props[self.PL]["PlaybackStatus"] == "Playing" else "Playing")
+
+    @dbus.service.method(PL)
+    def Stop(self): pass
+
+    @dbus.service.method(PL)
+    def Play(self): self.status("Playing")
+
+    @dbus.service.method(PL, in_signature="x")
+    def Seek(self, off):
+        pass
+
+    @dbus.service.method(PL, in_signature="ox")
+    def SetPosition(self, track, pos):
+        pass
+
+
+dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+session = dbus.bus.BusConnection(sesbus_addr)
+player = Player(session)
+print("ready", flush=True)
+try:
+    GLib.MainLoop().run()
+finally:
+    for p in procs:
+        p.terminate()
