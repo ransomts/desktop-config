@@ -76,6 +76,9 @@ class Link:
         GLib.idle_add(ui.on_state, "waiting")
         async with CONNECTING:
             GLib.idle_add(ui.on_state, "connecting")
+            # a leftover BlueZ link (e.g. brought back up on resume) hides the light from scans
+            if await asyncio.get_running_loop().run_in_executor(None, gvm.release_stale, [self.addr]):
+                await asyncio.sleep(1)
             dev = None
             for _ in range(3):
                 dev = await gvm.BleakScanner.find_device_by_address(self.addr, timeout=8)
@@ -133,6 +136,63 @@ class Link:
                 GLib.idle_add(self.panel.on_values, {item[1]: item[2]}, True)
             elif item[0] == "range":  # colour temperature range in K/100
                 GLib.idle_add(self.panel.on_range, item[1], item[2])
+
+
+class Control:
+    """The window's socket (gvm.SOCKET): `gvm on|off|toggle|preset|status` and the bar's light
+    pill reach the lights through it while this window holds them. One JSON request per
+    connection, one JSON reply; `handle(request) -> reply` runs on the GTK main loop."""
+
+    def __init__(self, handle):
+        self.handle = handle
+        self.server = None
+
+    async def start(self):
+        path = gvm.SOCKET
+        if os.path.exists(path):
+            if await asyncio.get_running_loop().run_in_executor(None, lambda: gvm.ask_window({"cmd": "ping"}, 1)):
+                return False  # another window already answers (e.g. `gvm-gui light2` beside this one)
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.server = await asyncio.start_unix_server(self._client, path=path)
+        return True
+
+    async def _client(self, reader, writer):
+        import concurrent.futures, json
+        try:
+            line = await asyncio.wait_for(reader.readline(), 5)
+            try:
+                req = json.loads(line)
+            except ValueError:
+                req = None
+            fut = concurrent.futures.Future()
+
+            def run():
+                try:
+                    fut.set_result(self.handle(req) if isinstance(req, dict) else {"errors": [["", "bad request"]]})
+                except Exception as e:  # noqa: BLE001
+                    fut.set_result({"errors": [["", f"{type(e).__name__}: {e}"]]})
+                return False
+            GLib.idle_add(run)
+            reply = await asyncio.wrap_future(fut)
+            writer.write((json.dumps(reply) + "\n").encode())
+            await writer.drain()
+        except (OSError, asyncio.TimeoutError):
+            pass
+        finally:
+            writer.close()
+
+    def stop(self):
+        if self.server:
+            self.server.close()
+            self.server = None
+            try:
+                os.unlink(gvm.SOCKET)
+            except OSError:
+                pass
 
 
 class LightPanel(Gtk.Box):
@@ -256,6 +316,7 @@ class LightPanel(Gtk.Box):
             now = GLib.get_monotonic_time() / 1e6
             self.sent[reg] = [(v, t) for v, t in self.sent.get(reg, []) if now - t < 3] + [(val, now)]
             self.link.set(reg, val)
+            self.window.save_state_soon()
         if not self.mirroring:
             self.window.touched(self)
             self.window.mirror(self, what, value)
@@ -352,6 +413,7 @@ class LightPanel(Gtk.Box):
                 current = self.register_values()
                 external = [(r, v) for r, v in vals.items() if r in current and current[r] != v]
         self.apply_values(vals)
+        self.window.save_state_soon()
         if not single and not self.known:
             self.known = True
             self.window.panel_ready(self)
@@ -507,6 +569,69 @@ class Window(Adw.ApplicationWindow):
         if not self.closed:
             self.closed = True
             self.close_links()
+        return False
+
+    # --- the control socket and the state file (gvm, the bar's light pill) ---
+    def remote(self, req):
+        """Carry out a request from `gvm` (Control): {"cmd", "lights": [names] | None, "name"}.
+        Reply {"out": [[light, text]], "errors": [[light, text]], "missing": [names]}: missing =
+        not in this window, or its connection failed, so gvm may try them directly."""
+        cmd = req.get("cmd")
+        if cmd == "ping":
+            return {"ok": True}
+        want = req.get("lights")
+        mine = {p.name for p in self.panels}
+        panels = [p for p in self.panels if want is None or p.name in want]
+        missing = [n for n in (want or []) if n not in mine]
+        out, errors, ready = [], [], []
+        for p in panels:
+            if p.known:
+                ready.append(p)
+            elif p.failed():
+                missing.append(p.name)
+            else:
+                errors.append([p.name, "still connecting in the lights window"])
+        if cmd not in gvm.REMOTE_CMDS:
+            return {"errors": [["", f"the lights window can't do {cmd!r}"]]}
+        pdef = None
+        if cmd == "preset":
+            pdef = gvm.load_presets().get(req.get("name") or "")
+            if not pdef:
+                return {"errors": [["", f"no preset {req.get('name')!r}"]]}
+        if cmd != "status" and ready and self.fx_task:  # the request replaces a running effect: no restore
+            self.fx_run["restore"] = False
+            self.fx_task.cancel()
+        if cmd == "preset":
+            settings = [(p, gvm.preset_settings(pdef, p.name)) for p in ready]
+            if self.synced.get_active() and len({json_key(st) for _, st in settings if st}) > 1:
+                self.synced.set_active(False)  # lights set differently can't stay synced
+            for p, st in settings:
+                if st:
+                    p.apply_settings(st)
+                else:
+                    out.append([p.name, "not in this preset, left alone"])
+        for p in ready:
+            if cmd in ("on", "off"):
+                p.apply("power", cmd == "on")
+            elif cmd == "toggle":
+                p.apply("power", not p.power.get_active())
+                out.append([p.name, "on" if p.power.get_active() else "off"])
+            elif cmd == "status":
+                st = gvm.regs_to_state(p.register_values())
+                colour = f"colour hue {st['hue']}° sat {st['sat']}%" if st["mode"] == "colour" else f"white {st['cct']}K"
+                out.append([p.name, f"{'on' if st['on'] else 'off'}  bright {st['bright']}%  {colour}  (lights window)"])
+        self.save_state_soon()
+        return {"ok": not errors, "out": out, "errors": errors, "missing": missing}
+
+    def save_state_soon(self):
+        """Write the lights' settings to gvm.STATE_FILE once they have been still for a moment."""
+        if getattr(self, "_state_timer", 0):
+            GLib.source_remove(self._state_timer)
+        self._state_timer = GLib.timeout_add(700, self._save_state)
+
+    def _save_state(self):
+        self._state_timer = 0
+        gvm.record_state({p.name: gvm.regs_to_state(p.register_values()) for p in self.panels if p.known}, "window")
         return False
 
     # --- presets ---
@@ -764,21 +889,39 @@ class App(Adw.Application):
         self.lights = lights
 
     def do_activate(self):
+        first = self.get_active_window() is None
         win = self.get_active_window() or Window(self, self.lights)
         win.present()
+        if first:
+            self.control = Control(win.remote)
+            asyncio.run_coroutine_threadsafe(self.control.start(), LOOP)
 
     def do_startup(self):
         Adw.Application.do_startup(self)
         import signal
         for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, self.quit)
+            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, self.on_signal)
 
-    def do_shutdown(self):
-        # however the app ends (window closed, killed, logout), give the lights back
+    def release_lights(self):
+        control = getattr(self, "control", None)
+        if control:  # nothing more may come in once the links are going
+            LOOP.call_soon_threadsafe(control.stop)
+            self.control = None
         for w in self.get_windows():
             if isinstance(w, Window) and not w.closed:
                 w.closed = True
                 w.close_links()
+
+    def on_signal(self):
+        # killed or logged out: drop the links while the windows still exist (by
+        # do_shutdown they can be gone, and BlueZ would keep both lights held)
+        self.release_lights()
+        self.quit()
+        return GLib.SOURCE_REMOVE
+
+    def do_shutdown(self):
+        # however the app ends (window closed, killed, logout), give the lights back
+        self.release_lights()
         Adw.Application.do_shutdown(self)
 
 

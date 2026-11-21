@@ -15,6 +15,8 @@ Singleton {
     readonly property string mic: "\uDB80\uDF6C"
     readonly property string micMuted: "\uDB80\uDF6D"
     readonly property string keyboard: "\uDB80\uDF0C"
+    readonly property string lightOn: "\uDB81\uDEE8"      // md lightbulb-on: the GVM lights, last known on
+    readonly property string lightOff: "\uDB80\uDF36"     // md lightbulb-outline: off, or not known
     readonly property string volLow: "\uDB81\uDD7F"
     readonly property string volMid: "\uDB81\uDD80"
     readonly property string volHigh: "\uDB81\uDD7E"

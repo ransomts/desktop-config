@@ -74,7 +74,9 @@ base_env=(HOME="$H" USER="$USER" LANG="${LANG:-C.UTF-8}" PATH="$tests/stubs:$PAT
     XDG_DATA_HOME="$HOME/.local/share" XDG_DATA_DIRS="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
     DBUS_SESSION_BUS_ADDRESS="$bus_addr" HYPR_TEST_LOG="$LOG" NO_AT_BRIDGE=1 GTK_A11Y=none)
 
-env -i "${base_env[@]}" WAYLAND_DISPLAY="$live_wl" HYPRLAND_NO_SD_VARS=1 HYPRLAND_NO_SD_NOTIFY=1 \
+# LIBSEAT_BACKEND=seatd: the nested one still probes DRM; libseat's builtin backend would fork a seatd
+# child whose exit() runs Hyprland's destructors and dumps core on every run (2026-11-18).
+env -i "${base_env[@]}" WAYLAND_DISPLAY="$live_wl" LIBSEAT_BACKEND=seatd HYPRLAND_NO_SD_VARS=1 HYPRLAND_NO_SD_NOTIFY=1 \
     Hyprland -c "$H/.config/hypr/hyprland.lua" > "$work/hyprland.out" 2>&1 &
 hypr_pid=$!
 

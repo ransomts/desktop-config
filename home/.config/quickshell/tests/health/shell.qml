@@ -30,6 +30,8 @@ ShellRoot {
         readonly property real t0: Date.parse("2026-11-14T09:00:00-05:00")
         property var fires: []
         Connections { target: Health; function onNewFailure(job) { win.fires = win.fires.concat([job.id]) } }
+        property var back: []
+        Connections { target: Health; function onRecovered(job) { win.back = win.back.concat([job.id]) } }
 
         function ago(min) { return new Date(t0 - min * 60000).toISOString() }
         function job(id, name, state, why, sinceMin) {
@@ -147,9 +149,30 @@ ShellRoot {
                 check("a job that appears already bad does not fire", win.fires.length === 0, JSON.stringify(win.fires))
                 return 50
             } },
+            { name: "healing", run: function() {
+                win.fires = []; win.back = []
+                feed(allOk())
+                feed([job("pull-mail", "Mail sync", "healing", "waiting for its first run since start-up or wake, due in 1 min; last worked 9 h ago", 540),
+                      job("davmail", "DavMail", "ok", "running since 3 h", 180)])
+                check("healing alone: worst ok, nothing bad, nothing fired", Health.worst === "ok" && Health.bad.length === 0 && win.fires.length === 0)
+                check("pill shows a quiet recovering count", pill.visible && pill.text === "↻ 1" && Qt.colorEqual(pill.ink, Theme.faint), pill.text)
+                check("its tooltip says what it waits for", pill.tip.indexOf("Recovering") >= 0 && pill.tip.indexOf("due in 1 min") > 0, pill.tip)
+                check("status names it after ok", Health.summary().indexOf("ok; recovering: Mail sync") === 0, Health.summary())
+                check("the popup lists it with a Log link", list.children.length > 0 && Health.healing.length === 1)
+                feed(mailBad("stale"))
+                check("healing that runs out of grace fires", win.fires.join() === "pull-mail", JSON.stringify(win.fires))
+                feed(allOk())
+                check("stale to ok: recovered fires", win.back.join() === "pull-mail", JSON.stringify(win.back))
+                feed([job("pull-mail", "Mail sync", "healing", "last run failed", 1), job("davmail", "DavMail", "ok", "x", 180)]); feed(allOk())
+                check("healing to ok: no recovered message", win.back.length === 1, JSON.stringify(win.back))
+                feed([job("pull-mail", "Mail sync", "healing", "x", 540), job("davmail", "DavMail", "failed", "not running", 2)])
+                check("something bad and something healing: bad wins the pill, the tooltip lists both", pill.text === "⚠ 1" && pill.tip.indexOf("Recovering") > 0, pill.tip)
+                feed(allOk()); win.fires = []; win.back = []
+                return 50
+            } },
             { name: "ordering", run: function() {
-                feed([job("a", "Alpha", "ok", "fine", 1), job("c", "Cee", "stale", "late", 500), job("b", "Bee", "failed", "broken", 30), job("o", "Off", "off", "x", -1)])
-                check("jobs: failed, stale, ok, off", Health.jobs.map(j => j.state).join() === "failed,stale,ok,off", Health.jobs.map(j => j.state).join())
+                feed([job("h", "Aitch", "healing", "due soon", 600), job("a", "Alpha", "ok", "fine", 1), job("c", "Cee", "stale", "late", 500), job("b", "Bee", "failed", "broken", 30), job("o", "Off", "off", "x", -1)])
+                check("jobs: failed, stale, healing, ok, off", Health.jobs.map(j => j.state).join() === "failed,stale,healing,ok,off", Health.jobs.map(j => j.state).join())
                 check("bad: failed first", Health.bad[0].id === "b" && Health.bad[1].id === "c")
                 return 80
             } },

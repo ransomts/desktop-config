@@ -57,7 +57,7 @@ Singleton {
     function nextScene() { store.scene = scenes[(scenes.indexOf(store.scene) + 1) % scenes.length]; return store.scene }
     function setEffect(name, on) { if (effects.indexOf(name) >= 0 || name === "pillbars") store[name] = on }
     function status() {
-        return (store.hidden ? "hidden" : store.running ? "on" : "still") + (moving || !store.running || store.hidden ? "" : hot ? " (still: fan busy, " + Math.round(fanAvg) + " rpm avg, " + Math.round(cpuTemp) + " C)" : " (still: on battery)")
+        return (store.hidden ? "hidden" : forced ? "forced" : store.running ? "on" : "still") + (moving || !store.running || store.hidden ? "" : hot ? " (still: fan busy, " + Math.round(fanAvg) + " rpm avg, " + Math.round(cpuTemp) + " C)" : " (still: on battery)")
             + " scene=" + store.scene + " speed=" + store.speed + " fps=" + store.fps
             + " " + effects.map(e => e + "=" + (store[e] ? "on" : "off")).join(" ")
             + " weather:" + (wxDemo || "auto") + " rain=" + wxRain.toFixed(2) + " fog=" + wxFog.toFixed(2) + " snow=" + wxSnow.toFixed(2)
@@ -65,7 +65,7 @@ Singleton {
     }
 
     // ---- animation clock: counts only time spent moving, so it resumes where it froze ----
-    // Moves on mains power only; on battery every scene holds its frame.
+    // Moves on mains power only; on battery every scene holds its frame (unless forced, below).
     // ---- heat guard: fan speed and CPU package temperature, read every 5 s while it matters ----
     // The temperature says little on this laptop: the fan switches on at about 72 C and off
     // at 69 C, so the CPU sits at 70 C whatever it is doing (measured 2026-11-12, docked: 70.4 C
@@ -82,7 +82,7 @@ Singleton {
     property var fanLog: []
     property bool hot: false
     readonly property int fanResume: Math.round(store.fanMax * 0.8)
-    readonly property bool guarding: live && store.heat && store.running && !store.hidden && !UPower.onBattery
+    readonly property bool guarding: live && store.heat && store.running && !store.hidden && !UPower.onBattery && !forced
     onGuardingChanged: if (!guarding) { hot = false; fanLog = []; fanAvg = 0 }
     Process {
         id: tempGet
@@ -112,7 +112,18 @@ Singleton {
         running: ws.guarding
         onTriggered: if (!tempGet.running) tempGet.running = true
     }
-    readonly property bool moving: live && store.running && !store.hidden && !UPower.onBattery && !(store.heat && hot)
+    // Forced: moves on battery and through the heat guard too. Not saved, so a restart never
+    // brings it back, and it lets go whenever the laptop is plugged in or unplugged, or the
+    // mode is set to anything else.
+    property bool forced: false
+    function force(on) { forced = on; if (on) { store.hidden = false; store.running = true } }
+    Connections { target: UPower; function onOnBatteryChanged() { ws.forced = false } }
+    Connections {
+        target: store
+        function onRunningChanged() { if (!store.running) ws.forced = false }
+        function onHiddenChanged() { if (store.hidden) ws.forced = false }
+    }
+    readonly property bool moving: live && store.running && !store.hidden && (forced || (!UPower.onBattery && !(store.heat && hot)))
     // Blur behind the bar, panels and translucent windows has to be redone on every screen
     // each time the wallpaper changes: about three quarters of Hyprland's GPU work while a
     // scene moves (38% -> 9% measured). So blur is switched off while moving, back on when still.

@@ -49,7 +49,7 @@ SettingsPage {
         const j = Health.jobs.find(x => x.id === id) || Health.hiddenJobs.find(x => x.id === id)
         return j ? j.name : id
     }
-    function stateText(j) { return j.state === "ok" ? "working" : j.state === "off" ? "off" : j.state === "stale" ? "behind" : j.state === "failed" ? "failing" : j.state }
+    function stateText(j) { return j.state === "ok" ? "working" : j.state === "off" ? "off" : j.state === "stale" ? "behind" : j.state === "healing" ? "recovering" : j.state === "failed" ? "failing" : j.state }
 
     SettingsCard {
         title: "Jobs"

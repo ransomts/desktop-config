@@ -39,6 +39,15 @@ elif "list-units" in a:
     if os.path.exists(p):
         sys.stdout.write(open(p).read())
 '''
+FAKE_DOCKER = r'''#!/usr/bin/env python3
+import os, sys, time
+fake = os.environ["FAKE"]
+if os.path.exists(fake + "/docker-hang"):
+    time.sleep(30)
+p = fake + "/docker"
+if os.path.exists(p):
+    sys.stdout.write(open(p).read())
+'''
 FAKE_FINDMNT = r'''#!/usr/bin/env python3
 import os, sys
 fake = os.environ["FAKE"]
@@ -70,7 +79,7 @@ class Env:
         self.run_dir = self.root + "/run"
         for d in (self.fake + "/units", self.fake + "/bin", self.state, self.run_dir, self.fake + "/net"):
             os.makedirs(d)
-        for name, body in (("systemctl", FAKE_SYSTEMCTL), ("findmnt", FAKE_FINDMNT), ("gsettings", FAKE_GSETTINGS)):
+        for name, body in (("systemctl", FAKE_SYSTEMCTL), ("findmnt", FAKE_FINDMNT), ("gsettings", FAKE_GSETTINGS), ("docker", FAKE_DOCKER)):
             p = "%s/bin/%s" % (self.fake, name)
             open(p, "w").write(body)
             os.chmod(p, 0o755)
@@ -106,6 +115,9 @@ class Env:
             "Id=%s\nLoadState=%s\nActiveState=%s\nSubState=x\nResult=%s\nExecMainStatus=%s\nUnitFileState=%s\n"
             "NRestarts=%s\nActiveEnterTimestamp=%s\nLastTriggerUSec=%s\nExecMainExitTimestamp=\n"
             % (name, load, active, result, status, fstate, restarts, enter, trigger))
+
+    def docker(self, rows):
+        open(self.fake + "/docker", "w").write(rows.replace("\\n", "\n"))
 
     def rm_unit(self, name):
         os.remove("%s/units/%s" % (self.fake, name))
@@ -148,12 +160,18 @@ class Env:
         self.unit("onedrive-restart.service", active="inactive")
         self.unit("rclone-box.service", enter=NOW - 5 * H)
         self.unit("qs-socket-watch.service", enter=NOW - 20 * H)
+        self.unit("mpd.service", enter=NOW - 20 * H)
+        self.unit("teams-refresh.timer", trigger=NOW - 2 * H, enter=NOW - D)
+        self.unit("teams-refresh.service", active="inactive")
+        os.makedirs(self.fake + "/archive", exist_ok=True)
+        open(self.fake + "/archive-dev", "w").write("")
+        self.docker("synapse running healthy 2026-11-14T08:00:00Z\nmautrix-teams running healthy x\nmautrix-gmessages running none x\n")
         open(self.fake + "/mounts", "w").write("%s/Box fuse.rclone\n" % self.run_dir)
         self.gs("default", "", "true", "7")
         self.gs("cosmic", "2026-11-12T15:17:55.379354Z", "true", "7")
         self.ms("ok")
         open(self.fake + "/net/tcp", "w").write("  sl  local_address rem_address   st\n   0: 00000000:0477 00000000:0000 0A\n   1: 00000000:0438 00000000:0000 0A\n")
-        for f in ("failed", "hang"):
+        for f in ("failed", "hang", "docker-hang"):
             if os.path.exists(self.fake + "/" + f):
                 os.remove(self.fake + "/" + f)
         shutil.rmtree(self.state + "/shell-health", ignore_errors=True)
@@ -163,7 +181,9 @@ class Env:
                    SHELL_HEALTH_UPDATES=self.root + "/updates-fake", XDG_STATE_HOME=self.state, XDG_RUNTIME_DIR=self.run_dir, FAKE=self.fake,
                    PATH=self.fake + "/bin:" + os.environ["PATH"], SHELL_HEALTH_NOW=str(now),
                    SHELL_HEALTH_ROUTE=self.fake + ("/route" if online else "/noroute"), SHELL_HEALTH_NETDIR=self.fake + "/net",
-                   XDG_CURRENT_DESKTOP="Hyprland")
+                   XDG_CURRENT_DESKTOP="Hyprland", SHELL_HEALTH_WAKE="0",
+                   SHELL_HEALTH_CONFIRM="0", SHELL_HEALTH_CONNECTIVITY="full",
+                   SHELL_HEALTH_ARCHIVE_DEV=self.fake + "/archive-dev", SHELL_HEALTH_ARCHIVE_DIR=self.fake + "/archive")
         env.update(extra or {})
         t = time.time()
         p = subprocess.run([sys.executable, "-I", SH] + list(args), capture_output=True, text=True, env=env, timeout=timeout)
@@ -214,7 +234,9 @@ check("push-roam: failed unit", j["push-roam"]["state"] == "failed" and "exit 1"
 check("davmail stopped", j["davmail"]["state"] == "failed" and j["davmail"]["run"] == "systemctl --user restart davmail.service")
 check("onedrive exit 78 says resync", j["onedrive"]["state"] == "failed" and "resync" in j["onedrive"]["why"], j["onedrive"]["why"])
 check("failed ones come first in the list", [x["state"] for x in d["jobs"]][:4] == ["failed"] * 4, str([x["state"] for x in d["jobs"]]))
-check("one failing run is not a failure (the script's own threshold)", (e.streak("pull-mail", 1, 60) or True) and e.jobs()[1]["pull-mail"]["state"] == "ok")
+e.streak("pull-mail", 1, 60)
+d, j = e.jobs()
+check("one failing run is not a failure (the script's own threshold): healing, says how many more", j["pull-mail"]["state"] == "healing" and "1 more before it counts" in j["pull-mail"]["why"], j["pull-mail"]["why"])
 
 print("case: stale")
 e.healthy()
@@ -237,6 +259,68 @@ e.healthy()
 e.streak("pull-calendars", 1, 60, "microsoft-down")
 j = e.jobs()[1]
 check("calendar: Microsoft down is named, stale not failed", j["pull-calendars"]["state"] == "stale" and "Microsoft 365" in j["pull-calendars"]["why"], j["pull-calendars"]["why"])
+
+print("case: healing after start-up or wake")
+e.healthy()
+for t in ("pull-mail", "pull-calendars", "push-roam"):
+    e.streak(t, 0, 9 * H)
+e.unit("push-roam.timer", trigger=NOW - 9 * H, enter=NOW - 2 * MIN)
+open(e.fake + "/units/push-roam.timer", "a").write("NextElapseUSecRealtime=@%d\n" % (NOW + 3 * MIN))
+woke = {"SHELL_HEALTH_WAKE": str(NOW - 2 * MIN)}
+d, j = e.jobs(extra=woke)
+check("nine hours off, woke 2 min ago: healing, not stale", states(j, "pull-mail", "pull-calendars", "push-roam") == "pull-mail=healing, pull-calendars=healing, push-roam=healing", states(j, "pull-mail", "pull-calendars", "push-roam"))
+check("healing is left out of worst", d["worst"] == "ok", d["worst"])
+check("says it waits for the first run, when it is due, and when it last worked", "first run since start-up" in j["push-roam"]["why"] and "in 3 min" in j["push-roam"]["why"] and "9 h ago" in j["push-roam"]["why"], j["push-roam"]["why"])
+check("healing sorts between stale and ok", [x["state"] for x in d["jobs"]][:3] == ["healing"] * 3, str([x["state"] for x in d["jobs"]]))
+check("the weekly backups are not affected by a wake", j["matrix-backup"]["state"] == "ok")
+d, j = e.jobs(extra={"SHELL_HEALTH_WAKE": str(NOW - 20 * MIN)})
+check("woke 20 min ago, mail (limit 15 min) never ran since: stale, counted from the wake", j["pull-mail"]["state"] == "stale" and "since start-up or wake 20 min ago" in j["pull-mail"]["why"], j["pull-mail"]["why"])
+check("... calendar (limit 30 min) still healing", j["pull-calendars"]["state"] == "healing", j["pull-calendars"]["why"])
+e.streak("pull-mail", 0, 60)
+check("ran after the wake: ok", e.jobs(extra=woke)[1]["pull-mail"]["state"] == "ok")
+e.streak("pull-calendars", 0, 20 * MIN)
+d, j = e.jobs(extra=woke)
+check("ran just before the wake and not overdue: ok, and its time is the real one", j["pull-calendars"]["state"] == "ok" and "20 min ago" in j["pull-calendars"]["why"] and "backed up 2 days ago" in j["matrix-backup"]["why"], j["pull-calendars"]["why"] + " / " + j["matrix-backup"]["why"])
+e.streak("pull-calendars", 0, 9 * H)
+e.unit("pull-calendars.service", active="activating")
+check("a timer job running right now after a wake says so", "running now" in e.jobs(extra=woke)[1]["pull-calendars"]["why"])
+print("case: wake read from the journal (sleep.target loses its timestamps once collected)")
+e.healthy()
+for t in ("pull-calendars", "push-roam"):
+    e.streak(t, 0, 2 * H)
+open(e.fake + "/stat", "w").write("cpu 1 2 3\nbtime %d\n" % (NOW - 9 * H))
+open(e.fake + "/bin/journalctl", "w").write("#!/bin/sh\necho \"%d.4628 host systemd[1]: Finished systemd-suspend.service - System Suspend.\"\n" % (NOW - 2 * MIN))
+os.chmod(e.fake + "/bin/journalctl", 0o755)
+real = {"SHELL_HEALTH_WAKE": "", "SHELL_HEALTH_PROCSTAT": e.fake + "/stat"}
+d, j = e.jobs(extra=real)
+check("asleep 2 h, resumed 2 min ago per the journal: healing, not stale", states(j, "pull-calendars", "push-roam") == "pull-calendars=healing, push-roam=healing", states(j, "pull-calendars", "push-roam"))
+open(e.fake + "/bin/journalctl", "w").write("#!/bin/sh\n")
+d, j = e.jobs(extra=real)
+check("no resume this boot: graded from boot (9 h ago), so 2 h overdue is stale", j["pull-calendars"]["state"] == "stale", j["pull-calendars"]["why"])
+os.remove(e.fake + "/bin/journalctl")
+
+print("case: failures in the first minutes after a wake")
+e.healthy()
+e.streak("pull-mail", 2, 30)
+w3 = {"SHELL_HEALTH_WAKE": str(NOW - 3 * MIN)}
+j = e.jobs(extra=w3)[1]
+check("2 failures (mail's limit), both since a wake 3 min ago: healing", j["pull-mail"]["state"] == "healing" and "since waking" in j["pull-mail"]["why"], j["pull-mail"]["why"])
+e.unit("pull-mail.service", active="failed", result="exit-code", status="1")
+check("... even with the unit itself failed", e.jobs(extra=w3)[1]["pull-mail"]["state"] == "healing")
+check("woke 6 min ago: the grace is over, failed", e.jobs(extra={"SHELL_HEALTH_WAKE": str(NOW - 6 * MIN)})[1]["pull-mail"]["state"] == "failed")
+e.healthy()
+e.streak("pull-mail", 2, 5 * MIN)
+check("last failure before the wake: no grace, failed", e.jobs(extra=w3)[1]["pull-mail"]["state"] == "failed")
+e.streak("matrix-backup", 0, 1)
+e.unit("matrix-backup.service", active="failed", result="exit-code", status="1")
+check("a job off the network gets no wake grace", e.jobs(extra=w3)[1]["matrix-backup"]["state"] == "failed")
+
+e.healthy()
+e.unit("davmail.service", active="activating", restarts="1", enter=NOW - 10)
+check("a service restarting (under 3 restarts) is healing", e.jobs()[1]["davmail"]["state"] == "healing")
+e.unit("davmail.service", enter=NOW - 20)
+open(e.fake + "/net/tcp", "w").write("  sl  local_address rem_address   st\n")
+check("davmail just started, port not up yet: healing", e.jobs()[1]["davmail"]["state"] == "healing")
 
 print("case: off")
 e.healthy()
@@ -272,29 +356,38 @@ e.ms("auth")
 check("ms auth: failed, says how to sign in", "login" in e.jobs()[1]["microsoft"]["why"])
 e.ms("offline")
 check("ms offline: not a failure", e.jobs()[1]["microsoft"]["state"] == "ok")
+e.ms("down", "token error: no reply (Temporary failure in name resolution)", 2 * MIN)
+j = e.jobs(extra=w3)[1]
+check("ms down only since a wake 3 min ago: healing, not failed", j["microsoft"]["state"] == "healing" and "since waking" in j["microsoft"]["why"], j["microsoft"]["why"])
+e.ms("down", "no reply", 3 * MIN + 20)
+check("... down from a few seconds before the logged wake: still healing", e.jobs(extra=w3)[1]["microsoft"]["state"] == "healing")
+e.ms("down", "no reply", 8 * MIN)
+check("ms down since well before the wake: failed", e.jobs(extra=w3)[1]["microsoft"]["state"] == "failed")
+e.ms("down", "no reply", 5 * MIN)
+check("ms down since a wake 6 min ago: the grace is over, failed", e.jobs(extra={"SHELL_HEALTH_WAKE": str(NOW - 6 * MIN)})[1]["microsoft"]["state"] == "failed")
 e.healthy()
 open(e.fake + "/failed", "w").write("fumon-thing.service loaded failed failed Something\npull-mail.service loaded failed failed Run mbsync\n")
 d, j = e.jobs()
-check("an unknown failed unit becomes a job", j.get("unit:fumon-thing.service", {}).get("state") == "failed", str(list(j)))
+check("an unknown failed unit becomes a job, amber not red", j.get("unit:fumon-thing.service", {}).get("state") == "stale", str(j.get("unit:fumon-thing.service")))
 check("a known failed unit is not listed twice", "unit:pull-mail.service" not in j)
 
 print("case: offline")
 e.healthy()
 e.streak("pull-mail", 0, 2 * H)
 d, j = e.jobs(online=False)
-check("offline, first look: grace, not red", j["pull-mail"]["state"] == "ok" and "offline" in j["pull-mail"]["why"], j["pull-mail"]["why"])
+check("offline, first look: grace (healing), not red", j["pull-mail"]["state"] == "healing" and "offline" in j["pull-mail"]["why"], j["pull-mail"]["why"])
 check("offline: worst stays ok", d["worst"] == "ok", d["worst"])
 check("offline: an ok job says so too", "offline" in j["push-roam"]["why"], j["push-roam"]["why"])
 check("offline: the local backups are untouched by it", j["matrix-backup"]["state"] == "ok" and "offline" not in j["matrix-backup"]["why"])
 d, j = e.jobs(online=False, now=NOW + 10 * MIN)
-check("offline 10 minutes: still in grace", j["pull-mail"]["state"] == "ok")
+check("offline 10 minutes: still in grace", j["pull-mail"]["state"] == "healing")
 d, j = e.jobs(online=False, now=NOW + 50 * MIN)
 check("offline 50 minutes: counts, and says why", j["pull-mail"]["state"] == "stale" and "offline for 50 min" in j["pull-mail"]["why"], j["pull-mail"]["why"])
 d, j = e.jobs(online=True, now=NOW + 51 * MIN)
 check("back online: judged on its own again", j["pull-mail"]["state"] == "stale" and "offline" not in j["pull-mail"]["why"], j["pull-mail"]["why"])
 e.healthy()
 e.streak("pull-calendars", 6, 60)
-check("offline: a failing calendar sync also waits", e.jobs(online=False)[1]["pull-calendars"]["state"] == "ok")
+check("offline: a failing calendar sync also waits", e.jobs(online=False)[1]["pull-calendars"]["state"] == "healing")
 
 print("case: since, options and limits")
 e.healthy()
@@ -314,6 +407,152 @@ t = time.time()
 d, j = e.jobs()
 check("a hanging systemctl does not hang it (under 3.2 s)", e.took < 3.2 and d["worst"] in ("ok", "stale", "failed"), e.took)
 check("its only write is shell-health/seen.json under the state dir", sorted(os.listdir(e.state + "/shell-health")) == ["seen.json"] and not os.path.exists(e.home + "/.local/state"), str(os.listdir(e.state + "/shell-health")))
+
+
+print("case: new jobs (Teams refresh, mpd, the music card, Matrix via a fake docker)")
+e.healthy()
+d, j = e.jobs()
+check("teams-refresh, mpd, archive and matrix are ok when healthy", states(j, "teams-refresh", "mpd", "archive", "matrix") == "teams-refresh=ok, mpd=ok, archive=ok, matrix=ok", states(j, "teams-refresh", "mpd", "archive", "matrix"))
+e.unit("teams-refresh.service", active="failed", result="exit-code", status="1")
+check("teams-refresh failed: failed", e.jobs()[1]["teams-refresh"]["state"] == "failed")
+e.healthy()
+e.unit("mpd.service", active="inactive")
+check("mpd not running: failed", e.jobs()[1]["mpd"]["state"] == "failed")
+e.healthy()
+os.remove(e.fake + "/archive-dev")
+j = e.jobs()[1]
+check("music card missing: stale, says to reseat it", j["archive"]["state"] == "stale" and "reseat" in j["archive"]["why"], j["archive"]["why"])
+shutil.rmtree(e.fake + "/archive")
+check("no /mnt/archive at all: off", e.jobs()[1]["archive"]["state"] == "off")
+e.healthy()
+e.docker("synapse running unhealthy x\n")
+check("synapse unhealthy: failed", e.jobs()[1]["matrix"]["state"] == "failed")
+
+print("case: confirmation (a job is bad on two looks before it is raised)")
+c100 = {"SHELL_HEALTH_CONFIRM": "100"}
+e.healthy()
+e.jobs(extra=c100)
+e.unit("davmail.service", active="failed", result="exit-code", status="1")
+d, j = e.jobs(extra=c100, now=NOW + 2 * MIN)
+check("first bad look: healing, checking again", j["davmail"]["state"] == "healing" and "checking again" in j["davmail"]["why"] and d["worst"] == "ok", j["davmail"]["why"])
+d, j = e.jobs(extra=c100, now=NOW + 4 * MIN)
+check("second look 2 min later: failed", j["davmail"]["state"] == "failed" and d["worst"] == "failed", j["davmail"]["why"])
+e.unit("davmail.service", enter=NOW - 5 * H)
+check("working again: ok", e.jobs(extra=c100, now=NOW + 6 * MIN)[1]["davmail"]["state"] == "ok")
+e.unit("davmail.service", active="failed", result="exit-code", status="1")
+check("fails again later: confirmation starts over", e.jobs(extra=c100, now=NOW + 8 * MIN)[1]["davmail"]["state"] == "healing")
+e.healthy()
+e.jobs(extra=c100)
+open(e.fake + "/failed", "w").write("some-thing.service loaded failed failed Something\n")
+check("an unknown failed unit is confirmed too", e.jobs(extra=c100, now=NOW + 2 * MIN)[1]["unit:some-thing.service"]["state"] == "healing")
+
+print("case: online means usable, not just a route")
+for c in ("portal", "limited", "none"):
+    e.healthy()
+    e.streak("pull-mail", 0, 2 * H)
+    j = e.jobs(extra={"SHELL_HEALTH_CONNECTIVITY": c})[1]
+    check("route but connectivity %s: offline grace" % c, j["pull-mail"]["state"] == "healing" and "offline" in j["pull-mail"]["why"], j["pull-mail"]["why"])
+e.healthy()
+e.streak("pull-mail", 0, 2 * H)
+check("NetworkManager unsure (unknown): the route decides", e.jobs(extra={"SHELL_HEALTH_CONNECTIVITY": "unknown"})[1]["pull-mail"]["state"] == "stale")
+
+print("case: the wake grace for every network job")
+e.healthy()
+open(e.fake + "/mounts", "w").write("")
+j = e.jobs(extra=w3)[1]
+check("Box mount gone, first seen since a wake 3 min ago: healing", j["rclone-box"]["state"] == "healing" and "since waking" in j["rclone-box"]["why"], j["rclone-box"]["why"])
+e.healthy()
+open(e.fake + "/mounts", "w").write("")
+e.jobs(now=NOW - 10 * MIN)
+check("already gone before the wake: no grace, failed", e.jobs(extra=w3)[1]["rclone-box"]["state"] == "failed")
+e.healthy()
+e.docker("synapse running healthy x\nmautrix-teams running unhealthy x\n")
+check("a bridge unhealthy right after a wake: healing", e.jobs(extra=w3)[1]["matrix"]["state"] == "healing")
+e.healthy()
+e.unit("mpd.service", active="inactive")
+check("a local job (mpd) gets no wake grace", e.jobs(extra=w3)[1]["mpd"]["state"] == "failed")
+
+print("case: unknown is never green")
+e.healthy()
+e.jobs()
+e.unit("davmail.service", active="failed", result="exit-code", status="1")
+e.jobs(now=NOW + 2 * MIN)
+open(e.fake + "/hang", "w").write("")
+d, j = e.jobs(now=NOW + 4 * MIN)
+check("systemd too slow: the last known state stays, and says so", j["davmail"]["state"] == "failed" and "could not check just now" in j["davmail"]["why"] and d["worst"] == "failed", j["davmail"]["why"])
+check("... and nothing turns off", all(j[i]["state"] != "off" for i in ("pull-mail", "onedrive", "rclone-box", "mpd", "teams-refresh")), states(j, "pull-mail", "onedrive", "rclone-box", "mpd", "teams-refresh"))
+e.healthy()
+open(e.fake + "/hang", "w").write("")
+j = e.jobs()[1]
+check("systemd too slow with nothing known yet: healing, could not check yet", j["davmail"]["state"] == "healing" and "could not check yet" in j["davmail"]["why"], j["davmail"]["why"])
+e.healthy()
+e.jobs()
+open(e.fake + "/docker-hang", "w").write("")
+j = e.jobs(now=NOW + 2 * MIN)[1]
+check("Docker too slow: Matrix keeps its last state, not off", j["matrix"]["state"] == "ok" and "could not check" in j["matrix"]["why"], j["matrix"]["why"])
+
+print("case: restarts are counted over the last hour")
+e.healthy()
+e.unit("davmail.service", enter=NOW - 5 * D, restarts="5")
+j = e.jobs()[1]
+check("5 restarts over its lifetime, none known recent: ok", j["davmail"]["state"] == "ok" and "restarted" not in j["davmail"]["why"], j["davmail"]["why"])
+check("an hour later, still 5: ok", e.jobs(now=NOW + 61 * MIN)[1]["davmail"]["state"] == "ok")
+e.unit("davmail.service", enter=NOW - 5 * D, restarts="9")
+j = e.jobs(now=NOW + 62 * MIN)[1]
+check("4 more within the hour: stale, says how many", j["davmail"]["state"] == "stale" and "4 times in the last hour" in j["davmail"]["why"], j["davmail"]["why"])
+check("two hours on, no new ones: ok again", e.jobs(now=NOW + 3 * H)[1]["davmail"]["state"] == "ok")
+e.unit("davmail.service", enter=NOW - 10, restarts="0")
+check("counter back to 0 (started afresh): ok", e.jobs(now=NOW + 3 * H + MIN)[1]["davmail"]["state"] == "ok")
+
+print("case: failed units worth no light")
+e.healthy()
+open(e.fake + "/failed", "w").write("dbus-:1.1-org.freedesktop.Notifications@3.service loaded failed failed x\ndesktop-test.service loaded failed failed x\nfumon-thing.service loaded failed failed x\n")
+j = e.jobs()[1]
+check("D-Bus activation units and desktop-test are left out", not any(k.startswith("unit:dbus-") or k == "unit:desktop-test.service" for k in j), str([k for k in j if k.startswith("unit:")]))
+e.config({"ignoreUnits": ["fumon*"]})
+check("health.json ignoreUnits adds globs", "unit:fumon-thing.service" not in e.jobs()[1])
+e.config(None)
+
+print("case: repairs a job made by itself")
+e.healthy()
+os.makedirs(e.state + "/pull-mail", exist_ok=True)
+open(e.state + "/pull-mail/davmail-restarted", "w").write("%d\n0\n" % (NOW - 10 * MIN))
+j = e.jobs()[1]
+check("mail says DavMail was restarted and it worked", j["pull-mail"]["state"] == "ok" and "restarted DavMail itself 10 min ago, which fixed it" in j["pull-mail"]["why"], j["pull-mail"]["why"])
+open(e.state + "/pull-mail/davmail-restarted", "w").write("%d\n1\n" % (NOW - 10 * MIN))
+check("... or that it did not help", "did not help" in e.jobs()[1]["pull-mail"]["why"])
+open(e.state + "/pull-mail/davmail-restarted", "w").write("%d\n0\n" % (NOW - 7 * H))
+check("after 6 hours it is no longer mentioned", "DavMail" not in e.jobs()[1]["pull-mail"]["why"])
+
+print("case: replay of the 2026-11-20 wake (polls every 2 min, real confirmation)")
+# 08:00:16 the journal logs the wake; resumed jobs had already run at 08:00:11 with no DNS.
+W = NOW
+real = {"SHELL_HEALTH_CONFIRM": "100", "SHELL_HEALTH_WAKE": str(W)}
+e.healthy()
+e.jobs(now=W - 8 * H, extra=real)                     # healthy the evening before
+e.ms("down", "token error: no reply (Temporary failure in name resolution)", 0)
+e.streak("pull-mail", 0, 8 * H)                       # the cut-off run was not counted
+e.streak("pull-calendars", 0, 8 * H)
+e.streak("push-roam", 0, 8 * H)
+open(e.fake + "/mounts", "w").write("")                # Box remounting
+seen_bad = []
+for k, conn in ((1, "limited"), (3, "full"), (5, "full")):
+    at = W + k * MIN
+    json.dump({"state": "down", "detail": "no reply (name resolution)", "checked": at - 30, "since": W - 5}, open(e.state + "/microsoft/health.json", "w"))
+    if k == 5:
+        e.ms("ok")
+        open(e.fake + "/mounts", "w").write("%s/Box fuse.rclone\n" % e.run_dir)
+        e.streak("pull-mail", 0, 30); e.streak("pull-calendars", 0, 60); e.streak("push-roam", 0, 60)
+    d, j = e.jobs(now=at, extra=dict(real, SHELL_HEALTH_CONNECTIVITY=conn))
+    seen_bad += ["%d min: %s" % (k, x["id"]) for x in d["jobs"] if x["state"] in ("stale", "failed")]
+check("no red or amber at any poll while the laptop wakes", not seen_bad, str(seen_bad))
+check("everything ok once the network is back", d["worst"] == "ok", states(j, "microsoft", "rclone-box", "pull-mail"))
+e.healthy()
+e.jobs(now=W - 8 * H, extra=real)
+for k in (1, 3, 5, 7):
+    json.dump({"state": "down", "detail": "Graph 503", "checked": W + k * MIN - 30, "since": W - 5}, open(e.state + "/microsoft/health.json", "w"))
+    d, j = e.jobs(now=W + k * MIN, extra=real)
+check("a real Microsoft outage that outlasts the wake is still raised", j["microsoft"]["state"] == "failed", j["microsoft"]["why"])
 
 GB = 10 ** 9
 MB = 10 ** 6

@@ -1,0 +1,3 @@
+#!/bin/sh
+# stub (hypr-scripts-test): record only (gvm-lights runs "gvm release" before starting gvm-gui)
+echo "gvm $*" >> "$CALLS"

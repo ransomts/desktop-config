@@ -5,7 +5,12 @@ pragma Singleton
 // refresh(); nothing else runs here.
 //
 //   Health.worst     "ok" | "stale" | "failed"   over the jobs not ignored
-//   Health.jobs      every job shell-health reported, bad ones first (state ok|stale|failed|off)
+//   Health.jobs      every job shell-health reported, bad ones first (state ok|healing|stale|failed|off)
+//   Health.healing   jobs on their way back by themselves (first run since start-up or wake due, a retry
+//                    scheduled, a service restarting, offline grace); why says what they wait for. Never in
+//                    worst or bad: the pill shows them as a quiet "↻ n" only while nothing is bad.
+//   Health.recovered(job)   a job the island had reason to call stale or failing is working again
+//                    (not on the first answer, not for ignored ones). The island says it (hook in shell.qml).
 //   Health.bad       the stale and failed ones that are not ignored
 //   Health.newFailure(job)   a job went from ok to stale/failed since the last look. Not on
 //                    every poll, and not for what was already bad when the shell started,
@@ -44,6 +49,7 @@ Singleton {
     readonly property int recentMs: 10 * 60 * 1000
     property var prev: ({})                     // id -> state at the previous answer
     signal newFailure(var job)
+    signal recovered(var job)
     signal noticeSay(var row)
     property var notices: []
     property var hiddenJobs: []
@@ -56,6 +62,7 @@ Singleton {
     readonly property var bad: jobs.filter(j => (j.state === "failed" || j.state === "stale") && !ignored[j.id])
     readonly property var ignoredBad: jobs.filter(j => (j.state === "failed" || j.state === "stale") && ignored[j.id])
     readonly property var good: jobs.filter(j => j.state === "ok")
+    readonly property var healing: jobs.filter(j => j.state === "healing")
     readonly property string worst: bad.some(j => j.state === "failed") ? "failed" : bad.length > 0 ? "stale" : "ok"
 
     function refresh(force) {
@@ -66,10 +73,10 @@ Singleton {
     function ingest(text) {
         let o
         try { o = JSON.parse(text) } catch (e) { console.warn("Health: bad JSON from shell-health -", String(text).slice(0, 200)); return false }
-        const rank = { failed: 0, stale: 1, ok: 2, off: 3 }
+        const rank = { failed: 0, stale: 1, healing: 2, ok: 3, off: 4 }
         const all = o.jobs || []
         const note = all.filter(j => j.state === "notice")
-        const rows = all.filter(j => j.state !== "notice").map((j, i) => [j, i]).sort((a, b) => ((rank[a[0].state] ?? 4) - (rank[b[0].state] ?? 4)) || a[1] - b[1]).map(p => p[0])
+        const rows = all.filter(j => j.state !== "notice").map((j, i) => [j, i]).sort((a, b) => ((rank[a[0].state] ?? 5) - (rank[b[0].state] ?? 5)) || a[1] - b[1]).map(p => p[0])
         const now = clock()
         const first = !loaded
         const seen = {}
@@ -77,6 +84,7 @@ Singleton {
         for (const j of rows) {
             const isBad = j.state === "failed" || j.state === "stale"
             const was = prev[j.id]
+            if (!first && j.state === "ok" && (was === "failed" || was === "stale") && !ign[j.id]) recovered(j)
             if (j.state === "ok" && ign[j.id]) { if (ign === ignored) ign = Object.assign({}, ign); delete ign[j.id]; changed = true }
             seen[j.id] = j.state
             if (!isBad || ign[j.id]) continue
@@ -85,7 +93,7 @@ Singleton {
                 const t = j.since ? Date.parse(j.since) : NaN
                 fresh = !isNaN(t) && now - t < recentMs
             } else {
-                fresh = was === "ok"
+                fresh = was === "ok" || was === "healing"
             }
             if (fresh) newFailure(j)
         }
@@ -129,8 +137,9 @@ Singleton {
     }
     function summary() {
         if (!loaded) return "unknown (no answer yet)"
-        if (bad.length === 0) return "ok" + (ignoredBad.length > 0 ? " (" + ignoredBad.length + " ignored)" : "")
-        return worst + ": " + bad.map(j => j.name + " (" + j.why + ")").join("; ")
+        const mending = healing.length > 0 ? "; recovering: " + healing.map(j => j.name + " (" + j.why + ")").join("; ") : ""
+        if (bad.length === 0) return "ok" + (ignoredBad.length > 0 ? " (" + ignoredBad.length + " ignored)" : "") + mending
+        return worst + ": " + bad.map(j => j.name + " (" + j.why + ")").join("; ") + mending
     }
     function table() {
         if (!loaded) return "no answer yet"
@@ -140,6 +149,9 @@ Singleton {
     }
     function tooltip() {
         return bad.map(j => "<b>" + j.name + "</b>: " + j.why).join("\n")
+    }
+    function healingTip() {
+        return healing.map(j => "<b>" + j.name + "</b>: " + j.why).join("\n")
     }
 
     // ---- actions for the popup ----

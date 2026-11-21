@@ -1,5 +1,6 @@
 // Tests for the bar's popups and the small panel pieces (qml-panels-test): Mixer, WifiList,
-// BluetoothList, TeamsList, MediaCard, MediaPop, PowerMenu, BatteryWarn, ProfileList, WallMenu,
+// BluetoothList, TeamsList, MediaCard, MediaPop, PowerMenu, BatteryWarn, ProfileList, LightsList (with the real
+// Lights.qml, its files and a stand-in gvm), WallMenu,
 // MsgIcon, Slider, ScriptSource, and an "every Settings page loads" pass. NOT part of the shell:
 // ~/.local/bin/qml-panels-test copies the real files next to these stubs (Mixer, BluetoothList and
 // BatteryWarn without their Quickshell.Services imports, which the stubs here stand in for; WallMenu
@@ -28,12 +29,14 @@ ShellRoot {
     readonly property var pageFiles: (Quickshell.env("PANELS_PAGES") || "").split(" ").filter(s => s !== "")
 
     TestEvent { id: ev }
+    QtObject { id: islandStub; property var said: []; function say(m) { said = said.concat([m]) } }
     Fit { id: fit }
 
     // ---- files ----
     FileView { id: hand; printErrors: false; blockLoading: true; blockWrites: true }
     function readFile(path) { hand.path = ""; hand.path = path; try { return hand.text() || "" } catch (e) { return "" } }
     function writeFile(path, s) { hand.path = path; hand.setText(s) }
+    function gvmLog() { return readFile(dir + "/gvm.log").trim().split("\n").filter(l => l !== "") }
     function setDark(d) { writeFile(home + "/.config/cosmic/com.system76.CosmicTheme.Mode/v1/is_dark", d ? "true\n" : "false\n"); Theme.reload() }
 
     // ---- finding things ----
@@ -190,6 +193,7 @@ ShellRoot {
             function previous() { calls = calls.concat(["previous"]) }
             function next() { calls = calls.concat(["next"]) }
             function togglePlaying() { calls = calls.concat(["togglePlaying"]) }
+            function stop() { calls = calls.concat(["stop"]); isPlaying = false }
         }
     }
 
@@ -226,6 +230,7 @@ ShellRoot {
     Component { id: mediaCardC; MediaCard {} }
     Component { id: powerC; PowerMenu {} }
     Component { id: profileC; ProfileList {} }
+    Component { id: lightsC; LightsList {} }
     Component { id: battC; BatteryWarn {} }
     property var batt: null
 
@@ -560,6 +565,14 @@ ShellRoot {
             clickText(pop, "Automatic")
             check("MediaPop: Automatic unpins", Sys.playerPin === "")
             check("MediaPop: nothing run through Sys", Sys.calls.length === 0, Sys.calls.join("; "))
+            let doneCount = 0
+            const onDone = () => doneCount++
+            pop.done.connect(onDone)
+            clickText(pop, "■  Stop and clear")
+            check("MediaPop: Stop and clear stops, clears, closes", last(p.calls) === "stop" && p.isPlaying === false && Sys.mediaCleared === true && doneCount === 1,
+                  p.calls.join(",") + " cleared=" + Sys.mediaCleared + " done=" + doneCount)
+            pop.done.disconnect(onDone)
+            Sys.mediaCleared = false; p.isPlaying = true
             return 100
         } },
     ]).concat(fitCases("MediaPop", () => root.w)).concat([
@@ -645,6 +658,97 @@ ShellRoot {
         } },
     ]).concat(fitCases("Profiles", () => root.w)).concat([
 
+        // ================= LightsList + Lights.qml =================
+        // files written by qml-panels-test: ~/.config/gvm/lights (light1, light2), presets.json
+        // (Camera, Orange), $XDG_STATE_HOME/gvm/lights.json (light1 on, light2 off); $PANELS_BIN/gvm
+        // logs its arguments to gvm.log, sleeps when gvm.slow has text, fails with gvm.fail's text
+        { name: "Lights", run: function() {
+            Lights.island = islandStub      // the singleton starts here and reads its files
+            return 400
+        } },
+        { name: "Lights: files read", run: function() {
+            check("Lights: names from the lights file, comments skipped", same(Lights.names, ["light1", "light2"]) && Lights.present, JSON.stringify(Lights.names))
+            check("Lights: presets with their notes", same(Lights.presets, [{ name: "Camera", note: "webcam look" }, { name: "Orange", note: "" }]), JSON.stringify(Lights.presets))
+            check("Lights: last known state read", Lights.anyOn && !Lights.allOn && !Lights.allOff && Lights.stateText() === "light1 on, light2 off", Lights.stateText())
+            check("Lights: tip says as of when, and right-click turns them off", Lights.tip().indexOf("as of ") > 0 && Lights.tip().indexOf("Right-click: all off") > 0, Lights.tip())
+            open(lightsC, 220)
+            return 200
+        } },
+        { name: "Lights: rows", run: function() {
+            const L = labels(pop)
+            check("Lights: all on, all off, the presets, the full controls", same(L, ["All on", "All off", "Camera", "Orange", "Full controls…"]), L.join(" | "))
+            check("Lights: the caption says how they are", has(pop, "Lights: light1 on, light2 off"), texts(pop).join(" | "))
+            check("Lights: mixed: neither all-row marked", !row(pop, "All on").current && !row(pop, "All off").current)
+            click(row(pop, "All off"))
+            check("Lights: click closes the popup at once", w.doneCount === 1 && Lights.busy, w.doneCount)
+            return 800
+        } },
+        { name: "Lights: All off ran", run: function() {
+            check("Lights: All off = gvm -l all off", last(gvmLog()) === "-l all off" && !Lights.busy && Lights.error === "", gvmLog().join("; "))
+            writeFile(Quickshell.env("XDG_STATE_HOME") + "/gvm/lights.json",
+                      JSON.stringify({ lights: { light1: { on: 1, at: 1763600000 }, light2: { on: 1, at: 1763600100 } } }))
+            return 400
+        } },
+        { name: "Lights: state file watched", run: function() {
+            check("Lights: a new state file is picked up", Lights.allOn && row(pop, "All on").current && !row(pop, "All off").current, Lights.stateText())
+            check("Lights: caption follows", has(pop, "Lights: all on"), texts(pop).join(" | "))
+            click(row(pop, "Camera"))
+            return 800
+        } },
+        { name: "Lights: preset, full controls", run: function() {
+            check("Lights: a preset = gvm preset NAME", last(gvmLog()) === "preset Camera" && w.doneCount === 2, gvmLog().join("; "))
+            click(row(pop, "Full controls…"))
+            check("Lights: Full controls opens the window through gvm-lights", last(Sys.calls) === "launch " + home + "/.local/bin/gvm-lights" && w.doneCount === 3, Sys.calls.join("; "))
+            writeFile(dir + "/gvm.slow", "1")
+            const n = gvmLog().length
+            Lights.on(); Lights.preset("Orange"); Lights.off()
+            check("Lights: busy while gvm runs", Lights.busy && Lights.calls.length > 0 && last(Lights.calls) === "-l all on")
+            return 2200
+        } },
+        { name: "Lights: clicks while busy", run: function() {
+            const log = gvmLog()
+            check("Lights: a click while busy runs next, the latest wins", same(log.slice(-2), ["-l all on", "-l all off"]) && log.indexOf("preset Orange") < 0 && !Lights.busy, log.join("; "))
+            writeFile(dir + "/gvm.slow", "")
+            writeFile(dir + "/gvm.fail", "gvm: light1: light A4:C1:38:00:00:01 not found (off, out of range, or held by the phone app?)")
+            Lights.quick()
+            return 800
+        } },
+        { name: "Lights: a failure", run: function() {
+            check("Lights: quick() with lights on turns them off", last(gvmLog()) === "-l all off", gvmLog().join("; "))
+            check("Lights: the error is gvm's last stderr line", Lights.error === "light1: light A4:C1:38:00:00:01 not found (off, out of range, or held by the phone app?)", Lights.error)
+            check("Lights: said on the island", islandStub.said.length === 1 && islandStub.said[0].title === "Lights: All off didn't work" && islandStub.said[0].kind === "lights", JSON.stringify(islandStub.said))
+            check("Lights: the popup shows the error", has(pop, Lights.error), texts(pop).join(" | "))
+            check("Lights: the tip shows the error", Lights.tip().indexOf("Last try: light1") > 0)
+            lock(w)
+            return 200
+        } },
+    ]).concat(fitCases("Lights (with an error)", () => root.w)).concat([
+        { name: "Lights: recovers, quick turns on", run: function() {
+            writeFile(dir + "/gvm.fail", "")
+            writeFile(Quickshell.env("XDG_STATE_HOME") + "/gvm/lights.json", JSON.stringify({ lights: { light1: { on: 0 }, light2: { on: 0 } } }))
+            return 400
+        } },
+        { name: "Lights: all off known", run: function() {
+            check("Lights: all off marked", Lights.allOff && !Lights.anyOn && row(pop, "All off").current, Lights.stateText())
+            Lights.quick()
+            return 800
+        } },
+        { name: "Lights: quick on", run: function() {
+            check("Lights: quick() with all off turns them on; the error clears", last(gvmLog()) === "-l all on" && Lights.error === "" && !has(pop, "light1: light A4:C1:38:00:00:01 not found (off, out of range, or held by the phone app?)"), gvmLog().join("; "))
+            writeFile(home + "/.config/gvm/lights", "# nothing named\n")
+            return 400
+        } },
+        { name: "Lights: no lights named", run: function() {
+            check("Lights: an empty lights file hides the pill (present false)", !Lights.present && Lights.stateText() === "not known yet", JSON.stringify(Lights.names))
+            writeFile(home + "/.config/gvm/lights", "light1 A4:C1:38:00:00:01\nlight2 A4:C1:38:00:00:02\n")
+            writeFile(Quickshell.env("XDG_STATE_HOME") + "/gvm/lights.json", "{broken")
+            return 400
+        } },
+        { name: "Lights: broken state file", run: function() {
+            check("Lights: a broken state file keeps what was known", Lights.present && Lights.allOff, Lights.stateText())
+            return 50
+        } },
+
         // ================= BatteryWarn =================
         { name: "BatteryWarn", run: function() {
             UPower.onBattery = false; UPower.displayDevice.percentage = 0.8; UPower.displayDevice.isLaptopBattery = true; UPower.displayDevice.ready = true
@@ -706,6 +810,13 @@ ShellRoot {
             check("WallMenu: Plain hides the scene", WallState.cfg.hidden === true && has(m, "plain wallpaper"))
             clickText(m, "Moving")
             check("WallMenu: Moving runs it again", WallState.cfg.running === true && WallState.cfg.hidden === false)
+            clickText(m, "Forced")
+            check("WallMenu: Forced forces it on", WallState.forced === true && last(WallState.calls) === "force true" && has(m, "forced on"), WallState.calls.join("; "))
+            clickText(m, "Still")
+            check("WallMenu: Still lets go of Forced", WallState.forced === false && WallState.cfg.running === false)
+            clickText(m, "Forced")
+            clickText(m, "Moving")
+            check("WallMenu: Moving lets go of Forced and keeps moving", WallState.forced === false && WallState.cfg.running === true)
             clickText(m, "30")
             check("WallMenu: frames-a-second chip", WallState.cfg.fps === 30)
             check("WallMenu: the screensaver row is there", has(m, "Screensaver"))

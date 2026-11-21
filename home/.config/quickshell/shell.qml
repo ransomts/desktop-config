@@ -20,6 +20,7 @@
 //   CursorFind.qml shake the mouse and the pointer grows (cursor-shake does the detecting)
 //   DropPreview.qml outline of where a dragged tiled window will land (drop-preview works it out)
 //   WifiList, BluetoothList, ProfileList, PowerMenu, MenuRow   the other pill popups
+//   Lights.qml, LightsList.qml   the GVM video lights pill (~/.local/bin/gvm); IPC `lights`
 //   Mixer.qml, MediaCard.qml, Calendar.qml, Slider.qml   pieces used by the panel and the pill popups
 //   Wallpaper.qml  animated wallpaper, one per screen, under everything: scene shaders in shaders/,
 //                  WallState.qml (scene, effects, feeds), WallSky.qml + sky.js (real night sky), WallAgenda.qml
@@ -77,6 +78,7 @@ ShellRoot {
                                    q => EventQuick.rows(q, launcher.view),
                                    q => Clocks.launcherRows(q, launcher.view)]      // "timer 10m tea", "alarm 7:30", "stopwatch", "timers"
         Profiles.island = island
+        Lights.island = island                              // a light command that fails is said on the island
         Clocks.island = island                              // alarms and timers say themselves on the island; also starts Clocks with the shell
     }
     Overview { id: overview }
@@ -115,7 +117,7 @@ ShellRoot {
                 ["island", () => island.say({ kind: "say", glyph: "", title: "Fit check: a fairly long island title to see that it fits",
                                               sub: "and a subtitle under it, also on the long side", ms: 1500 }), () => {}]
             ]
-            for (const p of ["calendar", "mixer", "media", "notifs", "wifi", "bluetooth", "profile", "power", "health", "teams", "pet"])
+            for (const p of ["calendar", "mixer", "media", "notifs", "wifi", "bluetooth", "profile", "power", "health", "teams", "pet", "lights"])
                 s.push(["bar popup: " + p, () => Sys.popupRequest(p), () => Sys.popupRequest(p)])
             s.push(["settings (remember page)", () => { fit.settingsPageBefore = settings.page }, () => {}])
             for (const pg of settings.pages)
@@ -201,6 +203,7 @@ ShellRoot {
         function menu(): void { wallMenu.toggle() }
         function on(): void  { WallState.cfg.hidden = false; WallState.cfg.running = true }
         function off(): void { WallState.cfg.hidden = false; WallState.cfg.running = false }   // hold the current frame
+        function force(on: bool): void { WallState.force(on) }   // move on battery and through the heat guard, until the power source or mode changes
         function hide(): void { WallState.cfg.hidden = true }                                  // plain hyprpaper image
         function scene(name: string): string { return WallState.setScene(name) }   // silk aurora contours ink ridges sky
         function next(): string { return WallState.nextScene() }
@@ -383,6 +386,15 @@ ShellRoot {
         function snoozed(): int { return Notif.snoozed.length }
     }
     IpcHandler {
+        target: "lights"        // the GVM video lights (Lights.qml); the pill is in Bar.qml
+        function status(): string { return Lights.status() }
+        function on(): void { Lights.on() }
+        function off(): void { Lights.off() }
+        function quick(): void { Lights.quick() }           // the pill's right-click
+        function preset(name: string): void { Lights.preset(name) }
+        function window(): void { Lights.openWindow() }
+    }
+    IpcHandler {
         target: "bar"
         function on(): void     { Sys.barVisible = true }    // ("show" collides with `qs ipc show`)
         function off(): void    { Sys.barVisible = false }
@@ -390,7 +402,7 @@ ShellRoot {
         // a script-backed pill changed (sent by ~/.local/bin/bar-refresh)
         function refresh(): void { Sys.refreshNow() }
         // open or close a pill popup on the focused screen:
-        // calendar | mixer | wifi | bluetooth | profile | power | media | notifs | pet
+        // calendar | mixer | wifi | bluetooth | profile | power | media | notifs | pet | lights
         function popup(name: string): void { Sys.popupRequest(name) }
     }
     // background jobs (Health.qml, ~/.local/bin/shell-health): the pill is in Bar.qml; a job that
@@ -399,6 +411,9 @@ ShellRoot {
         target: Health
         function onNewFailure(job) {
             island.say({ kind: "health", urgency: "critical", glyph: "⚠", title: job.name + (job.state === "failed" ? " is failing" : " is behind"), sub: job.why, ms: 6000 })
+        }
+        function onRecovered(job) {
+            island.say({ kind: "health", glyph: "✓", title: job.name + " is working again", sub: job.why, ms: 4000 })
         }
     }
     // low disk or "restart needed", once per boot each (Health.noticeSay); other notices stay in the popup
