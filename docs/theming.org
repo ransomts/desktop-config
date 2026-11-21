@@ -1,6 +1,6 @@
 #+title: Theming
 
-#+HTML: <img src="../screenshots/anim-theme.webp" alt="theme animation">
+#+HTML: <img src="../screenshots/anim-theme.avif" alt="theme animation">
 
 | Dark | Light |
 |------+-------|

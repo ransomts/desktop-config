@@ -33,7 +33,7 @@
 # Dark only:
 #   calc, emoji   launcher modes with a query typed
 #   scenes        a grid of every wallpaper scene
-# Animations (animated WebP, recorded with wf-recorder; --no-anim skips them):
+# Animations (animated AVIF, recorded with wf-recorder; --no-anim skips them):
 #   anim-wallpaper  anim-island  anim-pet  anim-theme
 #
 # Isolation is shell-boot-test's: temporary HOME and XDG dirs, private session and "system" D-Bus
@@ -400,23 +400,30 @@ record() {   # record NAME SECONDS FILTER ACTION...: ACTION runs in the backgrou
     want "$name" || return 0
     command -v wf-recorder >/dev/null || { echo "  $name: no wf-recorder" >&2; return 0; }
     env XDG_RUNTIME_DIR="$R" WAYLAND_DISPLAY="$nested_wl" timeout -s INT "$secs" \
-        wf-recorder -o "$SHOT" -r 30 -c libx264 -p crf=16 -f "$work/$name.mp4" >/dev/null 2>&1 &
+        wf-recorder -o "$SHOT" -r 30 -c libx264rgb -p crf=0 -p preset=ultrafast -f "$work/$name.mkv" >/dev/null 2>&1 &
     local rp=$!; sleep 0.6; "$@" & local ap=$!; wait "$rp"; wait "$ap" 2>/dev/null
-    ffmpeg -v error -y -i "$work/$name.mp4" -vf "$vf" -c:v libwebp_anim -lossless 0 -q:v 62 -compression_level 6 \
-        -loop 0 "$out/$name.webp" && echo "  $out/$name.webp ($(du -k "$out/$name.webp" | cut -f1) KB)"
+    # Animated AVIF (AV1, 10-bit): smooth gradients at a few hundred KB. WebP blocked up on the dark
+    # wallpaper gradients even at quality 90 (2026-11-21), so it is only the fallback without SVT-AV1.
+    if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libsvtav1; then
+        ffmpeg -v error -y -i "$work/$name.mkv" -vf "$vf,format=yuv420p10le" -c:v libsvtav1 -crf 26 -preset 6 -g 300 \
+            -f avif "$out/$name.avif" 2>/dev/null && echo "  $out/$name.avif ($(du -k "$out/$name.avif" | cut -f1) KB)"
+    else
+        ffmpeg -v error -y -i "$work/$name.mkv" -vf "$vf" -c:v libwebp_anim -lossless 0 -q:v 90 -preset picture \
+            -compression_level 6 -loop 0 "$out/$name.webp" && echo "  $out/$name.webp ($(du -k "$out/$name.webp" | cut -f1) KB)"
+    fi
 }
 if [ "$anim" = 1 ]; then
     echo "animations:"
     echo true > "$dark_file"; terms_off; sleep 2.5
     # the scenes drift slowly by design; sped up for the clip so the motion shows
     qsi call wallpaper force true >/dev/null; qsi call wallpaper speed 0.06 >/dev/null; sleep 1
-    record anim-wallpaper 6 "fps=20,scale=960:-2:flags=lanczos" sleep 0
+    record anim-wallpaper 6 "fps=20,scale=1280:-2:flags=lanczos" sleep 0
     qsi call wallpaper speed 0.012 >/dev/null
     a_pet() { sleep 1.5; notify -a "Calendar" -i x-office-calendar "Office hours in 10 minutes" "Room 210"; sleep 3; qsi call notif dismissAll >/dev/null; }
-    record anim-pet 7 "crop=1920:260:0:820,fps=20,scale=1280:-2:flags=lanczos" a_pet
+    record anim-pet 7 "crop=1920:260:0:820,fps=20" a_pet
     a_theme() { sleep 1.2; echo false > "$dark_file"; sleep 2.6; echo true > "$dark_file"; }
     qsi call panel open >/dev/null; until_layer qs-panel 40; sleep 0.6
-    record anim-theme 7 "fps=20,scale=960:-2:flags=lanczos" a_theme
+    record anim-theme 7 "fps=20,scale=1280:-2:flags=lanczos" a_theme
     qsi call panel close >/dev/null; until_gone qs-panel 30
     terms_on "Clemson Dark"
     a_island() { sleep 0.8; qsi call island say "Data Structures lecture in 5 minutes" "Hall B 100" >/dev/null; }

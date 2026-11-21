@@ -35,7 +35,7 @@ The pills, roughly right to left: power menu, battery, power profile, network, m
 
 =Island.qml=. A short message that grows out of the top of the bar over the clock and folds back: a meeting in five minutes, recording started, headphones connected, the charger or keyboard layout changed. Scripts can use it: =qs ipc call island say "Title" "second line"=.
 
-#+HTML: <img src="../screenshots/anim-island.webp" alt="island animation">
+#+HTML: <img src="../screenshots/anim-island.avif" alt="island animation">
 
 * Launcher
 
@@ -90,7 +90,7 @@ Settings (=Settings.qml= and its =Settings*.qml= pages, Super+comma) is one wind
 
 The scenes drift slowly; sped up five times:
 
-#+HTML: <img src="../screenshots/anim-wallpaper.webp" alt="wallpaper animation">
+#+HTML: <img src="../screenshots/anim-wallpaper.avif" alt="wallpaper animation">
 
 * Lock screen and screensaver
 
@@ -122,4 +122,4 @@ The scenes drift slowly; sped up five times:
 
 =Pet*.qml=. A pixel-art tiger cub that lives in the empty stretches of the bar, or down on the wallpaper when a desktop is empty. It reacts to notifications, sits on the clock, runs a focus timer, keeps reminders and reminds you of the next meeting. Right-click it for its menu. It also has a few secrets.
 
-#+HTML: <img src="../screenshots/anim-pet.webp" alt="pet animation">
+#+HTML: <img src="../screenshots/anim-pet.avif" alt="pet animation">
