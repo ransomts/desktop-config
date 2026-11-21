@@ -228,6 +228,12 @@ Alarms, timer sounds, the world clocks in the calendar popup.
 
 #+HTML: <img src="../screenshots/gallery/settings-clock.avif" alt="Clocks">
 
+** Battery low
+
+A notification at 15%, a critical one at 5%.
+
+#+HTML: <img src="../screenshots/gallery/battery-low.avif" alt="Battery low">
+
 ** Screensaver and idle
 
 When the screensaver starts, its scene, when screens go off and the lock comes.
@@ -458,4 +464,4 @@ Rain, fog and snow follow the real weather; leaves, snow, petals and fireflies f
 
 * Not pictured
 
-A few things need a real machine or a real person and are not staged: the low-battery notification (the stand-in battery does not set it off), the break reminder (it counts minutes of active typing), the treat-catch game (it needs someone playing), and the login screen (not in this repository).
+A few things need a real machine or a real person and are not staged: the break reminder (it counts minutes of active typing), the treat-catch game (it needs someone playing), and the login screen (not in this repository).

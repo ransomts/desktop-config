@@ -1,3 +1,4 @@
+#!/bin/bash
 # Sourced by desktop-shots (not run on its own): the gallery, every interactive view of the shell,
 # into $out/gallery/. Uses desktop-shots' helpers (qsi, hc, ptr, kbd, shoot, notify, record, ...).
 #

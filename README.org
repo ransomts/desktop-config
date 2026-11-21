@@ -104,6 +104,7 @@ A Hyprland plugin that makes resizing tiled windows follow the pointer and the a
 
 - Copy a file or folder into the same place under your =$HOME=; nothing here needs to be installed as a whole.
 - Scripts assume =~/.local/bin= is on =PATH=, and some call each other.
+- A few files need an absolute path (the =gvm= scripts' shebang, =gvm-gui.desktop=, the qt5ct/qt6ct colour scheme path); they read =/home/user/=, so put your own home there.
 - Things that are mine and will need changing: monitor names and positions in =hyprland.lua= and =dock-monitor-layout= (the serial numbers in the =desc:= rules are placeholders here, so put your own monitors in), the Dvorak layout, mail folder names in =dashboard-data= and =shell-status=, the latitude and longitude for the sky and weather, and the System76-specific bits (=charge-profile=, power profiles, the Fn-row keys).
 - A few pills read from things I run locally (a Matrix bridge for Teams unread counts, mbsync mail, an Org calendar export, two Bluetooth video lights). They hide themselves when there is nothing to read.
 
