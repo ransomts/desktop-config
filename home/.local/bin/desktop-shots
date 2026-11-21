@@ -10,6 +10,8 @@
 #   -k          keep the temporary directory (printed)
 #   -v          print the shell's log and the recorded commands at the end
 #   --only      only these shots (names below)
+#   --hold      set the session up, write TMP/env.sh (sourceable: hc, qsi, shoot, ptr, kbd) and wait
+#               until TMP/stop exists; for working on this script
 #   --keys FILE also write the key-binding page (keybind-sheet --org) from the nested session's bindings
 #   PNGs are run through pngquant when it is installed (they are committed, so size matters).
 #
@@ -23,6 +25,16 @@
 #   overview      the desktop overview
 #   settings      the settings window
 #   bar           a crop of the bar strip (from desktop)
+#   lecture       ink drawn over code and the countdown timer
+#   keys          the lecture key display (the spotlight is left out: on the headless screen its
+#                 clear circle renders as a light haze, 2026-11-21)
+#   editor        the screenshot editor with marks (pointer and keys through vptr/vkbd)
+#   lock          the lock screen
+# Dark only:
+#   calc, emoji   launcher modes with a query typed
+#   scenes        a grid of every wallpaper scene
+# Animations (animated WebP, recorded with wf-recorder; --no-anim skips them):
+#   anim-wallpaper  anim-island  anim-pet  anim-theme
 #
 # Isolation is shell-boot-test's: temporary HOME and XDG dirs, private session and "system" D-Bus
 # buses, a deny-by-default PATH where every program not on a short allow list is a recorder, every
@@ -31,7 +43,7 @@
 # The nested Hyprland shows as a window on your desktop while it runs (about a minute).
 set -u
 out="$HOME/Code/desktop-config/screenshots"; src="$HOME/Code/desktop-config/home"
-keep=0; verbose=0; only=""; modes="dark light"; keys=""
+keep=0; verbose=0; only=""; modes="dark light"; keys=""; hold=0; anim=1
 while [ $# -gt 0 ]; do
     case "$1" in
         -o) out="$2"; shift ;;
@@ -40,13 +52,15 @@ while [ $# -gt 0 ]; do
         -v) verbose=1 ;;
         --only) only=",$2,"; shift ;;
         --keys) keys="$2"; shift ;;
+        --hold) hold=1; keep=1 ;;
+        --no-anim) anim=0 ;;
         --dark-only) modes=dark ;;
         --light-only) modes=light ;;
         *) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
     esac
     shift
 done
-want() { [ -z "$only" ] || [[ "$only" == *",$1,"* ]]; }
+want() { case "$1" in anim-*) [ "$anim" = 1 ] || return 1 ;; esac; [ -z "$only" ] || [[ "$only" == *",$1,"* ]]; }
 
 QS="$HOME/.nix-profile/bin/qs"; GL="$HOME/.nix-profile/bin/nixGLIntel"
 qsrc="$src/.config/quickshell"; hsrc="$src/.config/hypr"; htests="$hsrc/tests"
@@ -85,7 +99,7 @@ EOF
 chmod +x "$work/rec"
 # ~/.local/bin: the published scripts, each a recorder except these offline status ones (they read
 # only the temporary HOME; anything they run goes through the PATH below)
-real_scripts="dnd-toggle notif-dnd drives agenda-day tz-now sunset-times shell-status"
+real_scripts="dnd-toggle notif-dnd drives agenda-day tz-now sunset-times shell-status cursor-track"
 for f in "$src"/.local/bin/* "$HOME"/.local/bin/*; do
     n=${f##*/}; [ -e "$H/.local/bin/$n" ] && continue
     case " $real_scripts " in *" $n "*) cp "$f" "$H/.local/bin/$n" ;; *) ln -s "$work/rec" "$H/.local/bin/$n" ;; esac
@@ -122,6 +136,15 @@ print(json.dumps({
          "url": "", "date": tom.isoformat(), "id": "", "calendar": "demo", "tags": []}]}}))
 CANNED
 chmod +x "$H/.local/bin/dashboard-data"
+rm -f "$H/.local/bin/lecture-keys"         # the key display reads evdev; here it gets a few made-up presses
+cat > "$H/.local/bin/lecture-keys" <<'CANNED'
+#!/bin/sh
+while :; do
+    for k in "Ctrl C" "Ctrl V" "Super+Shift D" "Ctrl+Shift T"; do sleep 0.7; printf '%s\t%s\n' $k; done
+    sleep 1
+done
+CANNED
+chmod +x "$H/.local/bin/lecture-keys"
 mkdir -p "$H/.config/cosmic/com.system76.CosmicTheme.Mode/v1"
 dark_file="$H/.config/cosmic/com.system76.CosmicTheme.Mode/v1/is_dark"; echo true > "$dark_file"
 
@@ -144,6 +167,8 @@ with open(sys.argv[1], "w") as f:
     for t, s, e, loc in ev:
         f.write(f"* {t}\n:PROPERTIES:\n:LOCATION: {loc}\n:END:\n<{day} {dn} {s}-{e}>\n")
 EOF
+# The emoji mode's list (Unicode data only), when it has been built here
+[ -f "$HOME/.cache/emoji-picker.txt" ] && cp "$HOME/.cache/emoji-picker.txt" "$H/.cache/"
 # Text the terminals show
 mkdir -p "$H/demo"
 sed -n '/^local mainMod/,$p' "$hsrc/hyprland.lua" | head -48 > "$H/demo/keys.lua"
@@ -153,7 +178,7 @@ sed -n '/^Item\|^Rectangle\|^MouseArea/,$p' "$qsrc/Pill.qml" | head -48 > "$H/de
 
 allow="sh dash bash env python3 jq sed awk gawk mawk grep cat date head tail tr cut sort uniq wc printf echo test [
        basename dirname mkdir ls stat readlink realpath seq sleep true false findmnt hyprctl id uname nproc mktemp
-       touch rm mv cp ln tee xargs expr od md5sum find timeout"
+       touch rm mv cp ln tee xargs expr od md5sum find timeout qalc"
 python3 -I - "$P" "$work/rec" $allow <<'EOF'
 import os, sys
 p, rec, allow = sys.argv[1], sys.argv[2], set(sys.argv[3:])
@@ -256,7 +281,26 @@ terms_on() {   # terms_on THEME
 sleep "${SHOTS_SETTLE:-6}"           # first polls, wallpaper fade-in
 
 shoot() { env XDG_RUNTIME_DIR="$R" WAYLAND_DISPLAY="$nested_wl" grim -o "$SHOT" "$out/$1.png" && echo "  $out/$1.png"; }
+# Pointer and keyboard for the nested session only: the strict-resize plugin's test clients
+# (wlr virtual pointer; virtual keyboard with a US keymap, evdev codes), built if missing.
+ptests=""
+for d in "$HOME/.local/share/hypr-strict-resize/tests" "$src/.local/share/hypr-strict-resize/tests"; do
+    [ -x "$d/vptr/vptr" ] && [ -x "$d/vkbd/vkbd" ] && { ptests=$d; break; }
+done
+if [ -z "$ptests" ] && [ -f "$src/.local/share/hypr-strict-resize/tests/build.sh" ]; then
+    cp -r "$src/.local/share/hypr-strict-resize/tests" "$work/ptests" && sh "$work/ptests/build.sh" >/dev/null 2>&1 && ptests="$work/ptests"
+fi
+ptr() { [ -n "$ptests" ] && env -i XDG_RUNTIME_DIR="$R" WAYLAND_DISPLAY="$nested_wl" "$ptests/vptr/vptr" 1920 1080 "$@"; }
+kbd() { [ -n "$ptests" ] && env -i XDG_RUNTIME_DIR="$R" WAYLAND_DISPLAY="$nested_wl" "$ptests/vkbd/vkbd" "$@"; }
 notify() { env DBUS_SESSION_BUS_ADDRESS="$bus_addr" /usr/bin/notify-send "$@"; }
+
+if [ "$hold" = 1 ]; then
+    { declare -p R sig nested_wl bus_addr H P QS SHOT out work ptests base_env qs_env
+      declare -f hc qsi shoot ptr kbd notify layer_on until_layer until_gone until_jq term terms_on terms_off; } > "$work/env.sh"
+    echo "holding: source $work/env.sh; touch $work/stop to end"
+    until [ -e "$work/stop" ]; do sleep 1; alive || break; done
+    exit 0
+fi
 
 for mode in $modes; do
     [ "$mode" = dark ] && echo true > "$dark_file" || echo false > "$dark_file"
@@ -295,12 +339,121 @@ EOF
         sleep 1.2; shoot "notifications-$mode"
         qsi call notif dismissAll >/dev/null; sleep 0.6
     fi
+    if want lecture; then      # a circle and an underline in ink, and a timer
+        qsi call lecture draw >/dev/null; sleep 0.8
+        ptr $(python3 -c "
+import math
+pts = [(560 + 330 * math.cos(t / 40 * 2 * math.pi), 690 + 70 * math.sin(t / 40 * 2 * math.pi)) for t in range(42)]
+print('m %d %d s 80 d s 50 ' % pts[0] + ' '.join('m %d %d s 12' % p for p in pts) + ' u s 200')")
+        ptr m 1150 345 s 80 d s 50 m 1300 347 s 20 m 1450 346 s 20 m 1600 348 s 20 m 1780 347 s 100 u s 200
+        qsi call lecture timer 10 "Quiz" >/dev/null; sleep 1.2
+        shoot "lecture-$mode"
+        qsi call lecture off >/dev/null; sleep 0.8
+    fi
+    if want keys; then         # the key display (fed made-up presses; see lecture-keys above)
+        qsi call lecture keys >/dev/null; sleep 3.1; shoot "keys-$mode"
+        qsi call lecture off >/dev/null; sleep 0.8
+    fi
+    if [ "$mode" = dark ]; then
+        if want calc; then qsi call launcher openWith "=2^10 + 3*7" >/dev/null; sleep 1.2; shoot calc-dark; qsi call launcher toggle >/dev/null; until_gone qs-launcher 30; sleep 0.4; fi
+        if want emoji; then qsi call launcher openWith ":tiger" >/dev/null; sleep 1.2; shoot emoji-dark; qsi call launcher toggle >/dev/null; until_gone qs-launcher 30; sleep 0.4; fi
+        if want scenes; then      # every scene on the empty desktop, a quarter size, into one grid
+            terms_off; mkdir -p "$work/scenes"
+            scenes=$(qsi call wallpaper status | grep -o 'scenes=[^ ]*' | cut -d= -f2 | tr , ' ')
+            [ -n "$scenes" ] || scenes="silk aurora contours ink ridges sky terrain flow ripples field pulsar depths"
+            for sc in $scenes; do
+                qsi call wallpaper scene "$sc" >/dev/null; sleep 2.2
+                env XDG_RUNTIME_DIR="$R" WAYLAND_DISPLAY="$nested_wl" grim -o "$SHOT" -s 0.25 "$work/scenes/$sc.png"
+            done
+            qsi call wallpaper scene silk >/dev/null
+            python3 -I - "$work/scenes" "$out/scenes-dark.png" $scenes <<'EOF'
+import sys
+from PIL import Image, ImageDraw, ImageFont
+d, outp, names = sys.argv[1], sys.argv[2], sys.argv[3:]
+ims = [Image.open(f"{d}/{n}.png").convert("RGB") for n in names]
+w, h = ims[0].size; cols = 4; rows = (len(ims) + cols - 1) // cols; gap = 6
+sheet = Image.new("RGB", (cols * w + (cols + 1) * gap, rows * h + (rows + 1) * gap), (14, 12, 20))
+try: font = ImageFont.truetype("DejaVuSansMono-Bold.ttf", 15)
+except OSError: font = ImageFont.load_default()
+for i, (n, im) in enumerate(zip(names, ims)):
+    x, y = gap + (i % cols) * (w + gap), gap + (i // cols) * (h + gap)
+    im = im.crop((0, 14, w, h)).resize((w, h))          # without the bar
+    sheet.paste(im, (x, y)); dr = ImageDraw.Draw(sheet)
+    dr.rounded_rectangle((x + 8, y + h - 30, x + 16 + dr.textlength(n, font=font), y + h - 8), 5, fill=(14, 12, 20))
+    dr.text((x + 12, y + h - 28), n, fill=(245, 102, 0), font=font)
+sheet.save(outp); print("  " + outp)
+EOF
+            terms_on "Clemson Dark"
+        fi
+    fi
 done
+
+# ---- animations (dark): wf-recorder for SECONDS, then animated WebP ----
+record() {   # record NAME SECONDS FILTER ACTION...: ACTION runs in the background while recording
+    local name=$1 secs=$2 vf=$3; shift 3
+    want "$name" || return 0
+    command -v wf-recorder >/dev/null || { echo "  $name: no wf-recorder" >&2; return 0; }
+    env XDG_RUNTIME_DIR="$R" WAYLAND_DISPLAY="$nested_wl" timeout -s INT "$secs" \
+        wf-recorder -o "$SHOT" -r 30 -c libx264 -p crf=16 -f "$work/$name.mp4" >/dev/null 2>&1 &
+    local rp=$!; sleep 0.6; "$@" & local ap=$!; wait "$rp"; wait "$ap" 2>/dev/null
+    ffmpeg -v error -y -i "$work/$name.mp4" -vf "$vf" -c:v libwebp_anim -lossless 0 -q:v 62 -compression_level 6 \
+        -loop 0 "$out/$name.webp" && echo "  $out/$name.webp ($(du -k "$out/$name.webp" | cut -f1) KB)"
+}
+if [ "$anim" = 1 ]; then
+    echo "animations:"
+    echo true > "$dark_file"; terms_off; sleep 2.5
+    # the scenes drift slowly by design; sped up for the clip so the motion shows
+    qsi call wallpaper force true >/dev/null; qsi call wallpaper speed 0.06 >/dev/null; sleep 1
+    record anim-wallpaper 6 "fps=20,scale=960:-2:flags=lanczos" sleep 0
+    qsi call wallpaper speed 0.012 >/dev/null
+    a_pet() { sleep 1.5; notify -a "Calendar" -i x-office-calendar "Office hours in 10 minutes" "Room 210"; sleep 3; qsi call notif dismissAll >/dev/null; }
+    record anim-pet 7 "crop=1920:260:0:820,fps=20,scale=1280:-2:flags=lanczos" a_pet
+    a_theme() { sleep 1.2; echo false > "$dark_file"; sleep 2.6; echo true > "$dark_file"; }
+    qsi call panel open >/dev/null; until_layer qs-panel 40; sleep 0.6
+    record anim-theme 7 "fps=20,scale=960:-2:flags=lanczos" a_theme
+    qsi call panel close >/dev/null; until_gone qs-panel 30
+    terms_on "Clemson Dark"
+    a_island() { sleep 0.8; qsi call island say "Data Structures lecture in 5 minutes" "Hall B 100" >/dev/null; }
+    record anim-island 6 "crop=960:200:480:0,fps=24" a_island
+fi
+
+# ---- the editor: needs the virtual keyboard, whose US keymap shows in the bar's layout pill from
+# here on, so it comes after everything else (the island is off meanwhile: it would announce the keymap)
+if want editor; then
+    qsi call island off >/dev/null
+    for mode in $modes; do
+        [ "$mode" = dark ] && echo true > "$dark_file" || echo false > "$dark_file"
+        terms_off; sleep 2; [ "$mode" = dark ] && terms_on "Clemson Dark" || terms_on "Clemson Light"
+        qsi call shot edit >/dev/null; until_layer qs-shot 40; sleep 1
+        ptr m 300 150 s 100 d s 100 m 900 450 s 100 m 1500 820 s 200 u s 300
+        kbd t 30 s 200                                                            # a: arrow
+        ptr m 1200 700 s 100 d s 80 m 1000 550 s 80 m 800 400 s 150 u s 200
+        kbd t 48 s 200                                                            # b: box
+        ptr m 420 260 s 100 d s 80 m 700 330 s 80 m 760 360 s 150 u s 200
+        kbd t 49 s 200                                                            # n: numbered steps
+        ptr m 400 240 s 100 d s 60 u s 300 m 1250 720 s 100 d s 60 u s 300
+        kbd t 45 s 200                                                            # x: pixelate
+        ptr m 1100 300 s 100 d s 80 m 1400 380 s 80 m 1450 400 s 150 u s 300
+        sleep 0.5; shoot "editor-$mode"
+        kbd t 1 s 300; until_gone qs-shot 30                                      # Esc
+    done
+    qsi call island on >/dev/null
+fi
 
 if [ -n "$keys" ]; then   # the key-binding page, from the published config's bindings
     hc -j binds > "$work/binds.json" && mkdir -p "$(dirname "$keys")" && "$HOME/.local/bin/keybind-sheet" --binds "$work/binds.json" --org "$keys"
 fi
 alive || echo "desktop-shots: the shell died during the run (pictures may be incomplete)" >&2
+# ---- the lock screen, last: there is no unlocking it. It reads the theme once at start, so one lock
+# per mode (allow_session_lock_restore lets a new lock client take over from a killed one).
+if want lock; then
+    for mode in $modes; do
+        [ "$mode" = dark ] && echo true > "$dark_file" || echo false > "$dark_file"
+        if [ -x "$GL" ]; then "${qs_env[@]}" LOCK_SCENE=silk "$GL" "$QS" -p "$H/.config/quickshell/lockscreen.qml" --no-color >> "$work/lock.log" 2>&1 &
+        else "${qs_env[@]}" LOCK_SCENE=silk QT_QUICK_BACKEND=software "$QS" -p "$H/.config/quickshell/lockscreen.qml" --no-color >> "$work/lock.log" 2>&1 & fi
+        lpid=$!; pids+=($lpid); sleep 4; shoot "lock-$mode"; kill -9 "$lpid" 2>/dev/null; sleep 1
+    done
+fi
 if command -v pngquant >/dev/null; then   # palette PNGs, about a quarter of the size; they live in git
     for f in "$out"/*-dark.png "$out"/*-light.png; do
         [ -f "$f" ] && [ "$f" -nt "$work/started" ] && pngquant --quality 65-90 --speed 1 --strip -f --ext .png "$f" 2>/dev/null

@@ -1,5 +1,7 @@
 #+title: Theming
 
+[[file:../screenshots/anim-theme.webp]]
+
 | Dark | Light |
 |------+-------|
 | [[file:../screenshots/desktop-dark.png]] | [[file:../screenshots/desktop-light.png]] |
