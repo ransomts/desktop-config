@@ -13,11 +13,11 @@ This is a copy of my real config, published so people can read it and borrow fro
 
 Dark and light follow the time of day (see [[file:docs/theming.org][theming]]); the switch is live:
 
-[[file:screenshots/anim-theme.webp]]
+#+HTML: <img src="screenshots/anim-theme.webp" alt="theme animation">
 
 The wallpaper is a set of animated shaders, here sped up:
 
-[[file:screenshots/anim-wallpaper.webp]]
+#+HTML: <img src="screenshots/anim-wallpaper.webp" alt="wallpaper animation">
 
  Every picture and animation is taken by =desktop-shots= in a staged session with made-up data; see [[#how-the-screenshots-are-made][how the screenshots are made]]. More pictures (launcher modes, every wallpaper scene, the island, the pet) are in [[file:docs/shell.org][docs/shell.org]].
 
