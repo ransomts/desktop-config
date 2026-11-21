@@ -1,9 +1,41 @@
 #+title: desktop-config
 #+subtitle: Hyprland + Quickshell on a System76 laptop, in Clemson orange
 
+[[file:screenshots/desktop-dark.png]]
+
 My Linux desktop: a Hyprland session whose whole shell (bar, launcher, notifications, lock screen, control panel, wallpaper, settings) is written in Quickshell, plus the scripts and user services that hold it together. It runs on Pop!_OS 24.04 on a System76 Lemur Pro, docked to four screens most days, with COSMIC still installed as the fallback session.
 
 This is a copy of my real config, published so people can read it and borrow from it. It is not an installer: paths, screens, the keyboard layout (Dvorak) and a few integrations are mine. Take the pieces you want.
+
+* Screenshots
+
+Dark and light follow the time of day (see [[file:docs/theming.org][theming]]). Every picture is taken by =desktop-shots= in a staged session with made-up data; see [[#how-the-screenshots-are-made][how the screenshots are made]].
+
+| Dark | Light |
+|------+-------|
+| [[file:screenshots/wallpaper-dark.png]] | [[file:screenshots/wallpaper-light.png]] |
+| The empty desktop: animated shader wallpaper, the bar, the pet | |
+| [[file:screenshots/launcher-dark.png]] | [[file:screenshots/launcher-light.png]] |
+| Launcher, with its modes listed under the search line | |
+| [[file:screenshots/panel-dark.png]] | [[file:screenshots/panel-light.png]] |
+| Control panel (Super+C) | |
+| [[file:screenshots/dashboard-dark.png]] | [[file:screenshots/dashboard-light.png]] |
+| Dashboard (Super+I): the day, weather, mail counts, the machine, tomorrow | |
+| [[file:screenshots/notifications-dark.png]] | [[file:screenshots/notifications-light.png]] |
+| Notification popups | |
+| [[file:screenshots/overview-dark.png]] | [[file:screenshots/overview-light.png]] |
+| Overview (Super+Tab) | |
+| [[file:screenshots/settings-dark.png]] | [[file:screenshots/settings-light.png]] |
+| Settings (Super+comma) | |
+
+* What is here
+
+| Page | About |
+|------+-------|
+| [[file:docs/shell.org][docs/shell.org]] | The Quickshell shell, piece by piece: bar and pills, launcher, notifications, panel, settings, dashboard, wallpaper, lock screen, lecture tools, the pet |
+| [[file:docs/keybindings.org][docs/keybindings.org]] | Every key binding, grouped (generated from the config) |
+| [[file:docs/theming.org][docs/theming.org]] | Colours: the palette, dark and light by time of day, recolouring everything with =palette= |
+| [[file:docs/testing.org][docs/testing.org]] | The test suites, the nested-Hyprland tests, and how the screenshots are made |
 
 * Layout
 
@@ -12,13 +44,15 @@ Everything under =home/= sits where it lives in =$HOME=.
 | Path | What it is |
 |------+------------|
 | =home/.config/hypr/= | Hyprland 0.57 config in Lua (=hyprland.lua=, =layouts.lua=), plus hypridle, hyprlock, hyprpaper, hyprsunset |
-| =home/.config/quickshell/= | The shell: about 170 QML files, shaders, a few JS helpers and assets |
-| =home/.local/bin/= | Scripts the bar, launcher and key bindings call |
+| =home/.config/quickshell/= | The shell: about 160 QML files, 15 shaders, a few JS helpers and assets, and its tests |
+| =home/.local/bin/= | Scripts the bar, launcher and key bindings call, and the test suites (=*-test=) |
 | =home/.local/share/hypr-strict-resize/= | A small Hyprland plugin (C++) for resizing tiled windows, with its tests |
+| =home/.local/share/desktop-tests/= | Shared fixtures and helpers for the test suites |
 | =home/.config/palette/= | The colour-plan tool's data: master copies of every themed file and alternate plans |
 | =home/.config/fuzzel/=, =ghostty/=, =gtk-3.0/=, =gtk-4.0/=, =qt5ct/=, =qt6ct/= | Matching colours for the launcher fallback, terminal, GTK and Qt apps |
 | =home/.config/systemd/user/= | User services and timers for the desktop (theme by time of day, polkit prompt, dock layout, logging) |
 | =home/.config/uwsm/=, =environment.d/=, =.local/share/wayland-sessions/= | Session start-up through uwsm |
+| =screenshots/=, =docs/keybindings.org= | Generated; not edited by hand |
 
 * Versions
 
@@ -27,7 +61,7 @@ Everything under =home/= sits where it lives in =$HOME=.
 - uwsm for the session ("Hyprland (uwsm-managed)" at the greeter)
 - Nerd Fonts for the bar glyphs, Papirus icons with orange folders (=papirus-orange-install=), Bibata cursor (=bibata-cursor-install=)
 
-* Key bindings
+* Key bindings in brief
 
 One meaning per modifier, written at the top of the key section of =hyprland.lua=:
 
@@ -39,29 +73,7 @@ One meaning per modifier, written at the top of the key section of =hyprland.lua
 | Super+Alt | tab groups |
 | Super+Z, then a letter | lecture tools: D draw, L spotlight, K show keys, Z the menu |
 
-Some fixed points: Super+D launcher, Super+Tab overview, Alt+Tab window switcher, Super+C control panel, Super+N notifications, Super+I dashboard, Super+W wallpaper menu, Super+comma settings, Print screenshot editor, Super+[0-9] desktops, Super+P display switching. =keybind-help= shows the live list from the running config.
-
-* The shell (Quickshell)
-
-=shell.qml= is the entry point; =quickshell-start= launches it. The lock screen (=lockscreen.qml=) and the polkit password prompt (=authprompt.qml=) run as their own Quickshell instances, so a crash in the main shell cannot take them down.
-
-- Bar (=Bar.qml=, =Pill.qml=): one per screen. Every pill follows one rule: click opens its list or card, right-click is the quick action (mute, Do Not Disturb, play/pause, eject, reconnect), middle-click opens the full app, scroll only for levels.
-- Launcher (=Launcher.qml=, =LaunchView.qml=): apps by how often you use them, plus modes for a calculator, clipboard history, files, windows, emoji, quick calendar events ("event Lunch tomorrow 12-1") and notes.
-- Notifications (=Notif*.qml=, =Island.qml=): Quickshell is the notification daemon. Popups stack in the corner, repeats collapse into one card with a count, and short messages grow out of the top of the bar.
-- Calendar-aware Do Not Disturb (=Quiet*.qml=, =quiet.js=): goes quiet during meetings and lectures on its own.
-- Control panel and settings (=Panel.qml=, =Settings*.qml=): one settings window over everything that already exists (displays, input, power, notifications, screensaver, recording). Every row reads the live value and writes it back where it really lives.
-- Wallpaper (=Wallpaper.qml=, =Wall*.qml=, =shaders/=): animated shader scenes on the bottom layer, a real night sky for your latitude (star catalogue, moon phase, planets), seasonal touches and a thin band showing the day's calendar. It holds still on battery.
-- Lock screen and screensaver (=Lock*.qml=, =Saver*.qml=).
-- Screenshot editor (=Shot*.qml=): freezes every screen, select a region, annotate, copy or save. Also a screen-share picker for =xdg-desktop-portal-hyprland= (=SharePick.qml=).
-- Lecture tools (=Lecture*.qml=): draw on the screen, spotlight, show the keys being pressed, a countdown timer, a round webcam bubble for recordings.
-- The pet (=Pet*.qml=): a pixel-art tiger cub that lives in the empty stretches of the bar, reacts to notifications, runs a focus timer and keeps reminders. It also has a few secrets.
-- Tests: =fit-check= walks every popup and reports anything drawn where it gets cut off.
-
-* Colours
-
-Everything is themed from one palette: Clemson orange (=#F56600=) and regalia purple, with dark and light variants. =theme-by-time= switches between them on the night light's schedule in =hyprsunset.conf= (a manual toggle, Super+Ctrl+T, holds until the next switch), and =hypr-theme-apply= plus =gtk-theme-follows-cosmic= swap the files that need swapping for fuzzel, GTK and Qt; Quickshell and the terminal follow on their own.
-
-=palette= recolours the whole set in one go: =palette new NAME --seed '#hex'= (or =--image FILE=) makes a plan, =palette preview NAME= draws it beside the current one, and applying it rewrites every file listed in =home/.config/palette/files.json= from the masters while keeping each colour's lightness. =forest=, =ocean= and =rose= are example plans.
+Some fixed points: Super+D launcher, Super+Tab overview, Alt+Tab window switcher, Super+C control panel, Super+N notifications, Super+I dashboard, Super+W wallpaper menu, Super+comma settings, Print screenshot editor, Super+[0-9] desktops, Super+P display switching. Super+/ shows the live list; the full table is in [[file:docs/keybindings.org][docs/keybindings.org]].
 
 * hypr-strict-resize
 
@@ -71,8 +83,15 @@ A Hyprland plugin that makes resizing tiled windows follow the pointer and the a
 
 - Copy a file or folder into the same place under your =$HOME=; nothing here needs to be installed as a whole.
 - Scripts assume =~/.local/bin= is on =PATH=, and some call each other.
-- Things that are mine and will need changing: monitor names and positions in =hyprland.lua= and =dock-monitor-layout=, the Dvorak layout, mail folder names in =dashboard-data= and =shell-status=, the latitude and longitude for the sky and weather, and the System76-specific bits (=charge-profile=, power profiles, the Fn-row keys).
-- A few pills read from services I run locally (a Matrix bridge for Teams unread counts, mbsync mail, an Org calendar export). They hide themselves when there is nothing to read.
+- Things that are mine and will need changing: monitor names and positions in =hyprland.lua= and =dock-monitor-layout= (the serial numbers in the =desc:= rules are placeholders here, so put your own monitors in), the Dvorak layout, mail folder names in =dashboard-data= and =shell-status=, the latitude and longitude for the sky and weather, and the System76-specific bits (=charge-profile=, power profiles, the Fn-row keys).
+- A few pills read from things I run locally (a Matrix bridge for Teams unread counts, mbsync mail, an Org calendar export, two Bluetooth video lights). They hide themselves when there is nothing to read.
+
+* How the screenshots are made
+:PROPERTIES:
+:CUSTOM_ID: how-the-screenshots-are-made
+:END:
+
+=desktop-shots= starts a nested Hyprland on the config in this repo, runs the real shell in it on a 1920x1080 headless screen, and photographs it with =grim=. It runs in a throwaway home directory on private D-Bus buses, with every program the shell might launch replaced by a stub, and feeds it made-up data: a calendar with a teaching day, three notifications, canned weather and mail counts, and two terminals showing files from this repo. Nothing from my own session can end up in a picture. The same run writes =docs/keybindings.org= from the nested session's bindings. More in [[file:docs/testing.org][docs/testing.org]].
 
 * License
 

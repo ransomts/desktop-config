@@ -1,0 +1,58 @@
+#+title: Testing
+
+The shell and scripts have about thirty test suites, all in =home/.local/bin/= as =*-test=. =desktop-test= runs them all in parallel and prints one line per suite, then the failures.
+
+#+begin_src sh
+desktop-test            # everything, 10 suites at a time
+desktop-test -l         # list the suites
+desktop-test clock hypr # only these
+#+end_src
+
+Logs go to =~/.local/state/desktop-test/latest/=.
+
+* How they stay out of the way
+
+Each suite runs in its own temporary =HOME=, runtime directory and D-Bus session, with stub commands in place of anything that would touch the real machine (=notify-send=, =systemctl=, =nmcli=, =wpctl=, ...). The stubs record what they were asked to do, and the tests check that record. The QML suites load the pieces they test offscreen; the full shell only runs in the nested ones below.
+
+* The suites
+
+| Suite | Covers |
+|-------+--------|
+| =hypr-test= | the Hyprland config itself, in a nested Hyprland: it loads clean, autostart, no key bound twice, special workspaces, docking and undocking with headless monitors |
+| =shell-boot-test= | the whole shell in a nested Hyprland: it starts and stays up, no QML errors or binding loops, bars on hot-plugged screens, IPC opens and closes each view, and =fit-check= finds nothing cut off |
+| =hypr-scripts-test= | the helpers that drive Hyprland through =hyprctl= |
+| =qml-panels-test=, =qml-overlays-test= | the bar's popups, panel pieces, overview and other overlays |
+| =launcher-test= | the launcher and its modes |
+| =notify-test= | the notification core: popups, grouping, rules |
+| =settings-test= | the settings window and its pages |
+| =health-test= | =shell-health= and the health pill, popup and singleton |
+| =devices-test= | Bluetooth audio, the lights (=gvm=), drives and other hardware glue |
+| =displays-test= | Settings > Displays and =display-layout= |
+| =agenda-test=, =dayflow-test=, =events-test=, =clock-test= | the calendar band, calendar-aware Do Not Disturb, quick events, clocks and time zones |
+| =lecture-test=, =capture-test=, =shot-test= | lecture tools; recording, mic and webcam; the screenshot editor and share picker |
+| =saver-test=, =session-test=, =power-test=, =input-test=, =auth-test= | screensaver; session restore; battery care and break reminders; input settings; the polkit prompt |
+| =pet-test= | the pet's pointer handling |
+| =menus-test=, =data-test=, =palette-follow-test= | picker menus and glue scripts; the Python data sources; the palette following the theme |
+
+* Nested Hyprland
+
+=hypr-test=, =shell-boot-test= and =desktop-shots= start a second Hyprland as a window inside the running session, on its own sockets and buses, with =HYPRLAND_NO_SD_VARS= set and stubs for =systemctl=, =uwsm= and =dbus-update-activation-environment=; otherwise the nested instance would point the real session's systemd environment at itself. Each one checks afterwards that the live session's environment is unchanged.
+
+* fit-check
+
+=fit-check= opens every popup and view of the running shell in turn and reports any text or control drawn where it gets cut off. =shell-boot-test= runs it on a 1920x1080 headless screen.
+
+* Screenshots
+
+=desktop-shots= takes the pictures in =screenshots/= and writes =docs/keybindings.org=:
+
+1. It copies the config from this repo's =home/= (what is published, not my live files) into a temporary home.
+2. It starts a nested Hyprland, adds a 1920x1080 headless screen and switches the nested window's own screen off.
+3. It runs the shell there with the same isolation as =shell-boot-test=, plus made-up data: a calendar file with a teaching day, canned weather and mail counts, three notifications sent on the private bus, and two Ghostty windows showing files from this repo.
+4. For dark and then light, it photographs the empty desktop, the desktop with windows, and each view (opened through =qs ipc=), with =grim= on the headless screen.
+5. It dumps the nested session's bindings and runs =keybind-sheet --org= on them, then shrinks the PNGs with =pngquant=.
+
+#+begin_src sh
+desktop-shots                      # all shots, both modes
+desktop-shots --only launcher,panel --dark-only -o /tmp/shots
+#+end_src

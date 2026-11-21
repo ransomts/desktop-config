@@ -1,0 +1,318 @@
+#!/bin/bash
+# Boot test for the WHOLE Quickshell shell (~/.config/quickshell/shell.qml): starts a nested Hyprland
+# on the real Hyprland config, runs the real shell in it (Nix qs through nixGLIntel, as quickshell-start
+# does) and checks it comes up and stays up. Every other Quickshell suite loads pieces offscreen; this
+# is the one that sees the full shell against a compositor.
+#
+#   shell-boot-test           run everything; PASS/FAIL lines and a RESULT line; exit 1 on a failure
+#   shell-boot-test -v        also print the shell's log, the recorded commands and the Hyprland log tail
+#   shell-boot-test -d DIR    test the Quickshell config in DIR instead of ~/.config/quickshell
+#   shell-boot-test -k        keep the temporary directory (printed)
+#   shell-boot-test -F        skip the fit-check sweep (it is about half the run time)
+#
+# Covered: the shell starts and stays up; its log carries no QML errors (TypeError, ReferenceError,
+# "is not a type", "Failed to load", binding loops, ...); the bar and wallpaper layers sit
+# on the monitor; two headless monitors added: a bar and a wallpaper on each; removed again: the shell
+# survives with no new errors; `qs ipc` (nested instance only) opens and closes the launcher, control
+# panel, overview and dashboard without errors; ~/.local/bin/fit-check sweeps every popup and finds
+# nothing cut off (on a 1920x1080 headless screen, with the nested window's own screen switched off meanwhile).
+#
+# Isolation. The nested Hyprland shows up as a window on your current desktop for ~30 s; nothing else
+# should reach the live session:
+#  - HOME, XDG_RUNTIME_DIR, XDG_STATE_HOME, XDG_CONFIG_HOME, XDG_CACHE_HOME, XDG_DATA_HOME are temporary.
+#    qs keeps its instance registry under XDG_RUNTIME_DIR, so every `qs ipc` here (and fit-check) can
+#    only see the nested shell; the live Quickshell is invisible to it;
+#  - the shell runs on its own D-Bus session bus AND its own "system" bus (DBUS_SYSTEM_BUS_ADDRESS), so it
+#    is no notification daemon, polkit agent, MPRIS client, BlueZ / NetworkManager / UPower client for
+#    the real machine; pipewire is not reachable (its socket lives in the real XDG_RUNTIME_DIR);
+#  - deny-by-default PATH: a short allow list of plain tools (sh, jq, python3, coreutils, hyprctl, which
+#    reaches only the nested instance) and a recording stub for every other program in /usr/bin and
+#    /usr/local/bin (notify-send, systemctl, curl, playerctl, nmcli, wpctl, pw-play, tailscale, ...);
+#  - the temporary ~/.local/bin holds a recording stub for every script in the real one (run-logged too,
+#    so nothing the shell launches runs), except a few read-only, offline status scripts copied for real;
+#  - Hyprland itself runs exactly as in hypr-test (stubs from ~/.config/hypr/tests/stubs first on PATH,
+#    HYPRLAND_NO_SD_VARS, every hl.exec_cmd recorded by a run-logged stub);
+#  - the live systemd environment and hypr-desk-home are compared before and after; a change FAILs.
+set -u
+verbose=0; keep=0; nofit=0; qsrc="$HOME/.config/quickshell"; hsrc="$HOME/.config/hypr"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v) verbose=1 ;;
+        -k) keep=1 ;;
+        -F) nofit=1 ;;
+        -d) qsrc="$2"; shift ;;
+        *) echo "usage: shell-boot-test [-v] [-k] [-F] [-d QUICKSHELL_CONFIG_DIR]" >&2; exit 2 ;;
+    esac
+    shift
+done
+QS="$HOME/.nix-profile/bin/qs"; GL="$HOME/.nix-profile/bin/nixGLIntel"
+htests="$HOME/.config/hypr/tests"
+for need in Hyprland hyprctl jq dbus-daemon python3; do
+    command -v "$need" >/dev/null || { echo "shell-boot-test: needs $need" >&2; exit 2; }
+done
+[ -x "$QS" ] || { echo "shell-boot-test: no qs at $QS" >&2; exit 2; }
+[ -f "$qsrc/shell.qml" ] || { echo "shell-boot-test: no $qsrc/shell.qml" >&2; exit 2; }
+[ -f "$hsrc/hyprland.lua" ] && [ -d "$htests/stubs" ] || { echo "shell-boot-test: no $hsrc/hyprland.lua or $htests/stubs" >&2; exit 2; }
+[ -n "${WAYLAND_DISPLAY:-}" ] && [ -n "${XDG_RUNTIME_DIR:-}" ] || { echo "shell-boot-test: needs a Wayland session to open the nested one in" >&2; exit 2; }
+case "$WAYLAND_DISPLAY" in /*) live_wl="$WAYLAND_DISPLAY" ;; *) live_wl="$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ;; esac
+
+live_env() { systemctl --user show-environment 2>/dev/null | grep -E '^(WAYLAND_DISPLAY|DISPLAY|HYPRLAND_INSTANCE_SIGNATURE|PATH)=' | sort; }
+live_home() { cat "$XDG_RUNTIME_DIR/hypr-desk-home" 2>/dev/null | md5sum; }
+env_before=$(live_env); home_before=$(live_home)
+
+work=$(mktemp -d) || exit 2
+H="$work/home"; R="$work/run"; LOG="$work/exec.log"; P="$work/path"; QLOG="$work/qs.log"
+mkdir -p "$H/.config" "$H/.local/bin" "$H/.local/lib/hyprland" "$H/.local/state" "$H/.local/share" "$H/.cache" \
+         "$H/.nix-profile/bin" "$R" "$P" && chmod 700 "$R"
+cp -r "$hsrc" "$H/.config/hypr"
+mkdir -p "$H/.config/quickshell"
+( cd "$qsrc" && tar --exclude=./tests --exclude='*.orig' -cf - . ) | tar -C "$H/.config/quickshell" -xf -
+[ -f "$HOME/.local/lib/hyprland/strict-resize.so" ] && ln -s "$HOME/.local/lib/hyprland/strict-resize.so" "$H/.local/lib/hyprland/"
+for d in fonts icons; do [ -d "$HOME/.local/share/$d" ] && ln -s "$HOME/.local/share/$d" "$H/.local/share/$d"; done
+ln -s "$QS" "$H/.nix-profile/bin/qs"          # fit-check and bar-refresh look for qs here
+: > "$LOG"
+
+# the recorder: every stubbed program and script is a link to it
+cat > "$work/rec" <<'EOF'
+#!/bin/sh
+printf '%s %s\n' "$(basename "$0")" "$*" >> "${SBT_LOG:-/dev/null}"
+exit 0
+EOF
+chmod +x "$work/rec"
+# ~/.local/bin: a recorder per script, except these read-only, offline status scripts (they read files
+# under the temporary HOME, or nothing at all; anything they run goes through the PATH below)
+real_scripts="dnd-toggle notif-dnd drives agenda-day tz-now sunset-times shell-status"
+for f in "$HOME"/.local/bin/*; do
+    n=${f##*/}
+    case " $real_scripts " in *" $n "*) cp "$f" "$H/.local/bin/$n" ;; *) ln -s "$work/rec" "$H/.local/bin/$n" ;; esac
+done
+# canned answers where an empty one would only make the shell warn
+rm -f "$H/.local/bin/shell-health"     # (a link to the recorder: replace the link, not its target)
+cat > "$H/.local/bin/shell-health" <<'CANNED'
+#!/bin/sh
+printf '%s %s\n' shell-health "$*" >> "${SBT_LOG:-/dev/null}"
+echo '{"worst": "ok", "jobs": []}'
+CANNED
+chmod +x "$H/.local/bin/shell-health"
+mkdir -p "$H/.config/cosmic/com.system76.CosmicTheme.Mode/v1" && echo true > "$H/.config/cosmic/com.system76.CosmicTheme.Mode/v1/is_dark"
+cp "$HOME/.local/bin/fit-check" "$work/fit-check"   # run from here, against the nested shell (HOME=temp)
+# PATH: allow list of real tools, a recorder for every other program
+allow="sh dash bash env python3 jq sed awk gawk mawk grep cat date head tail tr cut sort uniq wc printf echo test [
+       basename dirname mkdir ls stat readlink realpath seq sleep true false findmnt hyprctl id uname nproc mktemp
+       touch rm mv cp ln tee xargs expr od md5sum find timeout"
+python3 -I - "$P" "$work/rec" $allow <<'EOF'
+import os, sys, shutil
+p, rec, allow = sys.argv[1], sys.argv[2], set(sys.argv[3:])
+for d in ("/usr/local/bin", "/usr/bin", "/bin"):
+    try: names = os.listdir(d)
+    except OSError: continue
+    for n in names:
+        dst = os.path.join(p, n)
+        if os.path.lexists(dst): continue
+        os.symlink(os.path.join(d, n) if n in allow else rec, dst)
+for n in ("qs", "quickshell", "nixGLIntel", "notify-send", "playerctl", "cava", "pw-play", "wpctl", "pactl"):
+    if not os.path.lexists(os.path.join(p, n)): os.symlink(rec, os.path.join(p, n))
+EOF
+
+pids=()
+cleanup() {
+    [ -n "${qs_pid:-}" ] && kill -9 "$qs_pid" 2>/dev/null
+    for p in "${pids[@]}"; do kill -9 "$p" 2>/dev/null; done
+    [ -n "${hypr_pid:-}" ] && kill -9 "$hypr_pid" 2>/dev/null
+    [ -n "${bus_pid:-}" ] && kill "$bus_pid" 2>/dev/null
+    [ -n "${sbus_pid:-}" ] && kill "$sbus_pid" 2>/dev/null
+    wait 2>/dev/null
+    if [ "$keep" = 1 ]; then echo "kept $work"; else rm -rf "$work"; fi
+}
+trap cleanup EXIT
+
+# Two private buses: the session one, and a stand-in for the system bus (BlueZ, NetworkManager,
+# UPower, polkit are simply not there).
+bus=$(dbus-daemon --session --fork --print-address=1 --print-pid=1 --nopidfile) || { echo "shell-boot-test: dbus-daemon failed" >&2; exit 2; }
+bus_addr=$(printf '%s\n' "$bus" | sed -n 1p); bus_pid=$(printf '%s\n' "$bus" | sed -n 2p)
+sbus=$(dbus-daemon --session --fork --print-address=1 --print-pid=1 --nopidfile) || { echo "shell-boot-test: dbus-daemon failed" >&2; exit 2; }
+sbus_addr=$(printf '%s\n' "$sbus" | sed -n 1p); sbus_pid=$(printf '%s\n' "$sbus" | sed -n 2p)
+
+base_env=(HOME="$H" USER="$USER" LANG="${LANG:-C.UTF-8}"
+    XDG_RUNTIME_DIR="$R" XDG_CONFIG_HOME="$H/.config" XDG_STATE_HOME="$H/.local/state"
+    XDG_CACHE_HOME="$H/.cache" XDG_DATA_DIRS="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+    DBUS_SESSION_BUS_ADDRESS="$bus_addr" DBUS_SYSTEM_BUS_ADDRESS="$sbus_addr"
+    HYPR_TEST_LOG="$LOG" SBT_LOG="$LOG" NO_AT_BRIDGE=1 GTK_A11Y=none)
+
+# Hyprland as hypr-test runs it (its stubs first on PATH; XDG_DATA_HOME the real one, read only)
+# (LIBSEAT_BACKEND=seatd: see hypr-test; stops a forked libseat child dumping core every run)
+env -i "${base_env[@]}" PATH="$htests/stubs:$PATH" XDG_DATA_HOME="$HOME/.local/share" \
+    WAYLAND_DISPLAY="$live_wl" LIBSEAT_BACKEND=seatd HYPRLAND_NO_SD_VARS=1 HYPRLAND_NO_SD_NOTIFY=1 \
+    Hyprland -c "$H/.config/hypr/hyprland.lua" > "$work/hyprland.out" 2>&1 &
+hypr_pid=$!
+
+ok=0; bad=0
+pass() { ok=$((ok+1)); echo "PASS $1"; }
+fail() { bad=$((bad+1)); echo "FAIL $1${2:+   [$2]}"; }
+check() { if [ "$2" = 0 ]; then pass "$1"; else fail "$1" "${3:-}"; fi; }
+finish() {
+    if [ "$verbose" = 1 ]; then
+        echo "--- shell log"; cat "$QLOG" 2>/dev/null
+        echo "--- recorded commands (counts)"; cut -d' ' -f1 "$LOG" | sort | uniq -c | sort -rn
+        echo "--- nested Hyprland log tail"; tail -20 "$R/hypr/${sig:-none}/hyprland.log" 2>/dev/null
+    fi
+    echo "RESULT pass $ok fail $bad"
+    [ "$bad" = 0 ] && exit 0 || exit 1
+}
+
+sig=""
+for _ in $(seq 150); do
+    s=$(/bin/ls "$R/hypr" 2>/dev/null | head -1)
+    [ -n "$s" ] && [ -S "$R/hypr/$s/.socket.sock" ] && { sig=$s; break; }
+    kill -0 "$hypr_pid" 2>/dev/null || break
+    sleep 0.1
+done
+if [ -z "$sig" ]; then fail "nested Hyprland came up" "$(tail -3 "$work/hyprland.out" | tr '\n' ' ')"; finish; fi
+hc() { env XDG_RUNTIME_DIR="$R" HYPRLAND_INSTANCE_SIGNATURE="$sig" hyprctl "$@"; }
+for _ in $(seq 100); do hc version >/dev/null 2>&1 && break; sleep 0.1; done
+nested_wl=$(cd "$R" && /bin/ls wayland-* 2>/dev/null | grep -v '\.lock$' | head -1)
+until_jq() { local cmd=$1 expr=$2 n=${3:-50}; for _ in $(seq "$n"); do hc -j "$cmd" 2>/dev/null | jq -e "$expr" >/dev/null 2>&1 && return 0; sleep 0.1; done; return 1; }
+mon=$(hc -j monitors | jq -r '.[0].name')
+
+# ---- start the shell (as quickshell-start does: nixGLIntel qs -n --no-color) ----
+qs_env=(env -i "${base_env[@]}" PATH="$P" XDG_DATA_HOME="$H/.local/share"
+        WAYLAND_DISPLAY="$nested_wl" HYPRLAND_INSTANCE_SIGNATURE="$sig" XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=Hyprland)
+if [ -x "$GL" ]; then "${qs_env[@]}" "$GL" "$QS" -n --no-color > "$QLOG" 2>&1 &
+else "${qs_env[@]}" QT_QUICK_BACKEND=software "$QS" -n --no-color > "$QLOG" 2>&1 & fi
+qs_pid=$!
+qsi() { "${qs_env[@]}" "$QS" ipc "$@" 2>&1; }      # qs ipc against the nested shell only
+
+
+# ---- what counts as a problem in the shell's log ----
+# QML errors: always a FAIL. Binding loops: their own check. Anything else at WARN/ERROR level must be
+# on this allow list (each one is the isolation, not the shell):
+allowed='quickshell\.service\.pipewire\.loop: Failed to connect pipewire context'`
+        `'|quickshell\.dbus\.objectmanager: Failed to create DBusObjectManagerInterface for "org\.bluez"'`
+        `'|quickshell\.network: Network will not work'`
+        `'|quickshell\.dbus: Could not launch service org\.freedesktop\.UPower'`
+        `'|quickshell\.service\.(upower|powerprofiles): Could not start'`
+        `'|qt\.qpa\.wayland\.textinput: .*(dis|en)ableSurface'`
+        `'|WARN: attempted to use dangling screen object'`
+        `'|quickshell\.hyprland\.ipc: Got removal for monitor "SBT-[0-9A-Z]*" which was not previously tracked'`
+        `"|FileView at .*: Read of $H/\\.(local/state|config/shell|cache)/[^ ]* failed: File does not exist"
+#   pipewire: its socket is in the real XDG_RUNTIME_DIR, not the temporary one (no audio access on purpose)
+#   bluez / network / UPower / PowerProfiles: the stand-in system bus has none of those services
+#   textinput disableSurface: Qt's own Wayland text-input plugin as keyboard focus hops between layer surfaces
+#   while popups open and close quickly (sweep); not the shell's code
+#   dangling screen object / removal not tracked: Quickshell itself while a monitor goes away; the live shell
+#   logs the first one on every undock too (journal), harmless; the checks below verify it survives
+#   FileView "File does not exist" under ~/.local/state, ~/.config/shell, ~/.cache: first run with an empty
+#   HOME (state files the shell creates later). A missing file under ~/.config/quickshell still FAILs.
+qml_err='TypeError|ReferenceError|SyntaxError|is not a type|Failed to load|is not defined|is not a function|Cannot read propert|Cannot assign|Unable to assign|module "[^"]*" is not installed|Type [A-Za-z]* unavailable|fit: could not'
+problems() {   # problems FROM_LINE KIND: log lines after FROM_LINE of one kind (qml | loop | other)
+    local lines; lines=$(tail -n +"$(( $1 + 1 ))" "$QLOG" 2>/dev/null | grep -v '^qs:@/qs/')
+    case "$2" in
+        qml)   printf '%s\n' "$lines" | grep -E "$qml_err" ;;
+        loop)  printf '%s\n' "$lines" | grep -i 'binding loop' ;;
+        other) printf '%s\n' "$lines" | grep -E '^ *(WARN|ERROR|CRIT|FATAL)' | grep -Ev "$qml_err" | grep -vi 'binding loop' | grep -Ev "$allowed" ;;
+    esac
+}
+logmark() { wc -l < "$QLOG"; }
+short() { head -3 | sed 's/^ *//' | cut -c1-160 | tr '\n' '|'; }
+log_checks() {   # log_checks PHASE FROM_LINE
+    local q l o
+    q=$(problems "$2" qml); [ -z "$q" ]; check "$1: no QML errors in the log" $? "$(printf '%s' "$q" | short)"
+    l=$(problems "$2" loop); [ -z "$l" ]; check "$1: no binding loops in the log" $? "$(printf '%s' "$l" | short)"
+    o=$(problems "$2" other); [ -z "$o" ]; check "$1: no unexpected warnings in the log" $? "$(printf '%s' "$o" | short)"
+}
+alive() { kill -0 "$qs_pid" 2>/dev/null; }
+layer_on() {   # layer_on MONITOR NAMESPACE: is a layer surface of that namespace on that monitor
+    hc -j layers 2>/dev/null | jq -e --arg m "$1" --arg ns "$2" '.[$m].levels // {} | [.[][] | select(.namespace == $ns)] | length > 0' >/dev/null
+}
+until_layer() { for _ in $(seq "${3:-50}"); do layer_on "$1" "$2" && return 0; sleep 0.1; done; return 1; }
+
+# ---- boot ----
+echo "case: boot"
+up=1
+for _ in $(seq 150); do [ "$(qsi call bar status)" = shown ] && { up=0; break; }; alive || break; sleep 0.1; done
+check "boot: the shell answers qs ipc (bar status = shown)" $up "$(tail -3 "$QLOG" | tr '\n' ' ')"
+grep -q 'Configuration Loaded' "$QLOG"; check "boot: configuration loaded" $?
+until_layer "$mon" qs-bar 50
+for ns in qs-bar qs-wallpaper; do layer_on "$mon" "$ns"; check "boot: $ns layer on $mon" $?; done
+sleep "${SBT_SETTLE:-5}"            # the first polls and timers run
+alive; check "boot: the shell is still running after ${SBT_SETTLE:-5} s" $?
+[ "$(grep -c 'Quickshell has been restarted\|Reloading configuration' "$QLOG")" = 0 ]; check "boot: no restart or reload of the shell" $?
+busctl --address="$bus_addr" status org.freedesktop.Notifications >/dev/null 2>&1
+check "boot: the shell owns org.freedesktop.Notifications (on the private bus)" $?
+log_checks boot 0
+
+# ---- monitor hotplug: two headless screens in, out again ----
+echo "case: hotplug"
+m0=$(logmark)
+hc output create headless SBT-2 >/dev/null; hc output create headless SBT-3 >/dev/null
+until_jq monitors 'length == 3' 30
+for m in SBT-2 SBT-3; do
+    until_layer "$m" qs-bar 50; check "hotplug: bar appears on new screen $m" $?
+    until_layer "$m" qs-wallpaper 30; check "hotplug: wallpaper on new screen $m" $?
+done
+layer_on "$mon" qs-bar; check "hotplug: bar still on $mon" $?
+sleep 1
+hc output remove SBT-3 >/dev/null; hc output remove SBT-2 >/dev/null
+until_jq monitors 'length == 1' 30; sleep 1.5
+alive; check "hotplug: the shell survives both screens going away" $?
+n=$(hc -j layers | jq --arg ns qs-bar '[.[] | .levels[][] | select(.namespace == $ns)] | length')
+[ "$n" = 1 ]; check "hotplug: one bar left (on $mon)" $? "bars=$n"
+[ "$(qsi call bar status)" = shown ]; check "hotplug: still answers qs ipc" $?
+log_checks hotplug "$m0"
+
+# ---- qs ipc: open and close a few things (nested shell only) ----
+echo "case: ipc"
+m0=$(logmark)
+ipc_toggle() {   # ipc_toggle NAME NAMESPACE OPEN... -- CLOSE...
+    local name=$1 ns=$2; shift 2; local open=() close=()
+    while [ $# -gt 0 ] && [ "$1" != -- ]; do open+=("$1"); shift; done; shift; close=("$@")
+    qsi call "${open[@]}" >/dev/null; until_layer "$mon" "$ns" 30
+    check "ipc: $name opens (layer $ns)" $?
+    qsi call "${close[@]}" >/dev/null
+    local gone=1; for _ in $(seq 30); do layer_on "$mon" "$ns" || { gone=0; break; }; sleep 0.1; done
+    check "ipc: $name closes again" $gone
+}
+ipc_toggle launcher qs-launcher launcher toggle -- launcher toggle
+ipc_toggle "control panel" qs-panel panel toggle -- panel toggle
+ipc_toggle overview qs-overview overview toggle -- overview toggle
+ipc_toggle dashboard qs-dashboard dashboard open -- dashboard close
+ipc_toggle settings qs-settings settings open about -- settings close
+out=$(qsi call pet status); alive && [ -n "$out" ] && ! grep -qi 'no running\|not found\|error' <<<"$out"; check "ipc: pet status answers" $? "$out"
+alive; check "ipc: the shell is still running" $?
+log_checks ipc "$m0"
+
+# ---- fit-check: sweep every popup for cut-off items (on a 1920x1080 headless screen, focused) ----
+if [ "$nofit" = 0 ]; then
+    echo "case: fit-check"
+    m0=$(logmark)
+    hc output create headless SBT-FIT >/dev/null
+    until_jq monitors 'length == 2' 30; until_layer SBT-FIT qs-bar 50
+    # The nested window's own screen ($mon) is whatever size your tiling gives it (a thin strip at times),
+    # and the shell's idea of the focused screen does not reliably follow a dispatch: switch $mon off for
+    # the sweep so every view lands on SBT-FIT, a known 1920x1080.
+    hc eval "hl.monitor({ output = \"$mon\", disabled = true })" >/dev/null
+    until_jq monitors 'length == 1 and .[0].name == "SBT-FIT"' 50; sleep 1.2   # Desk.settle runs 700 ms after
+    sz=$(hc -j monitors | jq -r '.[] | select(.name == "SBT-FIT") | "\(.width)x\(.height)@\(.scale)"')
+    fout=$("${qs_env[@]}" timeout 100 bash "$work/fit-check" 2>&1); frc=$?
+    ! grep -q "\[$mon\]" <<<"$fout"; check "fit-check: every view was on SBT-FIT ($mon off)" $?
+    [ "$frc" = 0 ]; check "fit-check: sweep on SBT-FIT ($sz) finds nothing cut off" $? "rc=$frc $(printf '%s' "$fout" | grep -E 'CUT|✗|RESULT|fit-check:' | short)"
+    grep -q 'views checked' <<<"$fout"; check "fit-check: the sweep ran to the end" $?
+    hc eval "hl.monitor({ output = \"$mon\", disabled = false })" >/dev/null; hc reload >/dev/null
+    until_jq monitors "any(.[]; .name == \"$mon\")" 50
+    hc output remove SBT-FIT >/dev/null; until_jq monitors 'length == 1' 30; sleep 1
+    alive; check "fit-check: the shell is still running ($mon back, SBT-FIT gone)" $?
+    until_layer "$mon" qs-bar 30; check "fit-check: bar back on $mon" $?
+    log_checks fit-check "$m0"
+fi
+
+# ---- end: still up, and the live session untouched ----
+echo "case: end"
+alive; check "end: the shell ran the whole test without dying" $?
+starts=$(grep -E '^(qs|quickshell|nixGLIntel|quickshell-start) ?' "$LOG" | grep -Ev '^(qs|quickshell) (--version|ipc )')   # qs --version: Settings > About
+[ -z "$starts" ]; check "end: nothing tried to start another Quickshell" $? "$(printf '%s' "$starts" | short)"
+kill -9 "$qs_pid" 2>/dev/null; wait "$qs_pid" 2>/dev/null; qs_pid=""
+kill -9 "$hypr_pid" 2>/dev/null; wait "$hypr_pid" 2>/dev/null; hypr_pid=""
+[ "$(live_env)" = "$env_before" ]; check "isolation: live systemd environment unchanged" $? \
+    "CHANGED. Fix: systemctl --user set-environment with the live WAYLAND_DISPLAY/DISPLAY/HYPRLAND_INSTANCE_SIGNATURE, then dbus-update-activation-environment --systemd"
+[ "$(live_home)" = "$home_before" ]; check "isolation: live hypr-desk-home unchanged" $?
+finish

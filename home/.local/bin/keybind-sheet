@@ -2,6 +2,8 @@
 """Make the one-page Hyprland keybinding cheat sheet (PDF) from the live bindings.
 
   keybind-sheet [OUT.pdf]      default: ~/Scratch/hyprland-keybindings.pdf
+  keybind-sheet --org OUT.org  the same grouping as an Org page (the public repo's docs/keybindings.org)
+  keybind-sheet --binds FILE   read `hyprctl binds -j` output from FILE instead of the running Hyprland
 
 Keys and their descriptions come from `hyprctl binds -j`, so the sheet says what the
 keys do right now. The grouping below is curated; any binding it does not mention is
@@ -20,7 +22,8 @@ def modnames(mask):
     return " ".join(n for bit, n in MODBITS if mask & bit)
 KEYNAMES = {"Return": "Enter", "period": ".", "slash": "/", "bracketleft": "[", "bracketright": "]",
             "left": "←", "right": "→", "up": "↑", "down": "↓", "mouse_down": "scroll", "mouse_up": "scroll",
-            "mouse:272": "left-drag", "mouse:273": "right-drag", "Print": "PrtSc", "Space": "Space", "Tab": "Tab"}
+            "mouse:272": "left-drag", "mouse:273": "right-drag", "Print": "PrtSc", "Space": "Space", "space": "Space", "Tab": "Tab", "comma": ",", "equal": "=",
+            "minus": "-", "backslash": "\\", "semicolon": ";", "apostrophe": "'", "grave": "`"}
 
 # (title, rows). A row is (keys, text) where text None means "use the live description of
 # the first listed binding". keys are "Mods|key" strings; several mean "these share a row".
@@ -115,10 +118,17 @@ def keycaps(mods, keys):
     return "".join(caps) + "".join(f"<kbd>{html.escape(n)}</kbd>" for n in names)
 
 
-def main():
-    out = os.path.expanduser(sys.argv[1] if len(sys.argv) > 1 else "~/Scratch/hyprland-keybindings.pdf")
-    binds = json.loads(subprocess.check_output(["hyprctl", "binds", "-j"]))
-    live = {f"{modnames(b['modmask'])}|{b['key']}": (b.get("description") or "") for b in binds}
+def orgcaps(mods, keys):
+    """Org markup for one row's keys: =Super= =Shift= =D=."""
+    names = [KEYNAMES.get(k, k if len(k) > 1 else k.upper()) for k in keys]
+    if len(names) == 10 and names[0] == "1": names = ["1–0"]
+    if set(names) == {"←", "↑", "↓", "→"}: names = ["←↑↓→"]
+    if names == ["scroll", "scroll"]: names = ["scroll"]
+    return " ".join(f"~{m}~" for m in (mods.split() if mods else [])) + (" " if mods else "") + " ".join(f"~{n}~" for n in names)
+
+
+def collect(live, caps_fn, extra_fn):
+    """The curated sections, then Other, then the non-key rows: [(title, [(keys, text)])]."""
     used, blocks = set(), []
     for title, rows in SECTIONS:
         lines = []
@@ -129,16 +139,50 @@ def main():
             if keys == ["Super|Y"]: used.add("Super Shift|Y")
             mods = present[0].split("|")[0]
             same = all(k.split("|")[0] == mods for k in present)
-            caps = keycaps(mods, [k.split("|")[1] for k in present]) if same else \
-                " / ".join(keycaps(k.split("|")[0], [k.split("|")[1]]) for k in present)
-            lines.append((caps, text or live[present[0]]))
+            caps = caps_fn(mods, [k.split("|")[1] for k in present]) if same else \
+                " / ".join(caps_fn(k.split("|")[0], [k.split("|")[1]]) for k in present)
+            if text or live[present[0]]:                # no description: a moved() key, not worth a row
+                lines.append((caps, text or live[present[0]]))
         blocks.append((title, lines))
-    other = [(keycaps(*k.split("|")[:1], [k.split("|")[1]]), d) for k, d in live.items()
+    other = [(caps_fn(k.split("|")[0], [k.split("|")[1]]), d) for k, d in live.items()
              if k not in used and not k.split("|")[1].startswith(HIDE_PREFIX) and d]
     if other: blocks.append(("Other", other))
     for title, rows in EXTRA:
-        blocks.append((title, [(f"<span class=what>{html.escape(a)}</span>", b) for a, b in rows]))
+        blocks.append((title, [(extra_fn(a), b) for a, b in rows]))
+    return blocks, len(other)
 
+
+def org_page(blocks):
+    cell = lambda t: t.replace("|", "\\vert{}")
+    out = ["#+title: Key bindings", "",
+           "Super is the Windows key. Generated from the bindings of a running session by =keybind-sheet --org=; "
+           "edit the descriptions in =hyprland.lua=, not here.", ""]
+    for title, rows in blocks:
+        if not rows: continue
+        out += [f"* {title}", "", "| Keys | Does |", "|------+------|"]
+        out += [f"| {cell(c)} | {cell(d)} |" for c, d in rows] + [""]
+    return "\n".join(out)
+
+
+def main():
+    args = sys.argv[1:]
+    binds_file = org_out = None
+    if "--binds" in args:
+        i = args.index("--binds"); binds_file = args[i + 1]; del args[i:i + 2]
+    if "--org" in args:
+        i = args.index("--org"); org_out = args[i + 1]; del args[i:i + 2]
+    binds = json.load(open(binds_file)) if binds_file else json.loads(subprocess.check_output(["hyprctl", "binds", "-j"]))
+    live = {}
+    for b in binds:                       # a key bound twice (press and release): keep the one with a description
+        k = f"{modnames(b['modmask'])}|{b['key']}"
+        if not live.get(k): live[k] = b.get("description") or ""
+    if org_out:
+        blocks, n_other = collect(live, orgcaps, lambda a: a)
+        open(org_out, "w").write(org_page(blocks))
+        print(org_out, f"({len(live)} bindings, {n_other} under Other)")
+        return
+    out = os.path.expanduser(args[0] if args else "~/Scratch/hyprland-keybindings.pdf")
+    blocks, n_other = collect(live, keycaps, lambda a: f"<span class=what>{html.escape(a)}</span>")
     body = "".join(
         f"<section><h2>{html.escape(t)}</h2>" + "".join(
             f"<div class=row><div class=keys>{c}</div><div class=does>{html.escape(d)}</div></div>" for c, d in rows)
@@ -169,7 +213,7 @@ kbd {{ white-space: nowrap; font: 600 7.3pt "FiraCode Nerd Font", "Fira Code", m
         open(src, "w").write(page)
         subprocess.run([chrome, "--headless=new", "--disable-gpu", "--no-pdf-header-footer", f"--user-data-dir={tmp}/profile",
                         f"--print-to-pdf={out}", "file://" + src], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90)
-    print(out, f"({len(live)} bindings, {len(other)} under Other)")
+    print(out, f"({len(live)} bindings, {n_other} under Other)")
 
 
 if __name__ == "__main__":
