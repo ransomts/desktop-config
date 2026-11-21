@@ -35,6 +35,8 @@ The pills, roughly right to left: power menu, battery, power profile, network, m
 
 =Island.qml=. A short message that grows out of the top of the bar over the clock and folds back: a meeting in five minutes, recording started, headphones connected, the charger or keyboard layout changed. Scripts can use it: =qs ipc call island say "Title" "second line"=.
 
+[[file:../screenshots/anim-island.webp]]
+
 * Launcher
 
 =Launcher.qml=, =LaunchView.qml=; Super+D (or tap Super). Apps sorted by how often you open them. A prefix switches mode, and the modes are listed under the search line:
@@ -55,6 +57,10 @@ The pills, roughly right to left: power menu, battery, power profile, network, m
 | ~event~ | quick calendar event: "event Lunch tomorrow 12-1" |
 
 Tab moves to the next mode.
+
+| Calculator | Emoji |
+|------------+-------|
+| [[file:../screenshots/calc-dark.png]] | [[file:../screenshots/emoji-dark.png]] |
 
 * Notifications
 
@@ -80,18 +86,38 @@ Settings (=Settings.qml= and its =Settings*.qml= pages, Super+comma) is one wind
 
 =Wallpaper.qml=, =Wall*.qml=, =shaders/=. Animated shader scenes on the bottom layer (silk, aurora, contours, ink, ridges, terrain, flow, ripples, field, pulsar, depths, and a real night sky), picked from Super+W or Settings > Appearance. The sky is computed for your latitude: star catalogue, constellation lines, moon phase, planets. Seasonal touches (falling leaves, snow, fireflies), weather effects, and a thin band along the bottom showing the day's calendar. On battery it holds still.
 
+[[file:../screenshots/scenes-dark.png]]
+
+The scenes drift slowly; sped up five times:
+
+[[file:../screenshots/anim-wallpaper.webp]]
+
 * Lock screen and screensaver
 
-=lockscreen.qml=, =Lock*.qml=; =Saver*.qml=. The lock screen shows the time, the next event and the pet; the screensaver is the wallpaper scene with a clock, after the idle time set in Settings > Screensaver and idle.
+=lockscreen.qml=, =Lock*.qml=; =Saver*.qml=. The lock screen shows the time, the next event and the pet; the screensaver is the wallpaper scene with a clock, after the idle time set in Settings > Screensaver and idle. The lock screen shows a still frame of the current wallpaper scene.
+
+| Dark | Light |
+|------+-------|
+| [[file:../screenshots/lock-dark.png]] | [[file:../screenshots/lock-light.png]] |
 
 * Screenshots and recording
 
-=Shot*.qml=: Print freezes every screen, you pick a region, mark it up (pen, lines, arrows, boxes, text), then copy or save. =SharePick.qml= is the screen-share picker for =xdg-desktop-portal-hyprland=. =screen-record= records a region or a screen with sound and an optional round webcam bubble (=CamBubble.qml=).
+=Shot*.qml=: Print freezes every screen, you pick a region (or W for the window under the pointer), mark it up, then copy or save. Each tool has a key: P pen, M marker, L line, A arrow, B box, E ellipse, T text, N numbered steps, X pixelate, C crop; Ctrl+Z undoes.
+
+[[file:../screenshots/editor-dark.png]]
+
+ =SharePick.qml= is the screen-share picker for =xdg-desktop-portal-hyprland=. =screen-record= records a region or a screen with sound and an optional round webcam bubble (=CamBubble.qml=).
 
 * Lecture tools
 
-=Lecture*.qml=, =Ink.qml=. For teaching from the laptop: draw on the screen (D), a spotlight that dims everything but the pointer (L), show the keys being pressed (K), zoom, and a countdown timer. Super+Z then a letter; Super+Z twice for the menu.
+=Lecture*.qml=, =Ink.qml=. For teaching from the laptop: draw on the screen (D), a spotlight that dims everything but the pointer (L), show the keys being pressed (K), zoom, and a countdown timer. Super+Z then a letter; Super+Z twice for the menu. In draw mode the toolbar along the bottom lists the pen, marker, arrow, box, ellipse and line, with number keys to switch.
+
+[[file:../screenshots/lecture-dark.png]]
+
+[[file:../screenshots/keys-light.png]]
 
 * The pet
 
 =Pet*.qml=. A pixel-art tiger cub that lives in the empty stretches of the bar, or down on the wallpaper when a desktop is empty. It reacts to notifications, sits on the clock, runs a focus timer, keeps reminders and reminds you of the next meeting. Right-click it for its menu. It also has a few secrets.
+
+[[file:../screenshots/anim-pet.webp]]
