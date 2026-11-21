@@ -1,6 +1,6 @@
 #+title: Theming
 
-[[file:../screenshots/anim-theme.webp]]
+#+HTML: <img src="../screenshots/anim-theme.webp" alt="theme animation">
 
 | Dark | Light |
 |------+-------|
