@@ -61,13 +61,11 @@ gview() {   # gview NAME SECONDS OPEN-ARGS... -- CLOSE-ARGS...   (qs ipc calls)
     gshot "$name"
     [ ${#close[@]} -gt 0 ] && qsi call "${close[@]}" >/dev/null; sleep 1.3   # closed before the next "before" picture
 }
-gpop() {   # gpop NAME OPEN-ARGS...: a bar popup. Requests toggle, so every popup is closed with
-    # `bar popup ""` (a switch to no popup: closes whatever is open, and does nothing when none is),
-    # and each one opens from a closed bar.
+gpop() {   # gpop NAME TARGET ARG: a bar popup or pet page, opened from a closed bar (bar open/close, pet open)
     local name=$1; shift
-    qsi call bar popup "" >/dev/null; sleep 1.2
+    qsi call bar close >/dev/null; sleep 1.2
     gbase; qsi call "$@" >/dev/null; sleep 1.3; gshot "$name"
-    qsi call bar popup "" >/dev/null; sleep 1.2
+    qsi call bar close >/dev/null; sleep 1.2
 }
 mockcall() {   # mockcall OBJECT-PATH METHOD ARGS-PYTHON: a call on a stand-in system service's Mock interface
     "$venv/bin/python" -c "import dbus; b = dbus.bus.BusConnection('$sbus_addr'); o = b.get_object('$1', '$2'); getattr(dbus.Interface(o, 'org.freedesktop.DBus.Mock'), '$3')($4)" 2>/dev/null
@@ -94,7 +92,7 @@ EOF
     sleep 1; qsi call notif dismissAll >/dev/null 2>&1; sleep 0.8
     qsi call clock timer "25m Grading" >/dev/null; qsi call clock alarm "16:30 Leave for the meeting" >/dev/null
     touch "$H/demo/health-stale"; qsi call health refresh >/dev/null; sleep 1.5
-    for p in calendar notifs media mixer wifi bluetooth profile power health lights teams pet; do gpop "bar-$p" bar popup "$p"; done
+    for p in calendar notifs media mixer wifi bluetooth profile power health lights teams pet; do gpop "bar-$p" bar open "$p"; done
     rm -f "$H/demo/health-stale"; qsi call health refresh >/dev/null
 
     # ---- launcher: every mode ----
@@ -127,8 +125,16 @@ EOF
     gbase; qsi call cam on >/dev/null; touch "$H/demo/recording"; sleep 2.5; gshot recording right
     qsi call cam off >/dev/null; rm -f "$H/demo/recording"; sleep 1.5
 
+    # battery low: the stand-in battery drops to 12 % (the shell's own 15 % warning), then back
+    batpct() { mockcall org.freedesktop.UPower /org/freedesktop/UPower SetDeviceProperties \
+        "'/org/freedesktop/UPower/devices/DisplayDevice', {'Percentage': dbus.Double($1)}"
+        mockcall org.freedesktop.UPower /org/freedesktop/UPower SetDeviceProperties \
+        "'/org/freedesktop/UPower/devices/BAT0', {'Percentage': dbus.Double($1)}"; }
+    gbase; batpct 12; sleep 2.5; gshot battery-low box:1180,0,1920,360
+    qsi call notif dismissAll >/dev/null; batpct 64; sleep 1
+
     # ---- the pet ----
-    for pg in focus remind journal tricks looks say habits settings; do gpop "pet-$pg" pet menu "$pg"; done
+    for pg in focus remind journal tricks looks say habits settings; do gpop "pet-$pg" pet open "$pg"; done
     gbase; qsi call pet focus 25 >/dev/null; qsi call pet remind "20m" "Grade quiz 4" >/dev/null; sleep 1.5
     gshot pet-focus-bar box:0,0,1920,140; qsi call pet stopfocus >/dev/null
     terms_off; sleep 1.5
@@ -204,6 +210,7 @@ EOF
 
 gallery_keys() {   # after the editor: the virtual keyboard is in use from here on
     qsi call island off >/dev/null
+    echo true > "$dark_file"; terms_off; sleep 2; terms_on "Clemson Dark"; ptr m 1919 1079; sleep 1   # the editor ends on light
     # screen-share picker: lists made by the real qs-share-pick --parse from the nested session's windows
     if [ -x "$src/.local/bin/qs-share-pick" ]; then
         wl=$(hc -j clients | jq -r '.[] | "\(.pid)[HC>]\(.class)[HT>]\(.title)[HE>]\(.address)[HA>]"' | tr -d '\n')

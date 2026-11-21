@@ -617,7 +617,9 @@ PanelWindow {
         Qt.callLater(function() { if (pop.anchor.updateAnchor) pop.anchor.updateAnchor() })
     }
     Connections {
+        id: popConn
         target: Sys
+        function onPopupSet(name) { if (bar.popup !== name) popConn.onPopupRequest(name) }
         function onPopupRequest(name) {
             if (!bar.visible || !bar.monitor || !Hyprland.focusedMonitor || Hyprland.focusedMonitor.name !== bar.monitor.name) return
             const at = { mixer: vol, wifi: netPill, bluetooth: btPill.visible ? btPill : netPill, profile: profilePill, power: powerPill, notifs: notifPill, health: healthPill.visible ? healthPill : notifPill, pet: petSprite.active ? petSprite : clockPill,

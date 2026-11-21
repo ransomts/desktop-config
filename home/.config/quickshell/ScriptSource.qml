@@ -23,8 +23,10 @@ Item {
                 const out = text.trim()
                 if (out === "") { src.text = ""; src.tooltip = ""; src.cls = ""; src.data = ({}); return }
                 try {
-                    // the scripts put real newlines inside strings, which strict JSON forbids
-                    const o = JSON.parse(out.replace(/\n/g, "\\n"))
+                    // plain JSON first (pretty-printed is fine); then with every newline escaped, for the
+                    // scripts that put real newlines inside strings, which strict JSON forbids
+                    let o
+                    try { o = JSON.parse(out) } catch (e1) { o = JSON.parse(out.replace(/\n/g, "\\n")) }
                     src.text = o.text || ""
                     src.tooltip = o.tooltip || ""
                     src.cls = o.class || ""

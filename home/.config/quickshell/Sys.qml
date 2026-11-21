@@ -201,6 +201,7 @@ Singleton {
 
     // ---- popups under pills ("calendar", "mixer"), opened on the focused screen's bar ----
     signal popupRequest(string name)
+    signal popupSet(string name)        // open exactly this popup, or none for "" (no toggling)
 
     // ---- media: which player to show. A music player beats a browser tab (a video
     // or stream in Firefox shouldn't take over from Rhythmbox); playing beats paused.

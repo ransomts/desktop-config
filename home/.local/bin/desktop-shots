@@ -160,6 +160,15 @@ canned cams <<'CANNED'
 [ -z "$1" ] && printf '/dev/v4l/by-id/demo-camera\tDemo camera\t/dev/video9\n'
 exit 0
 CANNED
+rm -f "$H/.local/bin/run-logged"
+cat > "$H/.local/bin/run-logged" <<'CANNED'
+#!/bin/sh
+# the shell runs commands through run-logged: notifications (onto the private bus) run, the rest is recorded
+printf '%s %s\n' run-logged "$*" >> "${SBT_LOG:-/dev/null}"
+case "$*" in "sh -c notify-send "*|notify-send*) exec "$@" ;; esac
+exit 0
+CANNED
+chmod +x "$H/.local/bin/run-logged"
 canned teams-unread <<'CANNED'
 #!/bin/sh
 # one line: the bar escapes newlines before parsing

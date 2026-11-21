@@ -247,7 +247,8 @@ ShellRoot {
         function stopfocus(): string { return PetFocus.stop() }               // stop the timer or cycle
         function focusstatus(): string { return PetFocus.status() }
         function hat(name: string): string { return Pet.setHat(name) }        // auto none santa witch party cap grad
-        function menu(page: string): void { Pet.menuPage = page; Sys.popupRequest("pet") }     // tricks focus looks settings ("" main)
+        function menu(page: string): void { Pet.menuPage = page; Sys.popupRequest("pet") }
+        function open(page: string): void { Pet.menuPage = page; Sys.popupSet(""); Sys.popupSet("pet") }   // always shows PAGE     // tricks focus looks settings ("" main)
         function say(): string { return PetSay.ask() }                        // what's up? opens its briefing (a second call closes it) and prints it
         function brief(): string { PetSay.refresh(); return PetSay.asText() }   // the briefing as text, nothing opened (fresh data a second later)
         function remark(what: string): string { return PetSay.sayNow(what) }  // battery | event: one of its own remarks, now
@@ -404,6 +405,9 @@ ShellRoot {
         // open or close a pill popup on the focused screen:
         // calendar | mixer | wifi | bluetooth | profile | power | media | notifs | pet | lights
         function popup(name: string): void { Sys.popupRequest(name) }
+        // the same without toggling, for scripts: open is a no-op when it is already open, close when none is
+        function open(name: string): void { Sys.popupSet(name) }
+        function close(): void { Sys.popupSet("") }
     }
     // background jobs (Health.qml, ~/.local/bin/shell-health): the pill is in Bar.qml; a job that
     // just went from ok to failing or stale is said once on the island
