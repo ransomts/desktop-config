@@ -1,0 +1,461 @@
+#+title: Gallery
+
+Every interactive part of the desktop, one picture each. All of them are taken by =desktop-shots= in a staged session with made-up data; see [[file:testing.org][testing]]. Pictures are AVIF; any current browser shows them.
+
+* Interactions
+
+Short clips of the things a still cannot show.
+
+** Drag to place
+
+Super and drag a tiled window: the hypr-strict-resize plugin draws an outline where it will land, and it lands there when you let go.
+
+#+HTML: <img src="../screenshots/gallery/drag-to-place.avif" alt="Drag to place (animation)">
+
+** Border resizing
+
+Dragging the border between two tiled windows moves only that border.
+
+#+HTML: <img src="../screenshots/gallery/resize.avif" alt="Border resizing (animation)">
+
+** Pill buttons
+
+Hover for the tooltip, click for the card (here the calendar), right-click for the quick action (here play/pause on the music pill).
+
+#+HTML: <img src="../screenshots/gallery/pills.avif" alt="Pill buttons (animation)">
+
+** Do Not Disturb
+
+With Do Not Disturb on, a message arrives without a popup; the bell pill counts it.
+
+#+HTML: <img src="../screenshots/gallery/dnd.avif" alt="Do Not Disturb (animation)">
+
+* Bar popups
+
+Every pill's click card (=bar popup NAME= opens one from a script). Bluetooth, Wi-Fi, battery, power profiles and music here are stand-ins: =desktop-shots-fakes= plays those services.
+
+** Calendar
+
+Click the clock: the month, today's events, running timers and alarms, the world clocks.
+
+#+HTML: <img src="../screenshots/gallery/bar-calendar.avif" alt="Calendar">
+
+** Notifications
+
+The bell pill (Super+N): recent notifications grouped by app; right-click for Do Not Disturb.
+
+#+HTML: <img src="../screenshots/gallery/bar-notifs.avif" alt="Notifications">
+
+** Music
+
+The track, cover, seek bar and buttons, the player's volume; middle-click opens the player.
+
+#+HTML: <img src="../screenshots/gallery/bar-media.avif" alt="Music">
+
+** Sound
+
+Output devices, volume, and each app playing sound with its own level.
+
+#+HTML: <img src="../screenshots/gallery/bar-mixer.avif" alt="Sound">
+
+** Wi-Fi
+
+Networks in range; click one to join it.
+
+#+HTML: <img src="../screenshots/gallery/bar-wifi.avif" alt="Wi-Fi">
+
+** Bluetooth
+
+Paired devices; click to connect or disconnect.
+
+#+HTML: <img src="../screenshots/gallery/bar-bluetooth.avif" alt="Bluetooth">
+
+** Power profile
+
+Battery, balanced or performance, and the charge limit.
+
+#+HTML: <img src="../screenshots/gallery/bar-profile.avif" alt="Power profile">
+
+** Power menu
+
+Lock, suspend, log out, reboot, shut down.
+
+#+HTML: <img src="../screenshots/gallery/bar-power.avif" alt="Power menu">
+
+** Health
+
+Background jobs; one stale here (made up), with why and how long.
+
+#+HTML: <img src="../screenshots/gallery/bar-health.avif" alt="Health">
+
+** Lights
+
+The two video lights: all on or off, each light, presets.
+
+#+HTML: <img src="../screenshots/gallery/bar-lights.avif" alt="Lights">
+
+** Teams
+
+Unread chats with a preview; click opens the chat.
+
+#+HTML: <img src="../screenshots/gallery/bar-teams.avif" alt="Teams">
+
+** The pet's menu
+
+Right-click the pet: pet, feed, play, tricks, focus timer, reminders, journal, looks.
+
+#+HTML: <img src="../screenshots/gallery/bar-pet.avif" alt="The pet's menu">
+
+* Launcher modes
+
+Super+D, then a prefix. The data (clipboard, mail, tabs, notes) is made up.
+
+** Apps
+
+Most used first; the modes are listed under the search line.
+
+#+HTML: <img src="../screenshots/gallery/launcher-apps.avif" alt="Apps">
+
+** Join a meeting
+
+A meeting with a link under way or within ten minutes goes to the top of the list.
+
+#+HTML: <img src="../screenshots/gallery/launcher-join.avif" alt="Join a meeting">
+
+** Calculator (=)
+
+qalc; Enter copies the result.
+
+#+HTML: <img src="../screenshots/gallery/launcher-calc.avif" alt="Calculator (=)">
+
+** Emoji (:)
+
+Search by name or keyword.
+
+#+HTML: <img src="../screenshots/gallery/launcher-emoji.avif" alt="Emoji (:)">
+
+** Clipboard (v)
+
+cliphist; Ctrl+P pins an entry.
+
+#+HTML: <img src="../screenshots/gallery/launcher-clipboard.avif" alt="Clipboard (v)">
+
+** Windows (w)
+
+Every open window, with its desktop.
+
+#+HTML: <img src="../screenshots/gallery/launcher-windows.avif" alt="Windows (w)">
+
+** Files (/)
+
+Files in your home, by name.
+
+#+HTML: <img src="../screenshots/gallery/launcher-files.avif" alt="Files (/)">
+
+** Key bindings (?)
+
+The live list, searchable.
+
+#+HTML: <img src="../screenshots/gallery/launcher-keys.avif" alt="Key bindings (?)">
+
+** Org capture (o)
+
+Sends the text to an org-capture template.
+
+#+HTML: <img src="../screenshots/gallery/launcher-org.avif" alt="Org capture (o)">
+
+** Mail (m)
+
+Unread mail (mu); Enter opens it in mu4e.
+
+#+HTML: <img src="../screenshots/gallery/launcher-mail.avif" alt="Mail (m)">
+
+** Notes (n)
+
+org-roam notes by title.
+
+#+HTML: <img src="../screenshots/gallery/launcher-notes.avif" alt="Notes (n)">
+
+** Firefox tabs (t)
+
+Goes to the window showing the tab.
+
+#+HTML: <img src="../screenshots/gallery/launcher-tabs.avif" alt="Firefox tabs (t)">
+
+** QR code (qr)
+
+A QR code of the text, to copy.
+
+#+HTML: <img src="../screenshots/gallery/launcher-qr.avif" alt="QR code (qr)">
+
+** Quick event (event)
+
+A plain line becomes a calendar event.
+
+#+HTML: <img src="../screenshots/gallery/launcher-event.avif" alt="Quick event (event)">
+
+* Settings
+
+Super+comma. Every page; each row reads the live value and writes it back where it lives.
+
+** Appearance
+
+Theme, the times dark and light start, night light, colour plan, wallpaper scene and effects.
+
+#+HTML: <img src="../screenshots/gallery/settings-appearance.avif" alt="Appearance">
+
+** Bar and island
+
+Which pills show, island messages, shell sounds, pointer extras, Tailscale.
+
+#+HTML: <img src="../screenshots/gallery/settings-bar.avif" alt="Bar and island">
+
+** Notifications
+
+Do Not Disturb and per-app rules: normal, list only, mute.
+
+#+HTML: <img src="../screenshots/gallery/settings-notifications.avif" alt="Notifications">
+
+** Quiet hours
+
+Which calendar events turn Do Not Disturb on by themselves.
+
+#+HTML: <img src="../screenshots/gallery/settings-quiet.avif" alt="Quiet hours">
+
+** Clocks
+
+Alarms, timer sounds, the world clocks in the calendar popup.
+
+#+HTML: <img src="../screenshots/gallery/settings-clock.avif" alt="Clocks">
+
+** Screensaver and idle
+
+When the screensaver starts, its scene, when screens go off and the lock comes.
+
+#+HTML: <img src="../screenshots/gallery/settings-saver.avif" alt="Screensaver and idle">
+
+** Lecture tools
+
+Spotlight size, ink tool, colour and width, the key display.
+
+#+HTML: <img src="../screenshots/gallery/settings-lecture.avif" alt="Lecture tools">
+
+** Recording and camera
+
+Microphone, system sound and webcam bubble for recordings.
+
+#+HTML: <img src="../screenshots/gallery/settings-recording.avif" alt="Recording and camera">
+
+** Pet
+
+Where the pet goes, its sounds, liveliness, bedtime, meeting reminders.
+
+#+HTML: <img src="../screenshots/gallery/settings-pet.avif" alt="Pet">
+
+** Launcher
+
+The Org capture template and the prefixes.
+
+#+HTML: <img src="../screenshots/gallery/settings-launcher.avif" alt="Launcher">
+
+** Power
+
+Charge limit, reminders before travel, break reminders, power profile.
+
+#+HTML: <img src="../screenshots/gallery/settings-power.avif" alt="Power">
+
+** Displays
+
+Arrange screens (a map when there are several), save the layout, identify.
+
+#+HTML: <img src="../screenshots/gallery/settings-displays.avif" alt="Displays">
+
+** Input
+
+Key repeat, layouts, touchpad.
+
+#+HTML: <img src="../screenshots/gallery/settings-input.avif" alt="Input">
+
+** Health
+
+Which background jobs the health pill watches.
+
+#+HTML: <img src="../screenshots/gallery/settings-health.avif" alt="Health">
+
+** Session
+
+Reopening the last session's windows at login.
+
+#+HTML: <img src="../screenshots/gallery/settings-session.avif" alt="Session">
+
+** Focus profiles
+
+One click to set up for teaching, grading or writing, and back.
+
+#+HTML: <img src="../screenshots/gallery/settings-focus.avif" alt="Focus profiles">
+
+** About
+
+Versions, where things are, how to run the tests.
+
+#+HTML: <img src="../screenshots/gallery/settings-about.avif" alt="About">
+
+* Overlays and small windows
+
+** Window switcher
+
+Alt+Tab, with live thumbnails.
+
+#+HTML: <img src="../screenshots/gallery/switcher.avif" alt="Window switcher">
+
+** Wallpaper menu
+
+Super+W: scene, effects, weather, mode, frame rate, screensaver.
+
+#+HTML: <img src="../screenshots/gallery/wallpaper-menu.avif" alt="Wallpaper menu">
+
+** Volume
+
+The level popup for the volume keys.
+
+#+HTML: <img src="../screenshots/gallery/osd-volume.avif" alt="Volume">
+
+** Brightness
+
+The same for brightness.
+
+#+HTML: <img src="../screenshots/gallery/osd-brightness.avif" alt="Brightness">
+
+** Find the pointer
+
+Shake the mouse and the pointer grows for a moment.
+
+#+HTML: <img src="../screenshots/gallery/cursor-find.avif" alt="Find the pointer">
+
+** Screen-share picker
+
+When an app asks to share the screen: a screen, a window or a region.
+
+#+HTML: <img src="../screenshots/gallery/share-picker.avif" alt="Screen-share picker">
+
+** Password prompt
+
+The polkit agent's prompt (from its test suite, which runs the real view with a stand-in agent).
+
+#+HTML: <img src="../screenshots/gallery/polkit-dark-idle.avif" alt="Password prompt">
+
+** Password prompt, wrong password
+
+After a wrong password.
+
+#+HTML: <img src="../screenshots/gallery/polkit-dark-error.avif" alt="Password prompt, wrong password">
+
+** Password prompt, light
+
+In light mode.
+
+#+HTML: <img src="../screenshots/gallery/polkit-light-idle.avif" alt="Password prompt, light">
+
+** Screensaver
+
+The wallpaper scene with the time, after the idle time.
+
+#+HTML: <img src="../screenshots/gallery/screensaver.avif" alt="Screensaver">
+
+* Lecture tools
+
+Super+Z then a letter.
+
+** The menu
+
+Super+Z then Z: each tool with its key.
+
+#+HTML: <img src="../screenshots/gallery/lecture-menu.avif" alt="The menu">
+
+** Zoom
+
+Super+Z then = and -: the whole screen magnified.
+
+#+HTML: <img src="../screenshots/gallery/lecture-zoom.avif" alt="Zoom">
+
+** Recording with the webcam bubble
+
+The REC pill while recording, and the round webcam bubble (a made-up picture here).
+
+#+HTML: <img src="../screenshots/gallery/recording.avif" alt="Recording with the webcam bubble">
+
+* The pet
+
+Right-click the pet for its menu.
+
+** Focus timer
+
+Work and break lengths; the pet keeps time.
+
+#+HTML: <img src="../screenshots/gallery/pet-focus.avif" alt="Focus timer">
+
+** Focus timer on the bar
+
+The time left beside the pet, and a reminder set.
+
+#+HTML: <img src="../screenshots/gallery/pet-focus-bar.avif" alt="Focus timer on the bar">
+
+** Reminders
+
+In 10 or 30 minutes, an hour, or at a time.
+
+#+HTML: <img src="../screenshots/gallery/pet-remind.avif" alt="Reminders">
+
+** Journal
+
+Days together, counts, milestones.
+
+#+HTML: <img src="../screenshots/gallery/pet-journal.avif" alt="Journal">
+
+** Tricks
+
+Sit, lie down, spin, jump, beg, play dead, speak.
+
+#+HTML: <img src="../screenshots/gallery/pet-tricks.avif" alt="Tricks">
+
+** Looks
+
+Animal, coat, hat, friend, name.
+
+#+HTML: <img src="../screenshots/gallery/pet-looks.avif" alt="Looks">
+
+** Brief
+
+What is coming up, unread mail, the weather, in the pet's words.
+
+#+HTML: <img src="../screenshots/gallery/pet-say.avif" alt="Brief">
+
+** Habits
+
+Calm, chasing the pointer, coming down to an empty desktop, hiding while sharing.
+
+#+HTML: <img src="../screenshots/gallery/pet-habits.avif" alt="Habits">
+
+** Pet settings
+
+Bedtime, wake time, meeting reminder, liveliness, focus lengths.
+
+#+HTML: <img src="../screenshots/gallery/pet-settings.avif" alt="Pet settings">
+
+* Wallpaper
+
+** Every scene in light mode
+
+The dark ones are on the [[file:shell.org][shell page]].
+
+#+HTML: <img src="../screenshots/gallery/scenes-light.avif" alt="Every scene in light mode">
+
+** Weather and seasons
+
+Rain, fog and snow follow the real weather; leaves, snow, petals and fireflies follow the season; a paw on game days. Each over the same scene.
+
+#+HTML: <img src="../screenshots/gallery/wallpaper-effects.avif" alt="Weather and seasons">
+
+* Not pictured
+
+A few things need a real machine or a real person and are not staged: the low-battery notification (the stand-in battery does not set it off), the break reminder (it counts minutes of active typing), the treat-catch game (it needs someone playing), and the login screen (not in this repository).
